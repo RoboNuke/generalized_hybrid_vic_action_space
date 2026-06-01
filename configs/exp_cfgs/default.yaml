@@ -1,0 +1,113 @@
+# Default config — Forge Peg Insertion (Direct API), 16 envs, success-prediction
+# head enabled, recorder wrapper enabled with RoboNuke camera params.
+# Episode: 10s @ 15Hz = 150 steps. Asymmetric AC auto-detected (obs=21, state=72).
+# Every registered ConfigManager header must appear; unknown keys are hard errors.
+
+runner_cfg:
+  task: Isaac-Forge-PegInsert-Direct-v0
+  num_envs: 16                       # envs PER agent — kept low to share GPU with other experiments
+  num_agents: 1
+  total_timesteps: 20_000            # env.step() calls; transitions = total_timesteps * num_envs * num_agents
+  eval_timesteps: 150                # env.step() calls (~1 PegInsert episode at 150 steps)
+  memory_size: 2_000_000             # replay buffer capacity PER AGENT
+  seed: -1                           # -1 = non-deterministic
+
+sac_cfg:
+  gradient_steps: 8
+  batch_size: 1024
+  discount_factor: 0.99
+  polyak: 0.005
+  actor_lr: 1.0e-4                   # AdamW
+  critic_lr: 1.0e-4                  # AdamW
+  entropy_lr: 1.0e-4                 # AdamW (weight_decay always 0 for entropy)
+  weight_decay: 1.0e-2               # decoupled weight decay applied to actor + critic
+  random_timesteps: 0
+  learning_starts: 1500
+  learn_entropy: true
+  initial_entropy_value: 1.0e-2
+  target_entropy: -2.5               # null => skrl picks -|num_continuous|
+  grad_norm_clip: 0.0
+  mixed_precision: false
+  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor_kwargs: {}
+  rewards_shaper_scale: null
+  gripper_action_idx: null           # no gripper on Forge tasks
+  predict_success: true              # Forge handles success internally via the action space
+  success_td_weight: 50.0
+  success_td_discount: 0.99
+  success_info_key: is_success
+  success_train_min_successes: 100
+  success_heatmap_step_bins: 30      # vertical bins on success/fail P-mean heatmaps
+  success_wrapper: null              # auto-detect "forge" wrapper from task prefix
+  recorder:
+    # Disabled: TiledCamera is non-functional on this IsaacSim 5.0 + RTX 5090
+    # + driver 580.x combo (Replicator SDG graph crashes with
+    # `TypeError: Unable to write from unknown dtype, kind=f, size=0` for any
+    # TiledCamera, including the IsaacLab-shipped Cartpole-RGB-Camera example).
+    # Flip back to true once that upstream issue is resolved; the rest of the
+    # block keeps the RoboNuke camera params staged.
+    enabled: false
+    record_every_k_resets: 5
+    width: 240
+    height: 180
+    camera_pos: [1.0, 0.0, 0.35]
+    camera_quat: [-0.3535534, 0.6123724, 0.6123724, -0.3535534]
+    focal_length: 24.0
+    focus_distance: 400.0
+    horizontal_aperture: 20.955
+    clipping_range: [0.1, 20.0]
+    fps: 30
+    output_subdir: videos
+  experiment:
+    directory: forge_pih
+    experiment_name: ""              # empty => runner auto-generates as <task>_sac_N<num_agents>
+    write_interval: 150              # one episode per write
+    checkpoint_interval: auto
+
+model_cfg:
+  actor:
+    act_init_std: 1.0
+    actor_n: 1
+    actor_latent: 128
+    last_layer_scale: 0.1            # tiny init -> small initial actions, less tanh saturation
+    clip_log_std: true
+    min_log_std: -20.0
+    max_log_std: 2.0
+    reduction: sum
+    use_state_dependent_std: false
+    bernoulli_action_dims: null      # all-continuous (no binary gripper)
+    force_zero_action_dims: [3, 4]   # Forge sets actions[:, 3:5] = 0 internally
+  critic:
+    critic_output_init_mean: 0.0
+    critic_n: 2
+    critic_latent: 1024
+    clip_actions: false
+
+rescue_buffer_cfg:
+  enabled: false                   # master toggle; when false, runner skips all rescue construction
+  # ---- Algorithm 1 hyperparameters (required even when disabled — fail-loud convention) ----
+  tau: 0.7                         # f_phi(s_t) >= tau ⇒ rescue-point candidate
+  delta: 0.3                       # f_phi(s_T) <= delta ⇒ trajectory eligible for rescue extraction
+  alpha: 0.25                      # P(overwrite natural reset with rescue init) per done env
+  rho_min: 0.3                     # min rolling success rate to (a) add and (b) sample
+  window_size: 256                 # rolling-window length (trajectories per agent)
+  max_buffer_size: 1024            # per-agent rescue buffer capacity
+  # ---- Algorithm extras ----
+  dead_point_min_attempts: 3
+  action_entropy_first_k_steps: 10
+  # ---- Metric publication ----
+  metric_compute_interval: 150     # must equal sac_cfg.experiment.write_interval
+  buffer_snapshot_interval: 50000
+  snapshot_dir: rescue_snapshots
+  # ---- Section 5 — diversity / clustering ----
+  nn_query_subsample_rollout: 1.0
+  nn_distance_percentiles: [5, 25, 50]
+  dbscan_eps: null                 # null ⇒ auto-set to 5th-percentile pairwise dist at clustering time
+  dbscan_min_samples: 5
+  clustering_recompute_threshold: 25
+  min_buffer_size_for_clustering: 20
+  predictor_ece_n_bins: 10
+  projection_method: umap          # "umap" or "pca"
+  projection_recompute_threshold: 50
+  projection_n_neighbors: 15
+  projection_min_dist: 0.1
