@@ -1,12 +1,15 @@
 """YAML-driven config manager.
 
 Loads a single YAML file that contains one section per registered config dataclass
-(top-level header == header name in :attr:`ConfigManager.REGISTRY`). Each section's
-keys must match dataclass fields exactly; unknown keys raise. Nested dataclass-typed
-fields (e.g. ``SAC_CFG.experiment``, ``ModelCfg.actor``) recurse into their own dict.
+(top-level header == header name in :attr:`ConfigManager.REGISTRY`). Nested
+dataclass-typed fields (e.g. ``SAC_CFG.experiment``, ``ModelCfg.actor``) recurse
+into their own dict.
 
-Strict by design — any divergence between the YAML and the registered dataclasses
-is a hard error, never a silent fallback.
+Strictness rule: **error only on YAML content with no corresponding schema.** An
+unknown top-level header or an unknown key within a section is a hard error. Omission
+is always tolerated — a registered section absent from the YAML is default-
+constructed, and a field absent from a present section falls back to its dataclass
+default.
 """
 
 from __future__ import annotations
@@ -18,10 +21,13 @@ from typing import Any
 
 import yaml
 
+from configs.manager.controller_cfg import ControlCfg
+from configs.manager.loss_cfg import LossCfg
 from configs.manager.model_cfg import ModelCfg
-from configs.manager.rescue_buffer_cfg import RescueBufferCfg
+from configs.manager.ppo_cfg import PPO_CFG
 from configs.manager.runner_cfg import RunnerCfg
 from configs.manager.sac_cfg import SAC_CFG
+from configs.manager.sensor_cfg import SensorCfg
 
 
 def _resolved_field_types(dataclass_type: type) -> dict[str, Any]:
@@ -78,8 +84,11 @@ class ConfigManager:
     REGISTRY: dict[str, type] = {
         "runner_cfg": RunnerCfg,
         "sac_cfg": SAC_CFG,
+        "ppo_cfg": PPO_CFG,
         "model_cfg": ModelCfg,
-        "rescue_buffer_cfg": RescueBufferCfg,
+        "controller_cfg": ControlCfg,
+        "sensor_cfg": SensorCfg,
+        "loss_cfg": LossCfg,  # auxiliary-loss switches; consumed by learning/losses.py
     }
 
     @classmethod
@@ -89,8 +98,12 @@ class ConfigManager:
         * ``yaml_path is None`` returns one default-constructed instance per header
           (each dataclass with its own field defaults). The runner always passes a
           path; this branch exists for tests / programmatic use.
-        * Otherwise, every registered header MUST appear in the YAML. Unknown
-          headers, unknown fields within a section, and missing files all raise.
+        * Otherwise the rule is **error only on YAML content that has no
+          corresponding schema** — an unknown top-level header or an unknown field
+          within a section raises (along with a missing file). Omission is always
+          tolerated: a registered section absent from the YAML is default-
+          constructed, and fields absent from a present section fall back to their
+          dataclass defaults.
         """
         if yaml_path is None:
             return {header: type_() for header, type_ in cls.REGISTRY.items()}
@@ -110,15 +123,16 @@ class ConfigManager:
                 f"Unknown config header(s) {sorted(unknown_headers)} in {path}; "
                 f"expected one of {sorted(cls.REGISTRY)}"
             )
-        missing_headers = set(cls.REGISTRY) - set(raw)
-        if missing_headers:
-            raise KeyError(
-                f"Missing config section(s) {sorted(missing_headers)} in {path}"
-            )
 
+        # Missing sections are tolerated — default-construct them. Only YAML
+        # content without a corresponding schema (handled above and in _build)
+        # is an error.
         out = {}
         for header, type_ in cls.REGISTRY.items():
-            out[header] = cls._build(type_, raw[header], context=header)
+            if header in raw:
+                out[header] = cls._build(type_, raw[header], context=header)
+            else:
+                out[header] = type_()
         return out
 
     @classmethod

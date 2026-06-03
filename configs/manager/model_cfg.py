@@ -40,6 +40,29 @@ class ActorCfg:
     predictions the env will discard. ``None`` or ``[]`` disables. Must not
     overlap with ``bernoulli_action_dims``."""
 
+    selection_init_bias: float = 0.0
+    """For HYBRID control tasks only: initial bias added to each per-axis selection
+    (Bernoulli) logit, so the initial selection probability is ``sigmoid(bias)``.
+
+    Default ``0.0`` -> ``p=0.5`` force/position at init. Negative values bias toward
+    POSITION control at init (e.g. ``-2.0`` -> ``p≈0.12``); positive toward force.
+    Ignored by the non-hybrid actor."""
+
+    selection_distribution: str = "product"
+    """For HYBRID control tasks only: how the per-axis binary selection (Bernoulli)
+    combines with the continuous (position/force) heads in the joint distribution.
+
+    * ``"product"`` — selection and ALL continuous dims are independent
+      (``log_prob = Σ continuous + Σ selection``); entropy is the independent sum.
+    * ``"match"`` — the continuous density/entropy is CONDITIONED on the selection:
+      per gated axis only the selected component (position if sel=0, force if sel=1)
+      contributes, and entropy is the selection-probability-weighted mix of the two
+      components (the reference's hard ``HybridActionGMM``).
+
+    Ignored by the non-hybrid ``BlockSimBaActor`` (the runner pops it before
+    constructing that actor). Both SAC and PPO honor it via
+    ``HybridControlBlockSimBaActor``."""
+
 
 @dataclasses.dataclass(kw_only=True)
 class CriticCfg:

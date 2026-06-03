@@ -1,0 +1,91 @@
+# Forge Peg Insertion + Hybrid Force/Position Control, trained with PPO.
+# Mirrors forge_peg_insert_hybrid.yaml but selects the PPO agent (runner_cfg.agent_type)
+# and the "match" hybrid action distribution (model_cfg.actor.selection_distribution),
+# where the per-axis binary selection conditions the continuous position/force density.
+# force_axes=[0,0,1,0,0,0] (z-only) -> N=1 -> action 7 + 2 = 9.
+# Unknown headers/keys are hard errors; omitted sections/fields fall back to defaults.
+# (No sac_cfg section: it is default-constructed and unused under agent_type: ppo.)
+
+runner_cfg:
+  task: Isaac-Forge-PegInsert-Direct-v0
+  agent_type: ppo
+  num_envs: 256
+  num_agents: 2                      # must divide num_envs
+  total_timesteps: 20_000
+  eval_timesteps: 150
+  memory_size: 1_000_000             # ignored for PPO (rollouts drives the buffer)
+  seed: -1
+
+ppo_cfg:
+  rollouts: 32                       # collection steps/env between updates;
+                                     # (rollouts * num_envs * num_agents) must be divisible by mini_batches
+  learning_epochs: 8
+  mini_batches: 8                    # 32 * 512 = 16384 rows -> 2048 rows/minibatch
+  discount_factor: 0.99
+  gae_lambda: 0.95
+  policy_lr: 3.0e-4
+  value_lr: 3.0e-4
+  weight_decay: 1.0e-2
+  random_timesteps: 0
+  learning_starts: 0
+  grad_norm_clip: 1.0
+  ratio_clip: 0.2
+  value_clip: 0.2
+  entropy_loss_scale: 0.0
+  value_loss_scale: 1.0
+  kl_threshold: 0.0                  # 0 disables KL early-stop; e.g. 0.02 to enable
+  time_limit_bootstrap: true         # Forge truncates at 150 steps -> bootstrap on timeout
+  mixed_precision: false
+  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor_kwargs: {}
+  value_preprocessor: RunningStandardScaler
+  value_preprocessor_kwargs: {}
+  rewards_shaper_scale: null
+  gripper_action_idx: null
+  recorder:
+    enabled: false                   # recorder is SAC-only (Q-value overlay); must stay false for PPO
+  experiment:
+    directory: forge_pih_ppo_hybrid
+    experiment_name: ""
+    write_interval: 150
+    checkpoint_interval: auto
+
+model_cfg:
+  actor:
+    act_init_std: 1.0
+    actor_n: 1
+    actor_latent: 128
+    last_layer_scale: 0.1
+    clip_log_std: true
+    min_log_std: -20.0
+    max_log_std: 2.0
+    reduction: sum
+    use_state_dependent_std: false
+    bernoulli_action_dims: null      # hybrid selection is modeled by the hybrid actor, not here
+    force_zero_action_dims: [3, 4]   # Forge zeros pose Rx,Ry; sel/force dims appended after
+    selection_distribution: match    # "product" (independent) or "match" (selection-conditioned)
+    selection_init_bias: 0.0           # hybrid-only: init selection logit bias; sigmoid(bias)=init force prob (neg => position-dominant)
+  critic:
+    critic_output_init_mean: 0.0
+    critic_n: 2
+    critic_latent: 1024
+    clip_actions: false
+
+controller_cfg:
+  control_type: hybrid
+  force_axes: [0, 0, 1, 0, 0, 0]     # z-only force control
+  force_action_bounds: [50.0, 50.0, 50.0]
+  torque_action_bounds: [5.0, 5.0, 5.0]
+  force_action_threshold: [5.0, 5.0, 5.0]
+  torque_action_threshold: [1.0, 1.0, 1.0]
+  default_task_force_gains: [0.1, 0.1, 0.1, 0.01, 0.01, 0.01]   # diagonal force stiffness (kp)
+  async_z_force_bounds: false
+  apply_ema_force: false
+  no_sel_ema: false
+  ema_mode: action
+
+sensor_cfg:
+  contact:
+    enabled: true
+    contact_force_threshold: 1.0
+    log_contact_state: true

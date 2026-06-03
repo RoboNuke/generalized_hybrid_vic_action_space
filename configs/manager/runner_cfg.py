@@ -20,6 +20,11 @@ class RunnerCfg:
     task: str
     """Isaac Lab gym id, e.g. ``"Isaac-Lift-Cube-Franka-v0"``."""
 
+    agent_type: str = "sac"
+    """Which learning algorithm to run: ``"sac"`` (default; uses ``sac_cfg``) or
+    ``"ppo"`` (uses ``ppo_cfg``). SAC stays the default so existing configs are
+    unaffected."""
+
     env_cfg_overrides: dict[str, Any] = dataclasses.field(default_factory=dict)
     """Free-form overrides applied to the parsed Isaac Lab ``env_cfg`` *before*
     ``gym.make``. Keys are dotted attribute paths resolved against the env_cfg

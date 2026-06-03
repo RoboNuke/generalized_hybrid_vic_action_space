@@ -23,7 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=str,
         default=_DEFAULT_CONFIG_PATH,
-        help=f"Path to a YAML config file. Provides runner_cfg/sac_cfg/model_cfg. "
+        help=f"Path to a YAML config file. Provides runner_cfg/sac_cfg/ppo_cfg/model_cfg. "
              f"Defaults to {_DEFAULT_CONFIG_PATH}.",
     )
     parser.add_argument(
@@ -126,14 +126,16 @@ def main() -> None:
         import yaml as _yaml
         with open(args.config) as _f:
             _peek = _yaml.safe_load(_f) or {}
+        _agent_type_peek = str(_peek.get("runner_cfg", {}).get("agent_type", "sac")).lower()
+        _cfg_key = "ppo_cfg" if _agent_type_peek == "ppo" else "sac_cfg"
         if (
-            _peek.get("sac_cfg", {})
+            _peek.get(_cfg_key, {})
                  .get("recorder", {})
                  .get("enabled", False)
             and not getattr(args, "enable_cameras", False)
         ):
             args.enable_cameras = True
-            print("[runner] sac_cfg.recorder.enabled=true — forcing --enable_cameras on.")
+            print(f"[runner] {_cfg_key}.recorder.enabled=true — forcing --enable_cameras on.")
     except Exception as _e:
         # If the YAML is malformed we'll surface the error during ConfigManager
         # load below; don't block AppLauncher here.
@@ -142,6 +144,19 @@ def main() -> None:
     # Boot Omniverse before any isaaclab.envs imports.
     app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
+
+    # Silence IsaacLab's per-call "quat_rotate{,_inverse} will be deprecated" spam.
+    # These are emitted via omni.log on the "isaaclab.utils.math" channel (not Python
+    # warnings), so raise that channel's threshold to ERROR. omni is only importable
+    # after AppLauncher boots.
+    try:
+        import omni.log
+
+        omni.log.get_log().set_channel_level(
+            "isaaclab.utils.math", omni.log.Level.ERROR, omni.log.SettingBehavior.OVERRIDE
+        )
+    except Exception as e:  # pragma: no cover - best-effort log tidy-up
+        print(f"[runner] could not raise isaaclab.utils.math log level: {e!r}", flush=True)
 
     # Project root on sys.path so `models.block_simba` and `learning.sac` resolve
     # regardless of CWD.
@@ -157,11 +172,17 @@ def main() -> None:
 
     import dataclasses
     from memory.multi_random import MultiRandomMemory
-    from models.block_simba import BlockSimBaActor, BlockSimBaQCritic
+    from models.block_simba import (
+        BlockSimBaActor,
+        BlockSimBaQCritic,
+        BlockSimBaValueCritic,
+        HybridControlBlockSimBaActor,
+    )
     from learning.sac import SAC
+    from learning.ppo import PPO
+    from learning.losses import AuxLossManager
     from configs.manager import ConfigManager
     from wrappers import (
-        available_wrappers,
         default_wrapper_for_task,
         fallback_wrapper_name,
         make_wrapper,
@@ -171,8 +192,23 @@ def main() -> None:
     loaded = ConfigManager.load(args.config)
     runner_cfg = loaded["runner_cfg"]
     sac_cfg = loaded["sac_cfg"]
+    ppo_cfg = loaded["ppo_cfg"]
     model_cfg = loaded["model_cfg"]
-    rescue_buffer_cfg = loaded["rescue_buffer_cfg"]
+    controller_cfg = loaded["controller_cfg"]
+    sensor_cfg = loaded["sensor_cfg"]
+    # Auxiliary-loss switches (which extra losses are on and their per-target
+    # weights). Absent loss_cfg section -> all-off default -> vanilla SAC.
+    loss_cfg = loaded["loss_cfg"]
+
+    # Which learning algorithm to run. ``active_cfg`` supplies the fields the runner
+    # plumbs that exist on both SAC_CFG and PPO_CFG (experiment dir, observation
+    # preprocessor, rewards_shaper, recorder, mixed_precision).
+    agent_type = str(runner_cfg.agent_type).lower()
+    if agent_type not in ("sac", "ppo"):
+        raise ValueError(
+            f"runner_cfg.agent_type must be 'sac' or 'ppo', got {runner_cfg.agent_type!r}"
+        )
+    active_cfg = sac_cfg if agent_type == "sac" else ppo_cfg
 
     # CLI > YAML for runner-level fields. Apply overrides to the loaded RunnerCfg so
     # the dump-config-to-disk step at the end records the values actually used.
@@ -189,36 +225,16 @@ def main() -> None:
         runner_cfg.eval_timesteps if args.mode == "eval" else runner_cfg.total_timesteps
     )
 
-    # Auto-select a success wrapper for known tasks (e.g. Lift) when the YAML didn't
-    # set one. Always informs the user so the auto-application isn't invisible.
-    if sac_cfg.success_wrapper is None:
-        auto = default_wrapper_for_task(runner_cfg.task)
-        if auto is not None:
-            print(
-                f"[runner] auto-selecting success wrapper '{auto}' for task "
-                f"'{runner_cfg.task}' (set sac_cfg.success_wrapper explicitly to override)."
-            )
-            sac_cfg.success_wrapper = auto
-
-    # Cross-cutting consistency: the success-prediction head needs an env wrapper
-    # that emits ``infos[success_info_key]``. Catch the misconfig before booting Isaac.
-    if sac_cfg.predict_success and sac_cfg.success_wrapper is None:
-        raise ValueError(
-            "predict_success=True but sac_cfg.success_wrapper is null. Set "
-            f"success_wrapper to one of {available_wrappers()} (or disable "
-            "predict_success)."
-        )
-
     # YAML-friendly reward shaping: rewards_shaper_scale (float) -> multiplicative lambda.
     # Mirrors skrl runner's convention. Direct assignment of rewards_shaper still wins
     # if a programmatic caller set it before this point.
-    if sac_cfg.rewards_shaper is None and sac_cfg.rewards_shaper_scale is not None:
-        scale = float(sac_cfg.rewards_shaper_scale)
-        sac_cfg.rewards_shaper = lambda rewards, *args, **kwargs: rewards * scale
-    elif sac_cfg.rewards_shaper is not None and sac_cfg.rewards_shaper_scale is not None:
+    if active_cfg.rewards_shaper is None and active_cfg.rewards_shaper_scale is not None:
+        scale = float(active_cfg.rewards_shaper_scale)
+        active_cfg.rewards_shaper = lambda rewards, *args, **kwargs: rewards * scale
+    elif active_cfg.rewards_shaper is not None and active_cfg.rewards_shaper_scale is not None:
         raise ValueError(
-            "Both sac_cfg.rewards_shaper and sac_cfg.rewards_shaper_scale are set; "
-            "use exactly one."
+            f"Both {agent_type}_cfg.rewards_shaper and {agent_type}_cfg.rewards_shaper_scale "
+            "are set; use exactly one."
         )
 
     set_seed(runner_cfg.seed if runner_cfg.seed >= 0 else None)
@@ -227,6 +243,15 @@ def main() -> None:
     total_envs = runner_cfg.num_envs * runner_cfg.num_agents
     env_cfg = parse_env_cfg(runner_cfg.task, device=args.device, num_envs=total_envs)
     _apply_env_cfg_overrides(env_cfg, runner_cfg.env_cfg_overrides)
+
+    # Push the controller config's ctrl fields onto env_cfg.ctrl so the base controller
+    # (and factory_control_utils) see the YAML-overridable gains. ControlCfg subclasses the
+    # env's ForgeCtrlCfg, so it carries every ctrl field by inheritance — copy exactly the
+    # fields the env's ctrl cfg declares (avoids any hardcoded field list).
+    if hasattr(env_cfg, "ctrl"):
+        for f in dataclasses.fields(type(env_cfg.ctrl)):
+            if hasattr(controller_cfg, f.name):
+                setattr(env_cfg.ctrl, f.name, getattr(controller_cfg, f.name))
 
     # Inject the recorder camera. Direct envs like Factory/Forge construct
     # their scenes manually inside ``FactoryEnv._setup_scene`` and never read
@@ -243,7 +268,7 @@ def main() -> None:
     #   1. spawn TiledCamera on env_0
     #   2. call original clone_environments (replicates env_0 -> all envs)
     #   3. register the sensor with scene._sensors
-    if sac_cfg.recorder.enabled:
+    if agent_type == "sac" and sac_cfg.recorder.enabled:
         from isaaclab.sensors import TiledCamera, TiledCameraCfg
         from isaaclab.sim.spawners.sensors import PinholeCameraCfg
         from isaaclab_tasks.direct.factory.factory_env import FactoryEnv
@@ -305,13 +330,85 @@ def main() -> None:
             f"pre-clone; record_every_k_resets={rec.record_every_k_resets}"
         )
 
+    # Contact sensor: must be registered with the scene DURING env construction
+    # (before InteractiveScene.clone_environments), so patch FactoryEnv._setup_scene
+    # here, before gym.make. Forge/Factory only — the sensor mounts on the held/fixed
+    # peg-insertion assets. The runtime ContactSensorWrapper (added below) reads it.
+    contact_enabled = sensor_cfg.contact.enabled
+    if contact_enabled:
+        if not (runner_cfg.task.startswith("Isaac-Forge-")
+                or runner_cfg.task.startswith("Isaac-Factory-")):
+            raise ValueError(
+                f"sensor_cfg.contact.enabled=True requires a Forge/Factory task (held/fixed "
+                f"peg-insertion assets), but task is {runner_cfg.task!r}."
+            )
+        # ContactSensor reads per-env bodies via the USD stage (create_rigid_body_view),
+        # but Factory/Forge default to clone_in_fabric=True, which keeps the cloned
+        # env_1..N bodies in Fabric only — so the sensor finds just env_0 and fails its
+        # body-count check. Fabric cloning is incompatible with contact sensors, so turn
+        # it off here (a no-op for the camera recorder above).
+        if getattr(env_cfg.scene, "clone_in_fabric", False):
+            env_cfg.scene.clone_in_fabric = False
+            print("[runner] contact sensor enabled: forcing scene.clone_in_fabric=False "
+                  "(fabric clones are invisible to the contact sensor's body view).")
+        from wrappers.sensors.contact_sensor_wrapper import install_contact_sensor
+        install_contact_sensor(sensor_cfg.contact)
+
     env = gym.make(runner_cfg.task, cfg=env_cfg, render_mode=None)
-    # Always wrap with a subclass of skrl's IsaacLabWrapper. When no task-specific
-    # wrapper was selected, fall back to RewardDecompositionWrapper so every
-    # manager-based task gets per-env per-term reward logging in per-episode units
-    # (matches the units of `Reward / Total reward (mean)`). Direct-API envs
-    # without a reward_manager fall through gracefully — the hook is a no-op.
-    selected_wrapper = sac_cfg.success_wrapper or fallback_wrapper_name()
+
+    # Control wrapper (must wrap the raw gym env BEFORE the scorer/IsaacLabWrapper so the
+    # expanded action/obs/state spaces are visible when the models are built below). The
+    # control wrapper monkeypatches env.unwrapped's control hooks and grows the action
+    # space; "pose" uses the base controller and adds nothing.
+    control_type = controller_cfg.control_type
+    # For hybrid control types, keep a reference to the control wrapper so the runner
+    # can read its selection/position/force action layout for the hybrid actor.
+    ctrl_wrapper = None
+    if control_type == "pose-VICES":
+        from wrappers.controllers.vic_pose_wrapper import VICPoseWrapper
+        env = VICPoseWrapper(env, controller_cfg)
+        print(f"[runner] control wrapper: VICPoseWrapper (control_type={control_type})")
+    elif control_type == "hybrid":
+        from wrappers.controllers.hybrid_force_position_wrapper import HybridForcePositionWrapper
+        env = HybridForcePositionWrapper(env, controller_cfg, num_agents=runner_cfg.num_agents)
+        ctrl_wrapper = env
+        print(f"[runner] control wrapper: HybridForcePositionWrapper (control_type={control_type})")
+    elif control_type == "hybrid-vic":
+        from wrappers.controllers.hybrid_vic_wrapper import HybridVICWrapper
+        env = HybridVICWrapper(env, controller_cfg, num_agents=runner_cfg.num_agents)
+        ctrl_wrapper = env
+        print(f"[runner] control wrapper: HybridVICWrapper (control_type={control_type})")
+    elif control_type == "ctrl-action-interface":
+        from wrappers.controllers.ctrl_action_interface import CtrlActionInterfaceWrapper
+        env = CtrlActionInterfaceWrapper(env, controller_cfg, num_agents=runner_cfg.num_agents)
+        ctrl_wrapper = env
+        print(
+            f"[runner] control wrapper: CtrlActionInterfaceWrapper "
+            f"(control_type={control_type}, gain_mapping={controller_cfg.gain_mapping})"
+        )
+    elif control_type != "pose":
+        raise ValueError(f"[runner] unknown controller_cfg.control_type: {control_type!r}")
+
+    # Contact-sensor wrapper (logging-only): sits at the same layer as the control
+    # wrappers (inside the scorer/IsaacLabWrapper) so the per-axis in-contact flags it
+    # writes into extras['to_log'] each step are forwarded to TensorBoard by the
+    # scorer's _forward_to_log. Does not change the action/obs/state spaces.
+    if contact_enabled:
+        from wrappers.sensors.contact_sensor_wrapper import ContactSensorWrapper
+        env = ContactSensorWrapper(env, sensor_cfg.contact)
+        print(
+            f"[runner] contact-sensor wrapper attached "
+            f"(threshold={sensor_cfg.contact.contact_force_threshold} N, "
+            f"log_contact_state={sensor_cfg.contact.log_contact_state})"
+        )
+
+    # Always wrap with a subclass of skrl's IsaacLabWrapper. The wrapper is chosen
+    # by task prefix (e.g. "forge"/"factory"/"lift"); when no task-specific wrapper
+    # matches, fall back to RewardDecompositionWrapper so every manager-based task
+    # gets per-env per-term reward logging in per-episode units (matches the units
+    # of `Reward / Total reward (mean)`). Direct-API envs without a reward_manager
+    # fall through gracefully — the hook is a no-op.
+    selected_wrapper = default_wrapper_for_task(runner_cfg.task) or fallback_wrapper_name()
     env = make_wrapper(selected_wrapper, env)
 
     device = torch.device(args.device)
@@ -333,116 +430,145 @@ def main() -> None:
             f"state_dim={state_space.shape[0]} (critic uses state)"
         )
 
-    # Observation preprocessor: YAML carries the class as a string name; SAC resolves
-    # it via the registry. We inject the runtime kwargs (size, device) here since
-    # YAML can't carry a Box space or torch.device object. Skip if user explicitly
-    # set kwargs already.
-    if sac_cfg.observation_preprocessor is not None:
-        if not isinstance(sac_cfg.observation_preprocessor_kwargs, dict):
-            sac_cfg.observation_preprocessor_kwargs = {}
-        sac_cfg.observation_preprocessor_kwargs.setdefault("size", obs_space)
-        sac_cfg.observation_preprocessor_kwargs.setdefault("device", device)
+    # Observation preprocessor: YAML carries the class as a string name; the agent
+    # resolves it via the registry. We inject the runtime kwargs (size, device) here
+    # since YAML can't carry a Box space or torch.device object. Skip if user
+    # explicitly set kwargs already.
+    if active_cfg.observation_preprocessor is not None:
+        if not isinstance(active_cfg.observation_preprocessor_kwargs, dict):
+            active_cfg.observation_preprocessor_kwargs = {}
+        active_cfg.observation_preprocessor_kwargs.setdefault("size", obs_space)
+        active_cfg.observation_preprocessor_kwargs.setdefault("device", device)
+
+    # PPO value preprocessor (single shared RunningStandardScaler over scalar values).
+    if agent_type == "ppo" and ppo_cfg.value_preprocessor is not None:
+        if not isinstance(ppo_cfg.value_preprocessor_kwargs, dict):
+            ppo_cfg.value_preprocessor_kwargs = {}
+        ppo_cfg.value_preprocessor_kwargs.setdefault("size", 1)
+        ppo_cfg.value_preprocessor_kwargs.setdefault("device", device)
 
     # ---- models ----
     actor_kwargs = dataclasses.asdict(model_cfg.actor)
     critic_kwargs = dataclasses.asdict(model_cfg.critic)
-    policy = BlockSimBaActor(
-        observation_space=obs_space,
-        action_space=act_space,
-        device=device,
-        num_agents=n_agents,
-        predict_success=sac_cfg.predict_success,
-        **actor_kwargs,
-    )
+
+    # selection_distribution / selection_init_bias apply only to the hybrid actor;
+    # pop them so they never reach the plain BlockSimBaActor (which doesn't accept them).
+    selection_distribution = actor_kwargs.pop("selection_distribution", "product")
+    selection_init_bias = actor_kwargs.pop("selection_init_bias", 0.0)
 
     # Critic input space: state_space when asymmetric, else obs_space.
     critic_input_space = state_space if state_space is not None else obs_space
 
-    def make_q():
-        return BlockSimBaQCritic(
+    # Actor: hybrid control types get the selection-gated HybridControlBlockSimBaActor
+    # (product / match), otherwise the plain squashed-Gaussian actor.
+    if ctrl_wrapper is not None:
+        sel_dims, pos_dims, force_dims = ctrl_wrapper.policy_selection_layout
+        policy = HybridControlBlockSimBaActor(
+            observation_space=obs_space,
+            action_space=act_space,
+            device=device,
+            num_agents=n_agents,
+            selection_dims=sel_dims,
+            pos_component_dims=pos_dims,
+            force_component_dims=force_dims,
+            selection_distribution=selection_distribution,
+            selection_init_bias=selection_init_bias,
+            **actor_kwargs,
+        )
+        print(
+            f"[runner] hybrid actor: style={selection_distribution!r} "
+            f"selection_dims={sel_dims} pos={pos_dims} force={force_dims} "
+            f"selection_init_bias={selection_init_bias} (init p≈{1/(1+2.718281828**(-selection_init_bias)):.3f})"
+        )
+    else:
+        policy = BlockSimBaActor(
+            observation_space=obs_space,
+            action_space=act_space,
+            device=device,
+            num_agents=n_agents,
+            **actor_kwargs,
+        )
+
+    if agent_type == "sac":
+        def make_q():
+            return BlockSimBaQCritic(
+                observation_space=critic_input_space,
+                action_space=act_space,
+                device=device,
+                num_agents=n_agents,
+                **critic_kwargs,
+            )
+
+        critic_1, critic_2 = make_q(), make_q()
+        target_critic_1, target_critic_2 = make_q(), make_q()
+
+        models = {
+            "policy": policy,
+            "critic_1": critic_1,
+            "critic_2": critic_2,
+            "target_critic_1": target_critic_1,
+            "target_critic_2": target_critic_2,
+        }
+    else:  # ppo — single state-value critic V(s)
+        value = BlockSimBaValueCritic(
             observation_space=critic_input_space,
             action_space=act_space,
             device=device,
             num_agents=n_agents,
             **critic_kwargs,
         )
+        models = {"policy": policy, "value": value}
 
-    critic_1, critic_2 = make_q(), make_q()
-    target_critic_1, target_critic_2 = make_q(), make_q()
-
-    models = {
-        "policy": policy,
-        "critic_1": critic_1,
-        "critic_2": critic_2,
-        "target_critic_1": target_critic_1,
-        "target_critic_2": target_critic_2,
-    }
-
-    # ---- replay memory (per-agent partitioned sampling) ----
-    # `--memory_size` is interpreted as transitions PER AGENT (lit convention: each agent
-    # has its own ~1M buffer). Each agent owns env partition [i*epa, (i+1)*epa), so the
-    # per-env depth that yields `memory_size` per-agent transitions is:
-    #     per_env_depth = memory_size // num_envs   (where num_envs == envs per agent)
-    # skrl physically allocates a single (per_env_depth, total_envs, *) tensor, so the
-    # physical storage is per_env_depth * total_envs = memory_size * n_agents transitions.
-    per_env_memory = max(1, runner_cfg.memory_size // runner_cfg.num_envs)
-    realized_per_agent = per_env_memory * runner_cfg.num_envs
-    realized_total_storage = per_env_memory * total_envs
-    print(
-        f"[runner] memory: requested_per_agent={runner_cfg.memory_size:,}  "
-        f"per_env={per_env_memory:,}  realized_per_agent={realized_per_agent:,}  "
-        f"physical_storage={realized_total_storage:,} "
-        f"(num_envs/agent={runner_cfg.num_envs}, n_agents={n_agents})"
-    )
-    if sac_cfg.predict_success:
-        # Trajectory-staged memory: transitions live in a per-env staging buffer until
-        # the episode ends, at which point they're committed to the main buffer with
-        # the success label baked in. SAC never samples in-progress / unlabeled rows.
-        from memory.trajectory_buffered import TrajectoryBufferedMemory
-
-        # Discover the env's max episode length (Isaac Lab manager-based envs expose it).
-        max_ep_len = int(getattr(env.unwrapped, "max_episode_length", 0))
-        if max_ep_len <= 0:
-            raise RuntimeError(
-                "predict_success=True requires env.unwrapped.max_episode_length to be set. "
-                "Either disable success prediction (sac_cfg.predict_success=false) or use an "
-                "env that exposes a max episode length."
+    # ---- memory (per-agent partitioned sampling) ----
+    if agent_type == "sac":
+        # `--memory_size` is transitions PER AGENT (each agent owns env partition
+        # [i*epa, (i+1)*epa)). Per-env depth yielding memory_size per-agent transitions
+        # is memory_size // num_envs. skrl allocates one (per_env_depth, total_envs, *)
+        # tensor, so physical storage is per_env_depth * total_envs.
+        per_env_memory = max(1, runner_cfg.memory_size // runner_cfg.num_envs)
+        realized_per_agent = per_env_memory * runner_cfg.num_envs
+        print(
+            f"[runner] replay memory: requested_per_agent={runner_cfg.memory_size:,}  "
+            f"per_env={per_env_memory:,}  realized_per_agent={realized_per_agent:,}  "
+            f"physical_storage={per_env_memory * total_envs:,} "
+            f"(num_envs/agent={runner_cfg.num_envs}, n_agents={n_agents})"
+        )
+    else:  # ppo — on-policy rollout buffer of depth `rollouts` per env
+        per_env_memory = max(1, int(ppo_cfg.rollouts))
+        rollout_rows = per_env_memory * total_envs
+        if rollout_rows % ppo_cfg.mini_batches != 0:
+            raise ValueError(
+                f"PPO requires (rollouts * total_envs) % mini_batches == 0 so sample_all "
+                f"partitions evenly; got rollouts={per_env_memory} * total_envs={total_envs} "
+                f"= {rollout_rows}, not divisible by mini_batches={ppo_cfg.mini_batches}."
             )
-        print(f"[runner] env reports max_episode_length={max_ep_len}")
-        memory = TrajectoryBufferedMemory(
-            memory_size=per_env_memory,
-            num_envs=env.num_envs,
-            num_agents=n_agents,
-            max_episode_length=max_ep_len,
-            success_streak_len=int(getattr(sac_cfg, "success_streak_len", 1)),
-            success_use_streak=bool(getattr(sac_cfg, "success_use_streak", True)),
-            device=device,
-            replacement=True,
+        print(
+            f"[runner] rollout memory: rollouts={per_env_memory} per env  "
+            f"total_rows={rollout_rows:,}  mini_batches={ppo_cfg.mini_batches}  "
+            f"(rows/minibatch={rollout_rows // ppo_cfg.mini_batches:,})"
         )
-    else:
-        memory = MultiRandomMemory(
-            memory_size=per_env_memory,
-            num_envs=env.num_envs,
-            num_agents=n_agents,
-            device=device,
-            replacement=True,
-        )
+    memory = MultiRandomMemory(
+        memory_size=per_env_memory,
+        num_envs=env.num_envs,
+        num_agents=n_agents,
+        device=device,
+        replacement=True,
+    )
 
-    # ---- SAC config (loaded above; apply CLI overrides) ----
-    cfg = sac_cfg
-    # batch_size is interpreted PER AGENT — each agent samples cfg.batch_size
-    # transitions from its own env-partition slice. Total memory draw per
-    # gradient step is cfg.batch_size * num_agents.
-    assert realized_per_agent >= cfg.batch_size, (
-        f"per-agent replay buffer ({realized_per_agent}) < batch_size ({cfg.batch_size}); "
-        f"increase memory_size (need at least {cfg.batch_size} per agent) or reduce batch_size"
-    )
-    print(
-        f"[runner] batch_size={cfg.batch_size} per agent  "
-        f"(memory.sample returns {cfg.batch_size * n_agents:,} total rows / grad step)"
-    )
+    # ---- agent config (loaded above; `--memory_size` only affects SAC's replay) ----
+    cfg = active_cfg
+    if agent_type == "sac":
+        # batch_size is PER AGENT — each agent samples cfg.batch_size from its slice.
+        assert realized_per_agent >= cfg.batch_size, (
+            f"per-agent replay buffer ({realized_per_agent}) < batch_size ({cfg.batch_size}); "
+            f"increase memory_size (need at least {cfg.batch_size} per agent) or reduce batch_size"
+        )
+        print(
+            f"[runner] batch_size={cfg.batch_size} per agent  "
+            f"(memory.sample returns {cfg.batch_size * n_agents:,} total rows / grad step)"
+        )
     # CLI > YAML > auto-generated for the run name.
-    exp_name = args.experiment_name or cfg.experiment.experiment_name or f"{runner_cfg.task}_sac_N{n_agents}"
+    exp_name = args.experiment_name or cfg.experiment.experiment_name or f"{runner_cfg.task}_{agent_type}_N{n_agents}"
     cfg.experiment.experiment_name = exp_name
 
     # Final per-run output dir = <log_root>/<family>/<experiment_name>
@@ -473,7 +599,8 @@ def main() -> None:
     print(f"[runner] experiment dir: {os.path.join(final_directory, exp_name)}")
 
     # ---- agent ----
-    agent = SAC(
+    agent_cls = SAC if agent_type == "sac" else PPO
+    agent = agent_cls(
         models=models,
         memory=memory,
         observation_space=obs_space,
@@ -482,6 +609,11 @@ def main() -> None:
         device=device,
         cfg=cfg,
         num_agents=n_agents,
+        # Build the auxiliary-loss manager from loss_cfg and hand it to the agent.
+        # from_cfg() reads the per-loss flat fields and validates targets; it
+        # returns an empty (no-op) manager when nothing is enabled. Both SAC and
+        # PPO accept and apply this.
+        aux_losses=AuxLossManager.from_cfg(loss_cfg),
     )
 
     # ---- trainer ----
@@ -509,82 +641,18 @@ def main() -> None:
     # but the second call returns immediately.
     agent.init(trainer_cfg=trainer.cfg)
 
-    # Rescue-buffer subsystem: wraps the env with StateSnapshotWrapper (snapshot
-    # ring) then RescueInitWrapper (observe-only natural-reset hook), builds per-
-    # agent RescueBuffers and a RescueMetricsTracker, and attaches everything to
-    # the SAC agent. Strict prerequisites: sac_cfg.predict_success=True and env
-    # must expose max_episode_length. See configs/manager/rescue_buffer_cfg.py.
-    if rescue_buffer_cfg.enabled:
-        if not sac_cfg.predict_success:
-            raise RuntimeError(
-                "rescue_buffer_cfg.enabled=true requires sac_cfg.predict_success=true "
-                "(Algorithm 1 needs the success-prediction head)."
-            )
-        max_ep_len_rescue = int(getattr(env.unwrapped, "max_episode_length", 0))
-        if max_ep_len_rescue <= 0:
-            raise RuntimeError(
-                "rescue_buffer_cfg.enabled=true requires env.unwrapped.max_episode_length to be set."
-            )
-
-        from wrappers.state_snapshot_wrapper import StateSnapshotWrapper
-        from wrappers.rescue_init_wrapper import RescueInitWrapper
-        from memory.rescue_buffer import RescueBuffer
-        from learning.rescue_metrics import RescueMetricsTracker
-
-        env = StateSnapshotWrapper(env, max_episode_length=max_ep_len_rescue, device=device)
-        rescue_buffers = [
-            RescueBuffer(
-                capacity=int(rescue_buffer_cfg.max_buffer_size),
-                snapshot_dim=env.snapshot_dim,
-                obs_dim=int(obs_space.shape[0]),
-                device=device,
-                dead_point_min_attempts=int(rescue_buffer_cfg.dead_point_min_attempts),
-            )
-            for _ in range(n_agents)
-        ]
-        rescue_metrics = RescueMetricsTracker(
-            cfg=rescue_buffer_cfg,
-            summary_writers=agent.per_agent_image_writers,
-            observation_preprocessor=agent._observation_preprocessor,
-            success_prob_query=agent.success_prob_for_obs,
-            rescue_buffers=rescue_buffers,
-            num_agents=n_agents,
-            epa=env.num_envs // n_agents,
-            obs_dim=int(obs_space.shape[0]),
-            max_episode_length=max_ep_len_rescue,
-            write_interval=int(sac_cfg.experiment.write_interval),
-            experiment_dir=agent.experiment_dir,
-            device=device,
-        )
-        env = RescueInitWrapper(
-            env,
-            rescue_buffers=rescue_buffers,
-            state_snapshot=env,  # the StateSnapshotWrapper we just constructed
-            metrics_tracker=rescue_metrics,
-            num_agents=n_agents,
-            alpha=float(rescue_buffer_cfg.alpha),
-            rho_min=float(rescue_buffer_cfg.rho_min),
-        )
-        trainer.env = env
-        agent.attach_rescue(
-            cfg=rescue_buffer_cfg,
-            state_snapshot=env._state_snapshot,
-            rescue_buffers=rescue_buffers,
-            rescue_metrics=rescue_metrics,
-        )
-        print(
-            f"[runner] rescue subsystem enabled: tau={rescue_buffer_cfg.tau}, "
-            f"delta={rescue_buffer_cfg.delta}, alpha={rescue_buffer_cfg.alpha}, "
-            f"rho_min={rescue_buffer_cfg.rho_min}, W={rescue_buffer_cfg.window_size}, "
-            f"capacity={rescue_buffer_cfg.max_buffer_size}, snapshot_dim={env._state_snapshot.snapshot_dim}"
-        )
-
     # Recorder wrapper: opens a 3x4 grid GIF + TB video every K-th *global*
     # reset (steps where every env reports done). Constructed after the SAC
     # agent so its critics + state preprocessor can be passed in. The wrapper
     # composes around the existing wrapper stack via attribute delegation, so
     # the trainer's view of the env is unchanged.
-    if sac_cfg.recorder.enabled:
+    if agent_type == "ppo" and ppo_cfg.recorder.enabled:
+        raise NotImplementedError(
+            "ppo_cfg.recorder.enabled=True is not supported: the RecordingWrapper overlays "
+            "Q-values from SAC's twin critics, which PPO (state-value critic) lacks. Disable "
+            "the recorder for PPO until it is generalized to a value critic."
+        )
+    if agent_type == "sac" and sac_cfg.recorder.enabled:
         from wrappers.recording import RecordingWrapper
 
         rec_max_ep_len = int(getattr(env.unwrapped, "max_episode_length", 0))
