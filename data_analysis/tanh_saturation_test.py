@@ -58,7 +58,6 @@ def _make_actor(obs_dim, act_dim, scale, act_init_std, hidden, blocks, device, n
         min_log_std=-20.0,
         max_log_std=2.0,
         use_state_dependent_std=False,
-        predict_success=False,
     ).to(device)
 
 

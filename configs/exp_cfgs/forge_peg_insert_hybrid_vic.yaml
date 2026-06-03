@@ -1,0 +1,98 @@
+# Forge Peg Insertion + Hybrid Force/Position + Variable Impedance (hybrid-vic).
+# Unifies hybrid force/position control with full 6x6 variable impedance: on top of the
+# hybrid [pose | N sel | N force] action, the policy outputs a 6x6 stiffness K and a 6x6
+# damping D (36 + 36 = 72 extra dims). force_axes selects which axes can be force-controlled
+# (this example: z); set force_axes all-zero for a pure full-matrix VIC.
+#
+# Action dims for this config: base 7 + 2*N(=1) + 72 = 81.
+# NOTE: target_entropy is a PLACEHOLDER — more controllers are coming that change the action
+# dim, so it'll be re-tuned later; don't read too much into the value.
+# Unknown headers/keys are hard errors; omitted sections/fields fall back to defaults.
+
+runner_cfg:
+  task: Isaac-Forge-PegInsert-Direct-v0
+  agent_type: sac                   # "sac" (default) or "ppo"; selects sac_cfg vs ppo_cfg
+  num_envs: 256
+  num_agents: 2
+  total_timesteps: 20_000
+  eval_timesteps: 150
+  memory_size: 2_000_000
+  seed: -1
+
+sac_cfg:
+  gradient_steps: 8
+  batch_size: 1024
+  discount_factor: 0.99
+  polyak: 0.005
+  actor_lr: 1.0e-4
+  critic_lr: 1.0e-4
+  entropy_lr: 1.0e-4
+  weight_decay: 1.0e-2
+  random_timesteps: 0
+  learning_starts: 1500
+  learn_entropy: true
+  initial_entropy_value: 1.0e-2
+  target_entropy: -30.0            # PLACEHOLDER (action dim is large + will change); re-tune later
+  grad_norm_clip: 0.0
+  mixed_precision: false
+  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor_kwargs: {}
+  rewards_shaper_scale: null
+  gripper_action_idx: null
+  recorder:
+    enabled: false
+  experiment:
+    directory: forge_pih_hybrid_vic
+    experiment_name: ""
+    write_interval: 150
+    checkpoint_interval: auto
+
+model_cfg:
+  actor:
+    act_init_std: 1.0
+    selection_distribution: product  # hybrid-only: "product" (independent) or "match" (selection-conditioned)
+    selection_init_bias: 0.0           # hybrid-only: init selection logit bias; sigmoid(bias)=init force prob (neg => position-dominant)
+    actor_n: 1
+    actor_latent: 128
+    last_layer_scale: 0.1
+    clip_log_std: true
+    min_log_std: -20.0
+    max_log_std: 2.0
+    reduction: sum
+    use_state_dependent_std: false
+    bernoulli_action_dims: null
+    force_zero_action_dims: [3, 4]   # Forge zeros pose Rx,Ry; sel/force/gain dims appended after
+  critic:
+    critic_output_init_mean: 0.0
+    critic_n: 2
+    critic_latent: 1024
+    clip_actions: false
+
+controller_cfg:
+  control_type: hybrid-vic
+  force_axes: [0, 0, 1, 0, 0, 0]   # z force-eligible; set all-zero for pure VIC
+  # --- variable-impedance matrix bounds: per-axis [x,y,z,Rx,Ry,Rz], row-indexed per entry ---
+  # Each 6x6 K/D/K_f entry in row i is mapped from [-1,1] into [min[i], max[i]].
+  gain_min: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]            # pose stiffness K
+  gain_max: [1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0]
+  damping_min: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]         # pose damping D
+  damping_max: [100.0, 100.0, 100.0, 100.0, 100.0, 100.0]
+  force_gain_min: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]      # force stiffness K_f
+  force_gain_max: [1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0]
+  # --- hybrid force-control fields (used on force-eligible axes) ---
+  # NOTE: force stiffness here is the policy's full 6x6 K_f matrix (mapped with force_gain_*);
+  # the diagonal default_task_force_gains is NOT used by hybrid-vic.
+  force_action_bounds: [50.0, 50.0, 50.0]
+  torque_action_bounds: [5.0, 5.0, 5.0]
+  force_action_threshold: [5.0, 5.0, 5.0]
+  torque_action_threshold: [1.0, 1.0, 1.0]
+  async_z_force_bounds: false
+  apply_ema_force: false
+  no_sel_ema: false
+  ema_mode: action
+
+sensor_cfg:
+  contact:
+    enabled: true                  # mount an IsaacLab ContactSensor on the peg, filtered vs the hole
+    contact_force_threshold: 1.0   # N; per-axis EE-frame |force| above this => in contact (1.0 matches upstream)
+    log_contact_state: true        # log Contact / In-Contact {X,Y,Z,Any} fractions to TensorBoard

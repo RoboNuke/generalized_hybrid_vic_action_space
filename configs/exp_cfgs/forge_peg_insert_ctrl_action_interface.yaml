@@ -1,0 +1,124 @@
+# Forge Peg Insertion + Control Action Interface (ctrl-action-interface).
+# CtrlActionInterfaceWrapper is a HybridVICWrapper whose pose stiffness K, pose damping D, and
+# force stiffness K_f are produced from a CONFIG-SELECTABLE action-space formulation rather than
+# raw 6x6 matrices. Switch formulations by changing `gain_mapping` only. D is always derived from
+# K (never sampled); force control is pure stiffness (K_f, no damping). All formulations assume
+# policy actions in [-1, 1] and scale them internally.
+#
+# Action-dim formula: base 7 + 2*N + pdim + (pdim if use_hybrid_force else 0),
+#   where N = sum(force_axes) and pdim depends on gain_mapping:
+#     constant=0, variable_diagonal=6, cholesky=12, rotated=12.
+#   This config (variable_diagonal, force_axes x,y,z => N=3, hybrid on): 7 + 6 + 6 + 6 = 25.
+# NOTE: target_entropy is a PLACEHOLDER — the action dim changes with gain_mapping/hybrid, so
+# re-tune per formulation; don't read too much into the value.
+# Unknown headers/keys are hard errors; omitted sections/fields fall back to defaults.
+
+runner_cfg:
+  task: Isaac-Forge-PegInsert-Direct-v0
+  agent_type: sac                   # "sac" (default) or "ppo"; selects sac_cfg vs ppo_cfg
+  num_envs: 256
+  num_agents: 2
+  total_timesteps: 20_000
+  eval_timesteps: 150
+  memory_size: 2_000_000
+  seed: -1
+
+sac_cfg:
+  gradient_steps: 8
+  batch_size: 1024
+  discount_factor: 0.99
+  polyak: 0.005
+  actor_lr: 1.0e-4
+  critic_lr: 1.0e-4
+  entropy_lr: 1.0e-4
+  weight_decay: 1.0e-2
+  random_timesteps: 0
+  learning_starts: 1000
+  learn_entropy: true
+  initial_entropy_value: 1.0e-2
+  target_entropy: -10.0            # PLACEHOLDER (action dim varies with gain_mapping); re-tune later
+  grad_norm_clip: 0.0
+  mixed_precision: false
+  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor_kwargs: {}
+  rewards_shaper_scale: null
+  gripper_action_idx: null
+  recorder:
+    enabled: false
+  experiment:
+    directory: forge_pih_ctrl_action_interface
+    experiment_name: ""
+    write_interval: 150
+    checkpoint_interval: auto
+
+model_cfg:
+  actor:
+    act_init_std: 1.0
+    selection_distribution: product  # hybrid-only: "product" (independent) or "match" (selection-conditioned)
+    selection_init_bias: 0.0           # hybrid-only: init selection logit bias; sigmoid(bias)=init force prob (neg => position-dominant)
+    actor_n: 1
+    actor_latent: 128
+    last_layer_scale: 0.1
+    clip_log_std: true
+    min_log_std: -20.0
+    max_log_std: 2.0
+    reduction: sum
+    use_state_dependent_std: false
+    bernoulli_action_dims: null
+    force_zero_action_dims: [3, 4]   # Forge zeros pose Rx,Ry; sel/force/gain dims appended after
+  critic:
+    critic_output_init_mean: 0.0
+    critic_n: 2
+    critic_latent: 1024
+    clip_actions: false
+
+controller_cfg:
+  control_type: ctrl-action-interface
+  # ---- formulation selector (the single switch) ----
+  # "pose"              : No wrapper
+  # "constant"          : fixed diagonal K from default_task_prop_gains (K_f from
+  #                       default_task_force_gains); 0 extra action dims.
+  # "variable_diagonal" : per-axis diagonal K, 6 dims, geometric scaling.
+  # "cholesky"          : block-diagonal SPD K = blkdiag(L_pos L_posᵀ, L_rot L_rotᵀ), 12 dims
+  #                       (per block: 3 L-diagonal + 3 L-off-diagonal). D = zeros for now.
+  # "rotated"           : diagonal K (6) + 6-D rotation vector (6) = 12 dims; R applied as
+  #                       blkdiag(R,R) to the full 6x6.
+  gain_mapping: "constant" #variable_diagonal
+
+  # Toggle force control. When false: NO selection/force-target dims, K_f = zeros, and
+  # force_axes MUST be all-zero. When true: force_axes selects eligible axes (adds 2*N dims)
+  # and K_f gets its own gain dims (same formulation as pose K).
+  use_hybrid_force: false
+  force_axes: [0, 0, 0, 0, 0, 0]   # x,y,z force-eligible (must be all-zero when use_hybrid_force=false)
+
+  # ---- shared per-axis bounds [x,y,z,Rx,Ry,Rz], geometric scaling k = lo*(hi/lo)^((a+1)/2) ----
+  # A lower bound < ~1e-6 disables that channel (k=0) instead of producing NaN, so use > 0 for
+  # meaningful variable impedance. Translation and rotation differ ~10x, hence the split values.
+  gain_min: [300, 300, 300, 20, 20, 20] #[100.0, 100.0, 100.0, 5.0, 5.0, 5.0]        # pose stiffness K (position x3, rotation x3)
+  gain_max: [300, 300, 300, 20, 20, 20] #[2000.0, 2000.0, 2000.0, 100.0, 100.0, 100.0]
+  force_gain_min: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]        # force stiffness K_f (force x3, torque x3)
+  force_gain_max: [100.0, 100.0, 100.0, 10.0, 10.0, 10.0]
+
+  # Cholesky-only: off-diagonal L entry = chol_offdiag_rho * sqrt(lo*hi) * clamp(a,-1,1).
+  # 0.0 => diagonal-only (equivalent to variable_diagonal but with 12 dims). Increase to
+  # allow within-block (translation- or rotation-) axis coupling.
+  chol_offdiag_rho: 0.0
+
+  # ---- hybrid force-control fields (used on force-eligible axes when use_hybrid_force) ----
+  force_action_bounds: [20.0, 20.0, 20.0]
+  torque_action_bounds: [0.25, 0.25, 0.25]
+  force_action_threshold: [2.0, 2.0, 2.0]
+  torque_action_threshold: [0.01, 0.01, 0.01]
+  default_task_force_gains: [0.5, 0.5, 0.5, 0.1, 0.1, 0.1]   # K_f diagonal in "constant" mode
+  async_z_force_bounds: false
+  apply_ema_force: false
+  no_sel_ema: false
+  ema_mode: action
+  # NOTE: damping D is derived (2*sqrt(K), or zeros for cholesky), so damping_min/max are
+  # unused here; gain_min/gain_max (pose stiffness) ARE used.
+
+sensor_cfg:
+  contact:
+    enabled: true                  # mount an IsaacLab ContactSensor on the peg, filtered vs the hole
+    contact_force_threshold: 1.0   # N; per-axis EE-frame |force| above this => in contact (1.0 matches upstream)
+    log_contact_state: true        # log Contact / In-Contact {X,Y,Z,Any} fractions to TensorBoard

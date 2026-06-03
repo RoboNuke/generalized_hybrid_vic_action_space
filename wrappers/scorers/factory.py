@@ -7,10 +7,9 @@ gracefully no-ops. Per-env per-term decomposition is recovered here by hooking
 it's collapsed to a scalar in ``extras``.
 
 Mirrors :class:`ForgeWrapper` but **without** the Forge-specific
-``_log_forge_metrics`` hook (Factory has no `success_pred_error` reward term —
-success prediction is handled by our own SAC ``predict_success`` head, trained
-via BCE against the per-trajectory ``ep_succeeded`` label that we inject as
-``info["is_success"]``).
+``_log_forge_metrics`` hook (Factory has no `success_pred_error` reward term).
+We inject the per-trajectory ``ep_succeeded`` flag as ``info["is_success"]``
+for episode success-rate logging and recording-border colouring.
 
 Action space is 6 (no Forge-style success-prediction action dim). All 6 dims
 are continuous, so YAML should set ``bernoulli_action_dims: null`` and
@@ -23,7 +22,7 @@ from typing import Any
 
 import torch
 
-from wrappers.reward_decomposition import RewardDecompositionWrapper
+from wrappers.scorers.reward_decomposition import RewardDecompositionWrapper
 
 
 class FactoryWrapper(RewardDecompositionWrapper):
@@ -115,11 +114,6 @@ class FactoryWrapper(RewardDecompositionWrapper):
         # `super().step()` has already invoked `_reset_idx` on truncating
         # envs which zeros the upstream tensor — reading it post-step loses
         # any success achieved on the truncation step itself.
-        #
-        # Downstream (sac.py + memory) applies the N-consecutive-step streak
-        # criterion (`sac_cfg.success_streak_len`) to decide whether the
-        # trajectory is positive. We do NOT latch here — touch-and-slip
-        # should NOT be a positive unless the streak threshold is met.
         device = self._unwrapped.device
         num_envs = self._unwrapped.num_envs
         if self._latest_curr_successes is not None:

@@ -24,7 +24,7 @@ from isaaclab_tasks.manager_based.manipulation.lift.mdp.terminations import (
     object_reached_goal,
 )
 
-from wrappers.reward_decomposition import RewardDecompositionWrapper
+from wrappers.scorers.reward_decomposition import RewardDecompositionWrapper
 
 
 class LiftSuccessWrapper(RewardDecompositionWrapper):

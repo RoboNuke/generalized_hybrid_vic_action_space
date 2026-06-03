@@ -19,10 +19,9 @@ We also inject ``info["is_success"]`` per step as the **instantaneous**
 Lab's ``_get_dones`` / ``_reset_idx`` zeroes the upstream buffers. Reading
 ``env.ep_succeeded`` post-step would lose any success achieved on the
 truncation step itself (since ``_reset_idx`` runs inside ``super().step()``
-for envs truncating this step) — same bug the factory wrapper fixes. SAC's
-streak-counter + ``finalize_trajectory`` path consumes the per-step flag and
-applies the trajectory-level criterion controlled by ``success_use_streak``
-and ``success_streak_len``.
+for envs truncating this step) — same bug the factory wrapper fixes. SAC
+reads this per-step flag for episode success-rate logging and the
+recording/visualization layer uses it to colour episode borders.
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ from typing import Any
 
 import torch
 
-from wrappers.reward_decomposition import RewardDecompositionWrapper
+from wrappers.scorers.reward_decomposition import RewardDecompositionWrapper
 
 
 class ForgeWrapper(RewardDecompositionWrapper):

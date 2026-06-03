@@ -75,7 +75,47 @@ class RewardDecompositionWrapper(IsaacLabWrapper):
         self._step_fired = True
         obs, reward, terminated, truncated, info = super().step(actions)
         self._inject_per_env_rew(info)
+        self._forward_to_log(info)
         return obs, reward, terminated, truncated, info
+
+    def _forward_to_log(self, info: dict) -> None:
+        """Forward control-wrapper metrics from ``info['to_log']`` to TensorBoard.
+
+        Control wrappers (VIC / hybrid / contact sensor) write per-env tensors into
+        ``env.unwrapped.extras['to_log']`` (surfaced here as ``info['to_log']``).
+
+        Per-env tensors (first dim == ``num_envs``) are forwarded RAW under
+        ``info['per_env_to_log']`` so SAC can env-mean over each agent's env partition
+        and log a distinct value per agent. Reducing to a single global env-mean here
+        (as we used to) makes the metric identical across agents — every agent's writer
+        receives the same number. Trailing dims are mean-reduced so each entry is a
+        ``(num_envs,)`` vector.
+
+        Anything that is not a per-env tensor (a scalar, or a tensor whose first dim
+        isn't ``num_envs``) is reduced to a single env-mean scalar under ``info['log']``
+        with the tag verbatim, which SAC mirrors to every agent. The ``to_log`` dict is
+        cleared so stale values from a previous step aren't re-logged.
+        """
+        to_log = info.get("to_log")
+        if not isinstance(to_log, dict) or not to_log:
+            return
+        log = info.setdefault("log", {})
+        num_envs = self._unwrapped.num_envs
+        per_env: dict[str, torch.Tensor] = {}
+        for k, v in to_log.items():
+            if torch.is_tensor(v):
+                if v.dim() > 0 and v.shape[0] == num_envs:
+                    vec = v.detach().float()
+                    if vec.dim() > 1:  # collapse trailing dims -> (num_envs,)
+                        vec = vec.flatten(1).mean(dim=1)
+                    per_env[k] = vec
+                else:
+                    log[k] = v.float().mean()
+            elif isinstance(v, (int, float)):
+                log[k] = float(v)
+        if per_env:
+            info["per_env_to_log"] = per_env
+        to_log.clear()
 
     def _inject_per_env_rew(self, info: dict) -> None:
         """Publish captured per-env per-term episode sums into info, then clear."""

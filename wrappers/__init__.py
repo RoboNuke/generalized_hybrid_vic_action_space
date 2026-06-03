@@ -11,12 +11,13 @@ from __future__ import annotations
 from typing import Any, Callable
 
 # name -> "module.ClassName". Resolved lazily by ``make_wrapper``.
+# Per-env scorer wrappers live in the ``wrappers.scorers`` subpackage.
 _REGISTRY: dict[str, str] = {
-    "lift": "wrappers.lift_success.LiftSuccessWrapper",
-    "ant_success": "wrappers.ant_success.AntSuccessWrapper",
-    "factory": "wrappers.factory.FactoryWrapper",
-    "forge": "wrappers.forge.ForgeWrapper",
-    "reward_decomposition": "wrappers.reward_decomposition.RewardDecompositionWrapper",
+    "lift": "wrappers.scorers.lift_success.LiftSuccessWrapper",
+    "ant_success": "wrappers.scorers.ant_success.AntSuccessWrapper",
+    "factory": "wrappers.scorers.factory.FactoryWrapper",
+    "forge": "wrappers.scorers.forge.ForgeWrapper",
+    "reward_decomposition": "wrappers.scorers.reward_decomposition.RewardDecompositionWrapper",
 }
 
 # Default wrapper applied when no task-specific or YAML-specified wrapper is set.
@@ -25,8 +26,8 @@ _REGISTRY: dict[str, str] = {
 _DEFAULT_WRAPPER_NAME: str = "reward_decomposition"
 
 # Default wrapper for a given Isaac Lab task id, matched by prefix. Lets the runner
-# auto-apply success wrappers for known tasks without forcing every YAML to set
-# ``sac_cfg.success_wrapper``. First matching prefix wins.
+# auto-apply the right wrapper for known tasks from the task id alone. First
+# matching prefix wins.
 _TASK_DEFAULTS: dict[str, str] = {
     "Isaac-Lift-Cube-": "lift",
     "Isaac-Ant-": "ant_success",
@@ -43,8 +44,7 @@ def available_wrappers() -> list[str]:
 def default_wrapper_for_task(task: str) -> str | None:
     """Return the registered wrapper name whose prefix matches ``task``, or ``None``.
 
-    Used by the runner to auto-select a success wrapper based on the task id when
-    the user hasn't set one explicitly in the YAML.
+    Used by the runner to select the env wrapper based on the task id.
     """
     for prefix, name in _TASK_DEFAULTS.items():
         if task.startswith(prefix):

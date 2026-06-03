@@ -33,7 +33,7 @@ from typing import Any
 
 import torch
 
-from wrappers.reward_decomposition import RewardDecompositionWrapper
+from wrappers.scorers.reward_decomposition import RewardDecompositionWrapper
 
 
 class AntSuccessWrapper(RewardDecompositionWrapper):
