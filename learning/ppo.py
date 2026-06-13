@@ -98,6 +98,7 @@ class PPO(BlockAgent):
         cfg: PPO_CFG | dict = {},
         num_agents: int = 1,
         aux_losses: "AuxLossManager | None" = None,
+        contact_axes: list[int] | None = None,
     ) -> None:
         """Proximal Policy Optimization (PPO) with per-agent block-parallel independence.
 
@@ -120,6 +121,7 @@ class PPO(BlockAgent):
             device=device,
             cfg=PPO_CFG(**cfg) if isinstance(cfg, dict) else cfg,
             num_agents=num_agents,
+            contact_axes=contact_axes,
         )
 
         self.state_space = state_space
@@ -231,6 +233,9 @@ class PPO(BlockAgent):
                     "observations", "actions", "log_prob", "values", "returns", "advantages",
                 ]
 
+            # Optional ground-truth contact tensor for the supervised-selection loss.
+            self._maybe_create_contact_tensor()
+
     # --------------------------------------------------------------
     # Checkpoint hooks (BlockAgent does the slicing/stitching)
     # --------------------------------------------------------------
@@ -270,7 +275,12 @@ class PPO(BlockAgent):
                 self._current_values = self._value_preprocessor(values, inverse=True)
             return actions, outputs
 
-        with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
+        # no_grad: rollout sampling only. The PPO update recomputes log_prob/value
+        # from the stored rollout for the gradient, so the action graph here is never
+        # backpropagated — but if left attached it gets spliced into the controller
+        # wrappers' EMA buffers in-place every step, growing an unbounded graph that
+        # leaks GPU memory until OOM. (Stored log_prob/values are detached on buffer copy.)
+        with torch.no_grad(), torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
             actions, outputs = self.policy.act(inputs, role="policy")
             self._current_log_prob = outputs["log_prob"]
             if self.training:
@@ -332,6 +342,10 @@ class PPO(BlockAgent):
                         "(env.state() must return non-None)."
                     )
                 add_kwargs["states"] = states
+            # One-step-aligned contact ground truth for the SSL (no-op unless contact_axes).
+            self._buffer_contact_for_write(
+                terminated=terminated, truncated=truncated, infos=infos, add_kwargs=add_kwargs
+            )
             self.memory.add_samples(**add_kwargs)
 
     def pre_interaction(self, *, timestep: int, timesteps: int) -> None:
@@ -386,8 +400,10 @@ class PPO(BlockAgent):
 
         # per-agent metric accumulators (lists of (N,) tensors, averaged at the end)
         acc: dict[str, list[torch.Tensor]] = collections.defaultdict(list)
-        aux_policy_acc: dict[str, float] = {}
-        aux_value_acc: dict[str, float] = {}
+        # Per-agent (N,) raw aux-loss values, keyed by loss name. AuxLossManager.compute
+        # returns the unweighted per-agent tensor; we keep the last minibatch's value.
+        aux_policy_acc: dict[str, torch.Tensor] = {}
+        aux_value_acc: dict[str, torch.Tensor] = {}
 
         for epoch in range(self.cfg.learning_epochs):
             kl_epoch: list[torch.Tensor] = []
@@ -459,8 +475,8 @@ class PPO(BlockAgent):
 
                     # auxiliary losses (added to the single combined backward)
                     aux_total = torch.zeros((), device=self.device)
-                    aux_policy_terms: dict[str, float] = {}
-                    aux_value_terms: dict[str, float] = {}
+                    aux_policy_terms: dict[str, torch.Tensor] = {}
+                    aux_value_terms: dict[str, torch.Tensor] = {}
                     if self._aux_losses is not None and self._aux_losses.has_target("policy"):
                         # Fresh policy sample so action-regularizers (e.g. action_l2)
                         # differentiate through a reparameterized sample, like SAC.
@@ -556,10 +572,12 @@ class PPO(BlockAgent):
             for tag, vals in acc.items():
                 if vals:
                     self.track_per_agent(tag, torch.stack(vals).mean(dim=0))
+            # Aux losses: per-agent raw values under single-"/" tags, matching SAC
+            # (`Loss/ {name}_raw_actor` / `_raw_critic`). `val` is already (N,).
             for name, val in aux_policy_acc.items():
-                self.track_per_agent(f"Loss / Aux / {name} (policy)", [val] * N)
+                self.track_per_agent(f"Loss/ {name}_raw_actor", val)
             for name, val in aux_value_acc.items():
-                self.track_per_agent(f"Loss / Aux / {name} (critic)", [val] * N)
+                self.track_per_agent(f"Loss/ {name}_raw_critic", val)
             if self._last_action_head_grad_norm is not None:
                 self.track_per_agent("Action / action head grad norm", self._last_action_head_grad_norm)
             if self.policy_scheduler:

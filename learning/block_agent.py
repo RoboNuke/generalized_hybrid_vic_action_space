@@ -57,6 +57,7 @@ class BlockAgent(Agent):
         device: str | torch.device | None = None,
         cfg=None,
         num_agents: int = 1,
+        contact_axes: list[int] | None = None,
     ) -> None:
         super().__init__(
             models=models,
@@ -67,6 +68,19 @@ class BlockAgent(Agent):
             cfg=cfg,
         )
         self.num_agents = num_agents
+
+        # Optional ground-truth contact buffering for the supervised-selection loss.
+        # ``contact_axes`` are the force-eligible sensor-contact columns (nonzero
+        # ``controller_cfg.force_axes``, ascending x/y/z order); None disables it.
+        # The stored contact width is ``len(contact_axes) == sum(force_axes)`` — it tracks
+        # the force axes, not a fixed 3.
+        self._contact_axes = (
+            torch.as_tensor(list(contact_axes), dtype=torch.long, device=self.device)
+            if contact_axes else None
+        )
+        self._contact_dim = len(contact_axes) if contact_axes else 0
+        # One-step buffer: the contact the policy SAW at obs(t), written with transition t.
+        self._pending_contact: torch.Tensor | None = None
 
         # per-agent tracking buffers (writers created in init() once experiment_dir is set)
         self.per_agent_writers: list[SummaryWriter] = []
@@ -86,6 +100,10 @@ class BlockAgent(Agent):
         # flush. Cleared in write_tracking_data after the per-agent emit, so the published
         # rate always reflects only this-interval episodes (no rolling-window lag).
         self._per_agent_episodes_this_interval: list[list[int]] = []
+        # Finished-trajectory engagement labels accumulated since the last write_interval
+        # flush. Same semantics/lifecycle as the success buffer above (cleared in
+        # write_tracking_data after emit) — drives the Episode / Engagement rate metric.
+        self._per_agent_episodes_this_interval_engaged: list[list[int]] = []
         # Per-agent per-trajectory forward-distance accumulator (filled when a
         # task-specific wrapper publishes `info["per_env_episode_distance"]`),
         # cleared in write_tracking_data after emit. Currently the AntSuccess
@@ -97,6 +115,12 @@ class BlockAgent(Agent):
         # surfaced in write_tracking_data so the TB scalar doesn't have to be
         # re-derived after the step has already been applied.
         self._last_action_head_grad_norm: torch.Tensor | None = None
+        # Per-agent best this-interval success rate seen so far. Initialized in
+        # init() (one entry per agent). Each time write_tracking_data publishes a
+        # finished-episode success rate that strictly beats an agent's best, that
+        # agent's `ckpt_best.pt` is (re)written. -1.0 sentinel guarantees the first
+        # interval with any finished episode establishes the initial best.
+        self._best_success_rate: list[float] = []
 
     # --------------------------------------------------------------
     # Per-agent helpers
@@ -207,8 +231,10 @@ class BlockAgent(Agent):
                 self._per_agent_track_rewards.append([])
                 self._per_agent_track_timesteps.append([])
                 self._per_agent_episodes_this_interval.append([])
+                self._per_agent_episodes_this_interval_engaged.append([])
                 self._per_agent_distances_this_interval.append([])
                 self._per_agent_velocities_this_interval.append([])
+                self._best_success_rate.append(-1.0)
 
         # Algorithm-specific memory tensors (obs/actions/... for SAC, on-policy
         # rollout tensors for PPO).
@@ -252,12 +278,42 @@ class BlockAgent(Agent):
             # Success rate over trajectories that finished since the last flush.
             ep = self._per_agent_episodes_this_interval[i]
             if ep:
+                interval_success_rate = float(np.mean(ep))
                 writer.add_scalar(
                     tag="Episode / Success rate",
-                    value=float(np.mean(ep)),
+                    value=interval_success_rate,
                     timestep=timestep,
                 )
                 ep.clear()
+
+                # Keep a per-agent "best" checkpoint: whenever this interval's
+                # success rate beats the agent's previous best, (re)write
+                # ckpt_best.pt for that agent. The first interval with any finished
+                # episode always wins (sentinel -1.0). `Episode / Best success
+                # rate` is published every interval that has episodes so the TB
+                # line is a flat-until-improved trace of the running best.
+                if interval_success_rate > self._best_success_rate[i]:
+                    self._best_success_rate[i] = interval_success_rate
+                    self._write_best_checkpoint(i, timestep, interval_success_rate)
+                writer.add_scalar(
+                    tag="Episode / Best success rate",
+                    value=self._best_success_rate[i],
+                    timestep=timestep,
+                )
+
+            # Engagement rate over trajectories that finished since the last flush.
+            # Same source/lifecycle as success rate, but for the curr_engaged flag
+            # (peg close to socket). Cleared after emit so the rate reflects only
+            # this-interval episodes (no rolling-window lag).
+            eng = self._per_agent_episodes_this_interval_engaged[i]
+            if eng:
+                interval_engagement_rate = float(np.mean(eng))
+                writer.add_scalar(
+                    tag="Episode / Engagement rate",
+                    value=interval_engagement_rate,
+                    timestep=timestep,
+                )
+                eng.clear()
 
             # Per-trajectory forward distance (max/min/mean) — populated only when
             # a task-specific wrapper publishes per_env_episode_distance.
@@ -468,11 +524,21 @@ class BlockAgent(Agent):
                                 f"per_env_to_log[{tag!r}] has shape {tuple(vals.shape)}, "
                                 f"expected first dim == total_envs ({total_envs})."
                             )
+                        # Reduce each agent's env partition by the SAME convention
+                        # write_tracking_data uses for the interval: a "(max)"/"(min)"
+                        # tag suffix takes the per-env peak/trough (so e.g. a max-force
+                        # tag reports the true maximum any env saw, not the peak of the
+                        # env-mean); everything else env-means.
                         for i in range(self.num_agents):
                             env_lo, env_hi = i * epa, (i + 1) * epa
-                            self.per_agent_tracking[i][tag].append(
-                                float(vals[env_lo:env_hi].float().mean().item())
-                            )
+                            sl = vals[env_lo:env_hi].float()
+                            if tag.endswith("(max)"):
+                                red = sl.max()
+                            elif tag.endswith("(min)"):
+                                red = sl.min()
+                            else:
+                                red = sl.mean()
+                            self.per_agent_tracking[i][tag].append(float(red.item()))
 
                 # Per-agent `successes` and `success_times` mirror upstream
                 # Factory's `_log_factory_metrics` semantics, just sliced to each
@@ -513,6 +579,31 @@ class BlockAgent(Agent):
                             done_idx = done_slice.nonzero(as_tuple=False).view(-1)
                             self._per_agent_episodes_this_interval[i].extend(
                                 agent_succ[done_idx].long().tolist()
+                            )
+
+                # Engagement rate (env-driven): identical partitioning to success,
+                # sourced from the per-step curr_engaged flag (peg close to socket)
+                # snapshotted at the reset moment. Records each finished trajectory's
+                # engagement flag so write_tracking_data's interval mean is a true
+                # per-trajectory engagement rate.
+                curr_eng = infos.get("per_env_curr_engaged")
+                if curr_eng is not None:
+                    if not (torch.is_tensor(curr_eng) and curr_eng.dim() > 0
+                            and curr_eng.shape[0] == total_envs):
+                        raise ValueError(
+                            f"per_env_curr_engaged has shape "
+                            f"{tuple(curr_eng.shape) if torch.is_tensor(curr_eng) else type(curr_eng).__name__}, "
+                            f"expected ({total_envs},)"
+                        )
+                    done_flat = (terminated + truncated).bool().view(-1)
+                    for i in range(self.num_agents):
+                        env_lo, env_hi = i * epa, (i + 1) * epa
+                        done_slice = done_flat[env_lo:env_hi]
+                        if done_slice.any():
+                            agent_eng = curr_eng[env_lo:env_hi]
+                            done_idx = done_slice.nonzero(as_tuple=False).view(-1)
+                            self._per_agent_episodes_this_interval_engaged[i].extend(
+                                agent_eng[done_idx].long().tolist()
                             )
 
                 ep_succ_times = infos.get("per_env_ep_success_times")
@@ -632,6 +723,42 @@ class BlockAgent(Agent):
         raise NotImplementedError
 
     # --------------------------------------------------------------
+    # Ground-truth contact buffering (supervised-selection loss) — shared by SAC/PPO
+    # --------------------------------------------------------------
+    def _maybe_create_contact_tensor(self) -> None:
+        """When ``contact_axes`` is set, create the ``in_contact`` memory tensor (width =
+        ``len(contact_axes) == sum(force_axes)``) and add it to ``self._tensors_names`` so
+        it is returned in the sampled minibatch dict. Call at the end of each subclass
+        ``_create_memory_tensors``."""
+        if self._contact_axes is not None and self.memory is not None:
+            self.memory.create_tensor(name="in_contact", size=self._contact_dim, dtype=torch.float32)
+            self._tensors_names.append("in_contact")
+
+    def _buffer_contact_for_write(
+        self, *, terminated: torch.Tensor, truncated: torch.Tensor, infos: Any, add_kwargs: dict
+    ) -> None:
+        """One-step-aligned contact for the SSL target. Injects into ``add_kwargs`` the
+        contact the policy SAW at this transition's obs(t) (= the previous step's
+        post-step contact, sliced to the force-eligible axes), then refreshes the pending
+        buffer from this step's ``infos["in_contact"]`` (zeroing envs that just reset, so a
+        new episode starts with no contact). No-op when ``contact_axes`` is None."""
+        if self._contact_axes is None:
+            return
+        n_envs = terminated.shape[0]
+        if self._pending_contact is None:
+            self._pending_contact = torch.zeros((n_envs, self._contact_dim), device=self.device)
+        add_kwargs["in_contact"] = self._pending_contact
+        # refresh: this step's post-step contact (the contact obs(t+1) will carry)
+        raw = infos.get("in_contact") if isinstance(infos, dict) else None
+        if raw is not None:
+            nxt = raw.index_select(-1, self._contact_axes).float().clone()
+        else:
+            nxt = torch.zeros((n_envs, self._contact_dim), device=self.device)
+        done = (terminated + truncated).bool().view(-1)
+        nxt[done] = 0.0
+        self._pending_contact = nxt
+
+    # --------------------------------------------------------------
     # Per-agent checkpoint save/load (generic; specialized via hooks)
     # --------------------------------------------------------------
     def _checkpoint_model_keys(self) -> list[str]:
@@ -705,6 +832,22 @@ class BlockAgent(Agent):
             os.makedirs(ckpt_dir, exist_ok=True)
             path = os.path.join(ckpt_dir, f"ckpt_{tag}.pt")
             torch.save(self._build_per_agent_checkpoint(i, timestep), path)
+
+    def _write_best_checkpoint(self, i: int, timestep: int, success_rate: float) -> None:
+        """(Re)write agent ``i``'s ``ckpt_best.pt`` — the highest this-interval
+        success-rate checkpoint seen so far.
+
+        Overwrites the single fixed-name file each time the agent improves, so it
+        always holds the current best. The non-numeric ``best`` tag keeps it out of
+        the "latest" search in ``_resolve_ckpt_file`` (its glob ranks by integer
+        step, and ``ckpt_best.pt`` parses to -1, so it never wins). ``best_success_rate``
+        is stamped into the dict for provenance; load ignores unknown extra keys.
+        """
+        ckpt_dir = os.path.join(self.experiment_dir, str(i), "checkpoints")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        ckpt = self._build_per_agent_checkpoint(i, timestep)
+        ckpt["best_success_rate"] = float(success_rate)
+        torch.save(ckpt, os.path.join(ckpt_dir, "ckpt_best.pt"))
 
     # --- load helpers ---
     @staticmethod

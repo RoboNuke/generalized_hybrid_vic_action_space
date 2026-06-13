@@ -33,6 +33,9 @@ _TASK_DEFAULTS: dict[str, str] = {
     "Isaac-Ant-": "ant_success",
     "Isaac-Factory-": "factory",
     "Isaac-Forge-": "forge",
+    # AutoMate Assembly, wrapped by AutoMateForgeAdapter, exposes the FORGE reward
+    # decomposition (_log_factory_metrics / _log_forge_metrics) — use the forge scorer.
+    "Isaac-AutoMate-Assembly-": "forge",
 }
 
 

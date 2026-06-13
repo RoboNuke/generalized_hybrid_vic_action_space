@@ -79,6 +79,41 @@ class ControlCfg(ForgeCtrlCfg):
     gain_mapping: str = "variable_diagonal"
     use_hybrid_force: bool = False
     chol_offdiag_rho: float = 0.0
+    # cholesky/rotated only: learn the full 6-DOF gain matrix (position + orientation)
+    # instead of the translational 3x3 block alone (rotation block fixed to constant gains).
+    full_gain_matrix: bool = False
+
+    # rotated only: when set to [roll, pitch, yaw] (DEGREES) the K/D/K_f rotation frame R
+    # is FIXED to this orientation instead of being emitted by the policy. Drops the 6 rot6d
+    # action dims (and their force-block mirror when use_hybrid_force); the policy still sets
+    # the diagonal gains. None => R is learned from the action space (default rotated mode).
+    fixed_rotation_rpy: list | None = None
+
+    # When True, command full 3-DOF orientation (roll/pitch/yaw) via a delta-axis-angle
+    # rotation scaled by rot_action_bounds, instead of the default yaw-only map (roll/pitch
+    # forced to 0). Also un-zeros the orientation observation channels (AutoMate adapter).
+    # Remember to set the actor's force_zero_action_dims=null so Rx/Ry are learnable.
+    full_orientation_control: bool = False
+
+    # ---- eval-recording frame visualization (ctrl-action-interface only) ----
+    # Each marker is an independent RGB coordinate-axis frame drawn into the sim (captured by
+    # the recorder camera). All default OFF so training is unaffected; enable per-marker in the
+    # eval/record overlay. Each has its own axis length (meters); co-located peg-tip frames are
+    # disambiguated by giving them different scales.
+    #
+    # rotated stiffness frame (the rotation R), drawn at the peg tip; only meaningful when
+    # gain_mapping="rotated" (silently skipped in other modes).
+    visualize_rotation_frame: bool = False
+    rotation_frame_axis_scale: float = 0.05
+    # peg-tip frame (the held asset's own orientation), drawn at the peg tip.
+    visualize_peg_tip_frame: bool = False
+    peg_tip_frame_axis_scale: float = 0.04
+    # world frame (identity / world-aligned axes), drawn at the robot end-effector.
+    visualize_world_frame: bool = False
+    world_frame_axis_scale: float = 0.06
+    # Offset (meters) along the held asset's local +z from its root pose to the peg tip; sized
+    # for the 8 mm peg (height ~= 0.05 m). Shared by the rotated and peg-tip frames.
+    peg_tip_offset_z: float = 0.025
 
     def __post_init__(self):
         if self.control_type not in CONTROL_TYPES:
@@ -116,6 +151,17 @@ class ControlCfg(ForgeCtrlCfg):
                 )
         if self.chol_offdiag_rho < 0.0:
             raise ValueError(f"ControlCfg.chol_offdiag_rho must be >= 0, got {self.chol_offdiag_rho!r}")
+        if self.fixed_rotation_rpy is not None:
+            if self.gain_mapping != "rotated":
+                raise ValueError(
+                    "ControlCfg.fixed_rotation_rpy is only valid with gain_mapping='rotated'; "
+                    f"got gain_mapping={self.gain_mapping!r}."
+                )
+            if len(self.fixed_rotation_rpy) != 3:
+                raise ValueError(
+                    "ControlCfg.fixed_rotation_rpy must be length 3 [roll, pitch, yaw] (degrees), "
+                    f"got {self.fixed_rotation_rpy!r}"
+                )
 
         # control_type-specific force_axes consistency (each wrapper also re-checks).
         n_force = sum(self.force_axes)

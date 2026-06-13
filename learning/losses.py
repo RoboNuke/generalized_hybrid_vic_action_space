@@ -23,6 +23,7 @@ import dataclasses
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
 
 if TYPE_CHECKING:  # avoid a circular import (agents import nothing from here)
     from learning.block_agent import BlockAgent
@@ -125,6 +126,42 @@ class ActionL2Loss(AuxLoss):
     def compute(self, ctx: LossContext) -> torch.Tensor:
         # actions: (N*B, A) -> per-agent mean squared magnitude (N,).
         return ctx.actions.pow(2).view(ctx.agent.num_agents, -1).mean(dim=1)
+
+
+@register_loss
+class SupervisedSelectionLoss(AuxLoss):
+    """Binary cross-entropy supervising the hybrid policy's per-axis SELECTION toward
+    the ground-truth CONTACT state (force-control axes that are in contact).
+
+    Policy-only. Reads the per-axis selection probability the hybrid actor publishes in
+    ``ctx.policy_outputs["selection_prob"]`` (``(N*B, num_sel)`` = ``sum(force_axes)``,
+    ascending x/y/z order) and the buffered ground-truth contact in
+    ``ctx.sampled["in_contact"]`` — already sliced to the SAME force-eligible axes in the
+    SAME order, so the BCE is a direct column-aligned comparison. Requires a hybrid
+    control type (selection head) and the contact sensor (the runner validates this and
+    sizes ``contact_axes``).
+    """
+
+    name = "supervised_selection"
+    supported_targets = ("policy",)
+
+    def compute(self, ctx: LossContext) -> torch.Tensor:
+        sel_prob = (ctx.policy_outputs or {}).get("selection_prob")
+        if sel_prob is None:
+            raise ValueError(
+                "supervised_selection loss is enabled but the policy produced no "
+                "'selection_prob' — it requires a hybrid control type (selection head)."
+            )
+        if "in_contact" not in ctx.sampled:
+            raise KeyError(
+                "supervised_selection loss needs ctx.sampled['in_contact'] — the agent was "
+                "not given contact_axes (the runner sets it when this loss is enabled)."
+            )
+        target = ctx.sampled["in_contact"].clamp(0.0, 1.0)          # (N*B, num_sel), eligible axes
+        p = sel_prob.clamp(1e-7, 1.0 - 1e-7)                        # (N*B, num_sel)
+        bce = F.binary_cross_entropy(p, target, reduction="none")  # (N*B, num_sel)
+        # per-sample mean over axes -> per-agent mean (N,)
+        return bce.mean(dim=-1).view(ctx.agent.num_agents, -1).mean(dim=1)
 
 
 @dataclasses.dataclass

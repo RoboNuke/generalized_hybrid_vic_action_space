@@ -38,6 +38,46 @@ class HybridVICWrapper(HybridForcePositionWrapper):
     def _extra_action_dims(self):
         return self.GAIN_DIMS
 
+    def _gains_variable(self) -> bool:
+        """Whether the impedance gains are policy-driven (=> worth logging). Fixed-gain
+        formulations (ctrl-action-interface ``constant`` mode) override this to False."""
+        return True
+
+    def _k_coupling_logged(self) -> bool:
+        """Whether pose K has policy-controlled off-diagonal coupling worth logging.
+        Diagonal formulations have none; overridden True for non-diagonal K (e.g.
+        ctrl-action-interface ``rotated`` / ``cholesky``)."""
+        return False
+
+    def _k_coupling_dim(self) -> int:
+        """Leading-block size whose off-diagonal coupling is logged. Defaults to the
+        position 3x3 block; full-6-DOF formulations override this to 6 so the rotation
+        block (and any cross-coupling) is included."""
+        return 3
+
+    def _damping_logged(self) -> bool:
+        """Whether to publish pose damping D. Overridden to restrict to formulations where
+        D carries its own structure (ctrl-action-interface ``rotated`` / ``cholesky``);
+        diagonal D = 2*sqrt(K) is derivable from K so not worth a separate series."""
+        return True
+
+    @staticmethod
+    def _k_offdiag_norm_extrema(K):
+        """Per-env (min, max) of the normalized off-diagonal coupling of K.
+
+        ``c_ij = K_ij / sqrt(K_ii * K_jj)`` (correlation-style, in [-1, 1]); the extrema
+        are taken over all i != j entries of the (E,n,n) symmetric PSD ``K`` (pass just the
+        position 3x3 block to avoid the structurally-zero rotation/cross blocks). Returns
+        two (E,) tensors. Fully batched / on-device (no host transfer).
+        """
+        n = K.shape[-1]
+        diag = torch.diagonal(K, dim1=-2, dim2=-1).clamp_min(1e-12)  # (E,n) = K_ii
+        inv = diag.rsqrt()                                          # 1/sqrt(K_ii)
+        C = K * inv.unsqueeze(-1) * inv.unsqueeze(-2)               # (E,n,n) normalized
+        offdiag = ~torch.eye(n, dtype=torch.bool, device=K.device)
+        C_off = C[:, offdiag]                                       # (E, n*(n-1))
+        return C_off.amin(dim=-1), C_off.amax(dim=-1)
+
     def __init__(self, env, controller_cfg, num_agents: int = 1):
         super().__init__(env, controller_cfg, num_agents=num_agents)
         cfg = self.cfg_h  # ControlCfg
@@ -82,12 +122,34 @@ class HybridVICWrapper(HybridForcePositionWrapper):
         # already runs once per env.step (it's invoked from _pre_physics_step), so this is
         # logged unconditionally — like the base's force-goal log — not gated on the
         # apply-action _should_log_wrenches flag (which isn't set yet at this point).
-        if hasattr(self.unwrapped, "extras"):
+        # Skip series that carry no information for the current configuration: pose gains K/D
+        # are fixed in "constant" mode (nothing to plot), and the force stiffness Kf only
+        # exists when force control is active — and then only on the force-eligible axes.
+        if self._gains_variable() and hasattr(self.unwrapped, "extras"):
             log = self.unwrapped.extras["to_log"]
-            for name, M in (("K", self._K_pose), ("D", self._D_pose), ("Kf", self._K_force)):
-                diag = torch.diagonal(M, dim1=1, dim2=2)  # (E,6)
+            # Tags: Impedance_{Stiffness,Damping}/{pos,force}_{name}  (one '/' per tag).
+            # Pose stiffness K (diagonal).
+            k_diag = torch.diagonal(self._K_pose, dim1=1, dim2=2)  # (E,6)
+            for i in range(6):
+                log[f"Impedance_Stiffness/pos_{AXIS_NAMES[i]}"] = k_diag[:, i]
+            # Off-diagonal coupling of the active K block of pose K. By default only the
+            # position 3x3 block carries coupling (the rotation block is constant/diagonal and
+            # cross blocks are zero); full-6-DOF formulations widen this to the whole 6x6.
+            if self._k_coupling_logged():
+                n = self._k_coupling_dim()
+                c_min, c_max = self._k_offdiag_norm_extrema(self._K_pose[:, :n, :n])
+                log["Impedance_Stiffness/pos_offdiag_norm_min"] = c_min
+                log["Impedance_Stiffness/pos_offdiag_norm_max"] = c_max
+            # Pose damping D (diagonal) -- only formulations where D is non-trivial.
+            if self._damping_logged():
+                d_diag = torch.diagonal(self._D_pose, dim1=1, dim2=2)
                 for i in range(6):
-                    log[f"Impedance / {name} {AXIS_NAMES[i]}"] = diag[:, i]
+                    log[f"Impedance_Damping/pos_{AXIS_NAMES[i]}"] = d_diag[:, i]
+            # Force stiffness K_f (diagonal, force-eligible axes only).
+            if self._force_control_enabled():
+                kf_diag = torch.diagonal(self._K_force, dim1=1, dim2=2)
+                for i in self._force_log_axes:
+                    log[f"Impedance_Stiffness/force_{AXIS_NAMES[i]}"] = kf_diag[:, i]
 
     def _pose_motion_wrench(self):
         """Pose motion wrench using the policy's full 6x6 K/D (matrix path) + dead zone."""

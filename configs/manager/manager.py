@@ -24,6 +24,7 @@ import yaml
 from configs.manager.controller_cfg import ControlCfg
 from configs.manager.loss_cfg import LossCfg
 from configs.manager.model_cfg import ModelCfg
+from configs.manager.noise_cfg import NoiseCfg
 from configs.manager.ppo_cfg import PPO_CFG
 from configs.manager.runner_cfg import RunnerCfg
 from configs.manager.sac_cfg import SAC_CFG
@@ -39,6 +40,27 @@ def _resolved_field_types(dataclass_type: type) -> dict[str, Any]:
     inside ``skrl.agents.torch.base``).
     """
     return typing.get_type_hints(dataclass_type)
+
+
+def _deep_merge_dicts(base: dict, overlay: dict) -> dict:
+    """Recursively merge ``overlay`` onto ``base`` and return a new dict.
+
+    Nested mappings merge key-by-key; every non-mapping value (scalars, lists,
+    ``None``) in ``overlay`` *replaces* the corresponding value in ``base``
+    wholesale — lists are never element-wise merged. Neither input is mutated.
+
+    Used by :meth:`ConfigManager.load` to apply overlay YAML files over a base
+    config before strict header/field validation, so an overlay only needs the
+    keys it wants to change (e.g. just ``sac_cfg.recorder``).
+    """
+    merged = dict(base)
+    for key, ov_val in overlay.items():
+        base_val = merged.get(key)
+        if isinstance(base_val, dict) and isinstance(ov_val, dict):
+            merged[key] = _deep_merge_dicts(base_val, ov_val)
+        else:
+            merged[key] = ov_val
+    return merged
 
 
 def _to_yaml_safe(obj: Any) -> Any:
@@ -87,12 +109,17 @@ class ConfigManager:
         "ppo_cfg": PPO_CFG,
         "model_cfg": ModelCfg,
         "controller_cfg": ControlCfg,
+        "noise_cfg": NoiseCfg,  # observation-noise levels; pushed onto env_cfg.obs_rand
         "sensor_cfg": SensorCfg,
         "loss_cfg": LossCfg,  # auxiliary-loss switches; consumed by learning/losses.py
     }
 
     @classmethod
-    def load(cls, yaml_path: str | Path | None) -> dict:
+    def load(
+        cls,
+        yaml_path: str | Path | None,
+        overlay_paths: str | Path | list[str | Path] | None = None,
+    ) -> dict:
         """Return ``{header: populated_instance}`` for every registered header.
 
         * ``yaml_path is None`` returns one default-constructed instance per header
@@ -104,6 +131,13 @@ class ConfigManager:
           tolerated: a registered section absent from the YAML is default-
           constructed, and fields absent from a present section fall back to their
           dataclass defaults.
+
+        ``overlay_paths`` (a single path or a list) are deep-merged over the base
+        YAML *before* validation/building, in order, so a later overlay wins. An
+        overlay only needs the keys it changes (e.g. just ``sac_cfg.recorder``);
+        nested mappings merge key-by-key while lists/scalars replace. Strictness
+        still applies to the merged result, so an unknown header/field introduced
+        by an overlay is a hard error.
         """
         if yaml_path is None:
             return {header: type_() for header, type_ in cls.REGISTRY.items()}
@@ -116,6 +150,23 @@ class ConfigManager:
             raise ValueError(
                 f"Config root in {path} must be a mapping, got {type(raw).__name__}"
             )
+
+        if overlay_paths:
+            if isinstance(overlay_paths, (str, Path)):
+                overlay_paths = [overlay_paths]
+            for overlay in overlay_paths:
+                ov_path = Path(overlay)
+                if not ov_path.is_file():
+                    raise FileNotFoundError(f"Overlay config file not found: {ov_path}")
+                ov_raw = yaml.safe_load(ov_path.read_text())
+                if ov_raw is None:  # empty overlay file — nothing to merge
+                    continue
+                if not isinstance(ov_raw, dict):
+                    raise ValueError(
+                        f"Overlay config root in {ov_path} must be a mapping, "
+                        f"got {type(ov_raw).__name__}"
+                    )
+                raw = _deep_merge_dicts(raw, ov_raw)
 
         unknown_headers = set(raw) - set(cls.REGISTRY)
         if unknown_headers:

@@ -377,7 +377,16 @@ class BlockSimBaActor(GaussianMixin, Model):
         log_prob = log_prob_parts[0] if len(log_prob_parts) == 1 else sum(log_prob_parts)
 
         outputs["log_prob"] = log_prob
-        outputs["mean_actions"] = raw_out
+        # Deterministic (mean) action in the SAME env-facing layout as ``actions`` (see the
+        # hybrid actor for the rationale): tanh-squashed continuous means scattered into their
+        # positions, Bernoulli gates thresholded to {-1,+1}, force-zero dims left at 0. Avoids
+        # feeding the bare ``raw_out`` (compressed/pre-tanh) to skrl's deterministic eval.
+        mean_actions = actions.new_zeros((batch, self.num_actions))
+        if self.num_continuous > 0:
+            mean_actions.index_copy_(-1, self._cont_action_idx, torch.tanh(cont_mean))
+        if self.num_bernoulli > 0:
+            mean_actions.index_copy_(-1, self._bern_action_idx, 2.0 * (bern_prob > 0.5).float() - 1.0)
+        outputs["mean_actions"] = mean_actions
         return actions, outputs
 
     def get_entropy(self, *, role: str = ""):
@@ -585,7 +594,22 @@ class HybridControlBlockSimBaActor(BlockSimBaActor):
             log_prob = free + gated + lp_sel_per_dim.sum(dim=-1, keepdim=True)
 
         outputs["log_prob"] = log_prob
-        outputs["mean_actions"] = raw_out
+        # Deterministic (mean) action in the SAME env-facing layout as ``actions``:
+        # tanh-squashed continuous means scattered into their action positions, selection
+        # gates thresholded at 0.5, force-zero dims left at 0. ``raw_out`` alone is the
+        # compressed pre-tanh continuous backbone output (num_continuous wide) — emitting it
+        # directly (as before) makes skrl deterministic eval (stochastic_evaluation=False ->
+        # mean_actions) feed a mis-shaped, wrong-width action that skrl reshapes into a
+        # corrupted batch before it reaches the env.
+        mean_actions = actions.new_zeros((batch, self.num_actions))
+        mean_actions.index_copy_(-1, self._cont_action_idx, torch.tanh(cont_mean))
+        if self.num_bernoulli > 0:
+            mean_actions.index_copy_(-1, self._bern_action_idx, (sel_prob > 0.5).float())
+        outputs["mean_actions"] = mean_actions
+        # Per-axis selection probability (sigmoid of the Bernoulli logits), (N*B, num_sel),
+        # in ascending selection-axis order — consumed by the supervised-selection loss as
+        # its prediction. None when there are no selection dims.
+        outputs["selection_prob"] = self._sel_prob
         return actions, outputs
 
     def get_entropy(self, *, role: str = ""):

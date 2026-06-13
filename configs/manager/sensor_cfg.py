@@ -40,6 +40,14 @@ class ContactCfg:
     log_contact_state: bool = True
     """Publish per-axis ``Contact / In-Contact {X,Y,Z,Any}`` fractions via ``to_log``."""
 
+    append_to_policy_obs: bool = False
+    """Append the per-axis contact bool (x/y/z) to the POLICY observation (grows
+    observation_space by 3). Lets the actor condition on contact. Requires ``enabled``."""
+
+    append_to_critic_state: bool = False
+    """Append the per-axis contact bool (x/y/z) to the CRITIC state (grows state_space by
+    3; asymmetric tasks only). Requires ``enabled``."""
+
     # Prim-path expressions for the held (sensor) and fixed (filter) asset *roots*.
     # Forge/Factory spawn both with activate_contact_sensors=True; the contact-reporting
     # rigid body is an asset-specific CHILD prim of these roots (peg one level down, hole
@@ -50,7 +58,45 @@ class ContactCfg:
 
 
 @dataclasses.dataclass(kw_only=True)
+class EnergyCfg:
+    """Per-step energy / effort metrics for Forge/Factory peg insertion.
+
+    Logging-only: :class:`~wrappers.sensors.energy_metrics_wrapper.EnergyMetricsWrapper`
+    reads the live robot state each step and publishes per-env tensors under the
+    ``energy_metrics/`` TensorBoard tab via the existing ``extras['to_log']`` path.
+    All values are instantaneous per-step quantities; ``max_force`` is reduced to the
+    peak any env saw (via a ``(max)`` tag suffix), the rest to interval means.
+    """
+
+    enabled: bool = False
+    """Master switch. When False the runner installs neither config nor wrapper."""
+
+    log_max_force: bool = True
+    """``energy_metrics/max_force (max)`` — peak FT-sensor force magnitude ‖f‖₂."""
+
+    log_avg_force: bool = True
+    """``energy_metrics/avg_force`` — mean FT-sensor force magnitude ‖f‖₂."""
+
+    log_sq_joint_vel: bool = True
+    """``energy_metrics/sq_joint_vel`` — Σ q̇² over the 7 arm DOFs."""
+
+    log_sq_ee_vel: bool = True
+    """``energy_metrics/sq_ee_vel`` — Σ v² over the 3 EE linear-velocity components."""
+
+    log_work_power: bool = True
+    """``energy_metrics/work_power`` — Σ τ·q̇ over arm DOFs, i.e. mechanical power (W)."""
+
+    log_battery_power: bool = True
+    """``energy_metrics/battery_power`` — ``battery_scale·Σ τ²`` copper-loss proxy for
+    electrical draw (no motor model in sim, so a proxy is the best available)."""
+
+    battery_scale: float = 1.0
+    """Scale on the Σ τ² copper-loss proxy (unitless; I=τ/Kt ⇒ P_copper=I²R ∝ τ²)."""
+
+
+@dataclasses.dataclass(kw_only=True)
 class SensorCfg:
     """Top-level sensor config (registered YAML section ``sensor_cfg``)."""
 
     contact: ContactCfg = dataclasses.field(default_factory=ContactCfg)
+    energy: EnergyCfg = dataclasses.field(default_factory=EnergyCfg)

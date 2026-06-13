@@ -192,6 +192,20 @@ class HybridForcePositionWrapper(gym.Wrapper):
         pos_component_dims = eligible
         return selection_dims, pos_component_dims, force_component_dims
 
+    # ----------------------------------------------------- logging gates
+    # These decide which diagnostic series are worth writing to ``extras['to_log']`` for the
+    # current configuration, so we don't emit flat/constant/never-active channels. Overridden
+    # by formulations that add config switches (e.g. ctrl-action-interface's constant gains).
+    @property
+    def _force_log_axes(self) -> list[int]:
+        """Force-eligible axis indices; force-control series are logged only for these
+        (e.g. z-only force => just Z, never x/y/torques)."""
+        return [int(i) for i in self.eligible_idx.tolist()]
+
+    def _force_control_enabled(self) -> bool:
+        """Whether force control is active, so force-related series carry information."""
+        return self.N > 0
+
     # ------------------------------------------------------------------ setup
     def _update_dimensions(self):
         """Grow action/obs/state spaces by the added control dims and rebuild gym spaces."""
@@ -316,11 +330,13 @@ class HybridForcePositionWrapper(gym.Wrapper):
         sel_bits = (ca[:, bn:bn + N] > 0.5).float()                 # (E, N)
         self.sel_matrix = torch.zeros((self.num_envs, 6), device=self.device)
         self.sel_matrix[:, self.eligible_idx] = sel_bits
-        if hasattr(self.unwrapped, "extras"):
-            for i in range(6):
-                self.unwrapped.extras["to_log"][f"Control Mode / Force Control {AXIS_NAMES[i]}"] = (
-                    self.sel_matrix[:, i]
-                )
+        # Selection is only meaningful on force-eligible axes — pose-only axes are always
+        # position-controlled, so skip their flat-zero series (and emit nothing when force
+        # control is off entirely).
+        if self._force_control_enabled() and hasattr(self.unwrapped, "extras"):
+            log = self.unwrapped.extras["to_log"]
+            for i in self._force_log_axes:
+                log[f"Control Mode / Force Control {AXIS_NAMES[i]}"] = self.sel_matrix[:, i]
 
         # 2+3) Pose (position + orientation) targets — bit-exact with the base ForgeEnv
         # controller, including delta_pos / delta_yaw which the env reward (action penalty)
@@ -349,13 +365,15 @@ class HybridForcePositionWrapper(gym.Wrapper):
                 self.target_force_for_control[:, 2] - self.force_bounds[:, 2]
             ) / 2.0
 
-        # Log applied force-goal magnitude.
-        if hasattr(self.unwrapped, "extras"):
+        # Log applied force-goal magnitude — only when force control is active, and per-axis
+        # only for force-eligible translational axes (others have no force goal).
+        if self._force_control_enabled() and hasattr(self.unwrapped, "extras"):
+            log = self.unwrapped.extras["to_log"]
             fg = self.target_force_for_control[:, :3]
-            self.unwrapped.extras["to_log"]["Control Target / Force Goal Norm"] = torch.norm(fg, p=2, dim=-1)
-            self.unwrapped.extras["to_log"]["Control Target / Force X Goal"] = torch.abs(fg[:, 0])
-            self.unwrapped.extras["to_log"]["Control Target / Force Y Goal"] = torch.abs(fg[:, 1])
-            self.unwrapped.extras["to_log"]["Control Target / Force Z Goal"] = torch.abs(fg[:, 2])
+            log["Control Target / Force Goal Norm"] = torch.norm(fg, p=2, dim=-1)
+            for i in self._force_log_axes:
+                if i < 3:
+                    log[f"Control Target / Force {AXIS_NAMES[i]} Goal"] = torch.abs(fg[:, i])
 
     def _pose_motion_wrench(self):
         """Pose PD motion wrench using the env's diagonal task gains + dead zone.
@@ -412,14 +430,17 @@ class HybridForcePositionWrapper(gym.Wrapper):
 
         # Log force + position error magnitude once per env.step (first apply_action call).
         if self._should_log_wrenches and hasattr(self.unwrapped, "extras"):
-            ferr = self.target_force_for_control[:, :3] - measured[:, :3]
-            self.unwrapped.extras["to_log"]["Controller Output / Force Error X"] = ferr[:, 0]
-            self.unwrapped.extras["to_log"]["Controller Output / Force Error Y"] = ferr[:, 1]
-            self.unwrapped.extras["to_log"]["Controller Output / Force Error Z"] = ferr[:, 2]
+            log = self.unwrapped.extras["to_log"]
+            # Force error only on force-eligible translational axes; position error always
+            # (pose control is active on every axis).
+            if self._force_control_enabled():
+                ferr = self.target_force_for_control[:, :3] - measured[:, :3]
+                for i in self._force_log_axes:
+                    if i < 3:
+                        log[f"Controller Output / Force Error {AXIS_NAMES[i]}"] = ferr[:, i]
             perr = self.unwrapped.ctrl_target_fingertip_midpoint_pos - self.unwrapped.fingertip_midpoint_pos
-            self.unwrapped.extras["to_log"]["Controller Output / Position Error X"] = perr[:, 0]
-            self.unwrapped.extras["to_log"]["Controller Output / Position Error Y"] = perr[:, 1]
-            self.unwrapped.extras["to_log"]["Controller Output / Position Error Z"] = perr[:, 2]
+            for i in range(3):
+                log[f"Controller Output / Position Error {AXIS_NAMES[i]}"] = perr[:, i]
             self._should_log_wrenches = False
 
         # Blend via the selection matrix (force-axes already baked into sel_matrix).

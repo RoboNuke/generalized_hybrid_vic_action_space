@@ -290,17 +290,27 @@ def compute_ctrl_targets(env, actions):
     ctrl_target_preclipped_pos = fixed_pos_action_frame + pos_actions
 
     rot_actions = rot_actions.clone()
-    rot_actions[:, 0:2] = 0.0
-    # Joint-limit yaw map (assumes limit in (+x,-y)-quadrant of world frame).
-    rot_actions[:, 2] = math.radians(-180.0) + math.radians(270.0) * (rot_actions[:, 2] + 1.0) / 2.0
-    bolt_frame_quat = torch_utils.quat_from_euler_xyz(
-        roll=rot_actions[:, 0], pitch=rot_actions[:, 1], yaw=rot_actions[:, 2]
-    )
+    # Nominal downward EE orientation (180° roll) the rotation target is built relative to.
     rot_180_euler = torch.tensor([math.pi, 0.0, 0.0], device=device).repeat(num_envs, 1)
     quat_bolt_to_ee = torch_utils.quat_from_euler_xyz(
         roll=rot_180_euler[:, 0], pitch=rot_180_euler[:, 1], yaw=rot_180_euler[:, 2]
     )
-    ctrl_target_preclipped_quat = torch_utils.quat_mul(quat_bolt_to_ee, bolt_frame_quat)
+    if getattr(env.cfg.ctrl, "full_orientation_control", False):
+        # Full 3-DOF orientation: treat the scaled rot_actions as a single delta rotation
+        # (angle = ‖·‖, axis = normalized) composed onto the nominal downward orientation.
+        # The orientation range is governed by rot_action_bounds.
+        angle = torch.norm(rot_actions, p=2, dim=-1)
+        axis = rot_actions / angle.clamp_min(1e-6).unsqueeze(-1)
+        delta_quat = torch_utils.quat_from_angle_axis(angle, axis)
+        ctrl_target_preclipped_quat = torch_utils.quat_mul(delta_quat, quat_bolt_to_ee)
+    else:
+        rot_actions[:, 0:2] = 0.0
+        # Joint-limit yaw map (assumes limit in (+x,-y)-quadrant of world frame).
+        rot_actions[:, 2] = math.radians(-180.0) + math.radians(270.0) * (rot_actions[:, 2] + 1.0) / 2.0
+        bolt_frame_quat = torch_utils.quat_from_euler_xyz(
+            roll=rot_actions[:, 0], pitch=rot_actions[:, 1], yaw=rot_actions[:, 2]
+        )
+        ctrl_target_preclipped_quat = torch_utils.quat_mul(quat_bolt_to_ee, bolt_frame_quat)
 
     # Step 2a: clip position targets toward current pose, within pos_threshold.
     delta_pos = ctrl_target_preclipped_pos - env.fingertip_midpoint_pos
@@ -434,24 +444,48 @@ def rotation_6d_to_matrix(v6, eps=1e-8):
     return torch.stack((b1, b2, b3), dim=2)  # columns
 
 
-def build_lower_triangular_3x3(diag_vals, offdiag_vals):
-    """Assemble a batch of 3x3 lower-triangular matrices from diagonal + off-diagonal values.
+def euler_xyz_to_matrix(roll, pitch, yaw, device=None, dtype=torch.float32):
+    """Build a single (1,3,3) rotation matrix from fixed roll/pitch/yaw (radians).
 
+    Uses the same XYZ Euler convention as the env's ``quat_from_euler_xyz`` — roll
+    about x, pitch about y, yaw about z, composed ``R = Rz(yaw) @ Ry(pitch) @ Rx(roll)``.
+    Returned with a leading batch dim of 1 so callers can ``expand`` it across the env
+    batch (mirrors the (E,3,3) shape produced by :func:`rotation_6d_to_matrix`).
+    """
+    r = torch.as_tensor(roll, dtype=dtype, device=device)
+    p = torch.as_tensor(pitch, dtype=dtype, device=device)
+    y = torch.as_tensor(yaw, dtype=dtype, device=device)
+    cr, sr = torch.cos(r), torch.sin(r)
+    cp, sp = torch.cos(p), torch.sin(p)
+    cy, sy = torch.cos(y), torch.sin(y)
+    R = torch.stack([
+        cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr,
+        sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr,
+        -sp,     cp * sr,                cp * cr,
+    ]).reshape(1, 3, 3)
+    return R
+
+
+def build_lower_triangular(diag_vals, offdiag_vals):
+    """Assemble a batch of n×n lower-triangular matrices from diagonal + off-diagonal values.
+
+    The size ``n`` is inferred from ``diag_vals`` (so the same code builds 3x3, 6x6, ...).
     Off-diagonal entries fill the strictly-lower triangle in the order returned by
-    ``torch.tril_indices(3, 3, offset=-1)``: ``(1,0), (2,0), (2,1)``.
+    ``torch.tril_indices(n, n, offset=-1)`` (row-major: ``(1,0), (2,0), (2,1), (3,0), ...``);
+    ``offdiag_vals`` must therefore have ``n*(n-1)//2`` entries on its last axis.
 
     Args:
-        diag_vals: (E, 3) diagonal entries (L[0,0], L[1,1], L[2,2]).
-        offdiag_vals: (E, 3) strictly-lower entries (L[1,0], L[2,0], L[2,1]).
+        diag_vals: (E, n) diagonal entries (L[0,0] ... L[n-1,n-1]).
+        offdiag_vals: (E, n*(n-1)//2) strictly-lower entries in tril order.
 
     Returns:
-        (E, 3, 3) lower-triangular matrices.
+        (E, n, n) lower-triangular matrices.
     """
-    E = diag_vals.shape[0]
-    L = torch.zeros((E, 3, 3), dtype=diag_vals.dtype, device=diag_vals.device)
-    diag_idx = torch.arange(3, device=diag_vals.device)
+    E, n = diag_vals.shape
+    L = torch.zeros((E, n, n), dtype=diag_vals.dtype, device=diag_vals.device)
+    diag_idx = torch.arange(n, device=diag_vals.device)
     L[:, diag_idx, diag_idx] = diag_vals
-    off = torch.tril_indices(3, 3, offset=-1, device=diag_vals.device)
+    off = torch.tril_indices(n, n, offset=-1, device=diag_vals.device)
     L[:, off[0], off[1]] = offdiag_vals
     return L
 

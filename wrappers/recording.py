@@ -25,7 +25,7 @@ from typing import Any, Callable
 
 import torch
 
-from wrappers.recording_grid import build_grid_video, write_gif, write_tb_video
+from wrappers.recording_grid import build_grid_video, write_video, write_tb_video
 
 
 CAMERA_KEY = "recorder_camera"
@@ -107,8 +107,12 @@ class RecordingWrapper:
         self._values = torch.zeros((self._num_envs, self._max_ep_len), dtype=torch.float32)
         self._env_done = torch.zeros(self._num_envs, dtype=torch.bool)
 
-        # Session state.
-        self._state = "idle"  # one of: "idle", "starting", "active"
+        # Session state. ``record_on_start`` arms a session before the first
+        # step() so capture begins on the env's very first rollout (no warm-up
+        # episode needed); otherwise the first session waits for the first global
+        # reset and the cadence is driven by ``record_every_k_resets``.
+        self._state = "starting" if getattr(recorder_cfg, "record_on_start", False) else "idle"
+        # one of: "idle", "starting", "active"
         self._t_in_session = 0
         self._global_reset_count = 0
         self._total_steps = 0  # used as TB global_step when no agent timestep fn is provided
@@ -287,11 +291,12 @@ class RecordingWrapper:
                 is_success=self._success,
                 values=self._values[:, : self._t_in_session],
             )
-            gif_path = os.path.join(
-                self._output_dir, f"recording_{idx:06d}.gif"
+            path_base = os.path.join(self._output_dir, f"recording_{idx:06d}")
+            out_path = write_video(
+                grid, path_base, fps=int(self._cfg.fps),
+                fmt=getattr(self._cfg, "video_format", "mp4"),
             )
-            write_gif(grid, gif_path, fps=int(self._cfg.fps))
-            print(f"[recorder] wrote {gif_path} ({grid.shape[0]} frames)", flush=True)
+            print(f"[recorder] wrote {out_path} ({grid.shape[0]} frames)", flush=True)
             if self._image_writer is not None:
                 write_tb_video(
                     self._image_writer,

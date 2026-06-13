@@ -22,26 +22,42 @@ where ``pdim`` depends on ``gain_mapping``:
   * ``constant``          (pdim=0)  — diagonal K from ``default_task_prop_gains`` (K_f from
     ``default_task_force_gains``); nothing is added to the action space.
   * ``variable_diagonal`` (pdim=6)  — per-axis diagonal K, geometric scaling.
-  * ``cholesky``          (pdim=12) — block-diagonal SPD K from TWO independent 3x3 Cholesky
-    factors (position block, rotation block): ``K = blkdiag(L_pos L_posᵀ, L_rot L_rotᵀ)``.
-    Per-block layout of the 6 dims: ``[3 L-diagonal, 3 L-off-diagonal]``; the off-diagonal
-    order matches ``torch.tril_indices(3,3,offset=-1)`` -> ``(1,0),(2,0),(2,1)``. D = zeros
-    for now (the Λ-based double-diagonalization damping is deferred).
-  * ``rotated``           (pdim=12) — diagonal K (6, geometric) + a 6-D rotation vector (6)
-    -> 3x3 rotation R (Gram-Schmidt) applied block-diagonally: ``K = blkdiag(R,R) diag(k) blkdiag(R,R)ᵀ``.
+  * ``cholesky``          (pdim=6 | 21)  — variable SPD K. By default only the POSITION 3x3
+    block is policy-set (rotation uses constant gains): ``K = blkdiag(K_pos, diag(k_rot_const))``,
+    6 dims = ``[3 diag, 3 off-diagonal]``. With ``full_gain_matrix`` the policy sets the whole
+    6x6 SPD K directly: 21 dims = ``[6 diag, 15 off-diagonal]``. Off-diagonal order matches
+    ``torch.tril_indices(n,n,-1)``. K uses the variance/correlation form
+    ``K = diag(√k)·Corr·diag(√k)``: the diagonal stiffness ``k = geom_scale(diag, lo, hi)`` lands
+    EXACTLY in ``[lo, hi]`` while ``Corr = C Cᵀ`` (row-normalized lower-triangular C with
+    strictly-lower entries ``chol_offdiag_rho·clamp(off,-1,1)``) is a true correlation matrix, so
+    off-diagonals stay bounded (``|Corr[i,j]| ≤ ρ/√(1+ρ²) ≤ 1``) and K stays SPD. D is critically
+    damped (matrix critical damping ``D = 2·K^{1/2}``).
+  * ``rotated``           (pdim=9 | 12) — diagonal K + a 6-D rotation vector -> 3x3 rotation R
+    (Gram-Schmidt) applied block-diagonally with R SHARED across blocks:
+    ``K = blkdiag(R,R) diag(k) blkdiag(R,R)ᵀ``. R rotates BOTH the position and orientation
+    blocks in all cases. By default only the position diagonal gains are policy-set, the
+    orientation gains held at the constants (3 diag + 6 rot6d = 9); with ``full_gain_matrix``
+    all 6 diagonals are policy-set (6 diag + 6 rot6d = 12). The shared R keeps rot6d at 6 dims
+    either way. Setting ``fixed_rotation_rpy = [roll, pitch, yaw]`` (degrees) instead FIXES R to
+    that constant frame: the rot6d dims drop out (pdim = 3 or 6, diagonal gains only) while R
+    still rotates both blocks of K / D / K_f exactly as the learned variant does.
 
 Scaling is geometric ``k = lo * (hi/lo)^((a+1)/2)`` with per-channel bounds (position /
 rotation for K; force / torque for K_f); a lower bound < eps yields 0 on that channel.
 ``use_hybrid_force=False`` => no selection/force-target dims (force_axes all-zero) and K_f=0.
 """
 
+import math
+
 import torch
+from isaaclab.utils.math import quat_apply, quat_from_matrix
 
 from .hybrid_vic_wrapper import HybridVICWrapper
 from .factory_control_utils import (
     geom_scale,
     rotation_6d_to_matrix,
-    build_lower_triangular_3x3,
+    euler_xyz_to_matrix,
+    build_lower_triangular,
     block_diag_2,
 )
 
@@ -51,8 +67,29 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
 
     _ALLOW_ZERO_N = True                  # force_axes all-zero => no force control
 
-    # Pose-K action dims consumed by each formulation (K_f mirrors this when hybrid is on).
-    _PDIM = {"constant": 0, "variable_diagonal": 6, "cholesky": 12, "rotated": 12}
+    @staticmethod
+    def _pose_pdim(mode, full, fixed_rot=False):
+        """Pose-K action dims consumed by ``mode`` (K_f mirrors this when hybrid is on).
+
+        ``constant`` => 0, ``variable_diagonal`` => 6 (per-axis diagonal, always full 6-DOF).
+        ``cholesky``/``rotated`` cover ``n`` policy-set diagonal DOFs: n=6 with
+        ``full_gain_matrix`` (position + orientation), else n=3 (position gains only;
+        orientation gains held at the constants — but ``rotated`` still rotates that block):
+
+          * cholesky = [diag(n), off(n*(n-1)/2)]  -> 6  (n=3) or 21 (n=6)
+          * rotated  = [diag(n), rot6d(6)]        -> 9  (n=3) or 12 (n=6); the 3x3 rotation R
+            is SHARED across the position and orientation blocks, so rot6d stays 6 either way.
+            With ``fixed_rot`` (``fixed_rotation_rpy`` set) R is constant, so the rot6d block
+            is dropped entirely: rotated = [diag(n)] -> 3 (n=3) or 6 (n=6).
+        """
+        if mode == "constant":
+            return 0
+        if mode == "variable_diagonal":
+            return 6
+        n = 6 if full else 3
+        if mode == "rotated":
+            return n if fixed_rot else n + 6
+        return n + n * (n - 1) // 2  # cholesky
 
     def __init__(self, env, controller_cfg, num_agents: int = 1):
         # Must be set BEFORE super().__init__: the base __init__ calls _update_dimensions()
@@ -60,12 +97,25 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         cfg = controller_cfg
         self._mode = cfg.gain_mapping
         self._use_hybrid = cfg.use_hybrid_force
-        self._pdim = self._PDIM[self._mode]
+        self._full = bool(cfg.full_gain_matrix)
+        # Fixed-rotation variant of ``rotated``: when fixed_rotation_rpy is supplied the R
+        # frame is constant (config-defined) rather than policy-emitted, so the rot6d action
+        # dims drop out. Only meaningful for gain_mapping="rotated" (validated in the cfg).
+        self._fixed_rpy = cfg.fixed_rotation_rpy if self._mode == "rotated" else None
+        self._fixed_rot = self._fixed_rpy is not None
+        self._pdim = self._pose_pdim(self._mode, self._full, self._fixed_rot)
 
         super().__init__(env, controller_cfg, num_agents=num_agents)
 
         dev = self.device
         self._chol_rho = float(cfg.chol_offdiag_rho)
+
+        # Constant rotation frame R (1,3,3) shared by K/D/K_f when fixed_rotation_rpy is set.
+        # Config supplies roll/pitch/yaw in DEGREES (easier to author); convert to radians here.
+        self._R_fixed = (
+            euler_xyz_to_matrix(*[math.radians(v) for v in self._fixed_rpy], device=dev)
+            if self._fixed_rot else None
+        )
 
         # Per-axis geometric bounds as (1, 6) tensors [x, y, z, Rx, Ry, Rz]: pose stiffness K
         # from gain_min/max, force stiffness K_f from force_gain_min/max.
@@ -82,8 +132,51 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
             cfg.default_task_force_gains, dtype=torch.float32, device=dev
         )                                                        # (6,)
 
+        # Eval-recording axis-frame markers (all default off; enabled per-marker from the
+        # record overlay). Lazy-created on first _update_frame_viz call; _R_frame is cached
+        # each step in _build_pose_KD for the rotated stiffness frame.
+        self._viz_rotation = bool(cfg.visualize_rotation_frame)
+        self._viz_peg_tip = bool(cfg.visualize_peg_tip_frame)
+        self._viz_world = bool(cfg.visualize_world_frame)
+        self._rotation_frame_scale = float(cfg.rotation_frame_axis_scale)
+        self._peg_tip_frame_scale = float(cfg.peg_tip_frame_axis_scale)
+        self._world_frame_scale = float(cfg.world_frame_axis_scale)
+        self._peg_tip_offset_z = float(cfg.peg_tip_offset_z)
+        self._marker_rotation = None
+        self._marker_peg_tip = None
+        self._marker_world = None
+        self._R_frame = None
+
     def _extra_action_dims(self):
         return self._pdim + (self._pdim if self._use_hybrid else 0)
+
+    # ---- logging gates (driven by this formulation's config switches) ----
+    def _force_control_enabled(self) -> bool:
+        # Force control needs both eligible axes and the hybrid-force toggle; without the
+        # toggle K_f is zeros and there are no selection/force-target dims.
+        return self._use_hybrid and self.N > 0
+
+    def _gains_variable(self) -> bool:
+        # "constant" mode uses fixed K/D/K_f (no policy gain dims) — nothing to plot.
+        return self._mode != "constant"
+
+    def _k_coupling_logged(self) -> bool:
+        # Only the non-diagonal K formulations have off-diagonal coupling to report.
+        return self._mode in ("rotated", "cholesky")
+
+    def _k_coupling_dim(self) -> int:
+        # ``rotated`` rotates BOTH the position and orientation blocks (cross blocks are
+        # structurally zero), so the whole 6x6 carries coupling regardless of full mode.
+        # ``cholesky`` only couples the policy-set block: all 6 DOFs in full mode, else the
+        # position 3x3 (its non-full orientation block is a constant diagonal).
+        if self._mode == "rotated":
+            return 6
+        return 6 if self._full else 3
+
+    def _damping_logged(self) -> bool:
+        # Damping D is a full matrix only for rotated/cholesky; the diagonal modes derive
+        # D = 2*sqrt(K), so there's nothing new to publish there.
+        return self._mode in ("rotated", "cholesky")
 
     # ------------------------------------------------------------------ gain mapping
     def _parse_gain_matrices(self):
@@ -100,8 +193,73 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
             K_f = torch.zeros((self.num_envs, 6, 6), device=self.device)
         return K, D, K_f
 
+    def _compute_control_targets(self):
+        # Parse gains (caches self._R_frame for rotated mode) via the base, then refresh the
+        # eval-recording frame markers. This runs in _pre_physics_step, so marker transforms
+        # are set before the recorder camera renders the frame (no one-step lag).
+        super()._compute_control_targets()
+        self._update_frame_viz()
+
+    def _update_frame_viz(self):
+        """Draw the enabled eval-recording axis frames at the peg tip / EEF.
+
+        Each marker is gated by its config toggle and lazy-created on first use; the rotated
+        stiffness frame additionally requires gain_mapping="rotated" (else there's no R). All
+        markers default off, so training pays nothing here.
+        """
+        if not (self._viz_rotation or self._viz_peg_tip or self._viz_world):
+            return
+
+        from .frame_viz import AxisFrameMarker
+
+        env = self.unwrapped
+        env_origins = env.scene.env_origins                                  # (E,3) world
+        E = self.num_envs
+
+        show_rotation = self._viz_rotation and self._mode == "rotated" and self._R_frame is not None
+
+        # Peg tip in absolute world coords (shared by the rotated + peg-tip frames). held_pos is
+        # env-relative in the Factory env, so add env_origins; the tip is offset along the held
+        # asset's local +z.
+        if self._viz_peg_tip or show_rotation:
+            offset = torch.zeros((E, 3), device=self.device)
+            offset[:, 2] = self._peg_tip_offset_z
+            tip_pos_w = env.held_pos + env_origins + quat_apply(env.held_quat, offset)
+
+        if show_rotation:
+            if self._marker_rotation is None:
+                self._marker_rotation = AxisFrameMarker(
+                    "/World/Visuals/RotatedStiffnessFrame", self._rotation_frame_scale)
+            self._marker_rotation.update(tip_pos_w, quat_from_matrix(self._R_frame))
+
+        if self._viz_peg_tip:
+            if self._marker_peg_tip is None:
+                self._marker_peg_tip = AxisFrameMarker(
+                    "/World/Visuals/PegTipFrame", self._peg_tip_frame_scale)
+            self._marker_peg_tip.update(tip_pos_w, env.held_quat)
+
+        if self._viz_world:
+            if self._marker_world is None:
+                self._marker_world = AxisFrameMarker(
+                    "/World/Visuals/WorldFrameAtEEF", self._world_frame_scale)
+            identity = torch.zeros((E, 4), device=self.device)
+            identity[:, 0] = 1.0
+            self._marker_world.update(env.fingertip_midpoint_pos + env_origins, identity)
+
     def _build_pose_KD(self, a):
-        """Pose stiffness K and (derived) damping D = 2*sqrt(K), per ``self._mode``."""
+        """Pose stiffness K and critically-damped D, per ``self._mode``.
+
+        Diagonal modes use D = 2*sqrt(K) per axis; ``rotated`` rotates that critically-
+        damped diagonal (== matrix critical damping since K = R diag(k) Rᵀ); ``cholesky``
+        uses the full matrix critical damping 2*V*sqrt(Λ)*Vᵀ (see ``_crit_damp_matrix``).
+
+        For ``rotated`` / ``cholesky`` the policy controls the position 3x3 block's gains by
+        default; with ``full_gain_matrix`` it controls all 6 DOFs (position + orientation).
+        ``rotated`` always applies the shared R to BOTH the position and orientation blocks —
+        ``full_gain_matrix`` only switches the orientation diagonal gains between policy-set
+        and the constants, never whether they are rotated. ``cholesky``'s non-full orientation
+        block is the constant diagonal (``_const_rot_block``), since it has no rotation frame.
+        """
         E = self.num_envs
         if self._mode == "constant":
             kdiag = self._k_const.unsqueeze(0).expand(E, 6)
@@ -112,29 +270,64 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
             return torch.diag_embed(kdiag), torch.diag_embed(self._crit_damp(kdiag))
 
         if self._mode == "rotated":
-            kdiag = geom_scale(a[:, 0:6], self._k_lo, self._k_hi)
-            Rf = block_diag_2(*self._rot_blocks(a[:, 6:12]))
-            RfT = Rf.transpose(1, 2)
-            K = Rf @ torch.diag_embed(kdiag) @ RfT
-            D = Rf @ torch.diag_embed(self._crit_damp(kdiag)) @ RfT
+            # Rotate a critically-damped diagonal by R. R is shared across blocks and rotates
+            # BOTH the position and orientation blocks in every case; ``full_gain_matrix`` only
+            # decides whether the orientation diagonal gains are policy-set or held at the
+            # constants — never whether they're rotated. With ``fixed_rotation_rpy`` R is the
+            # constant config frame; otherwise it's decoded from the trailing 6 action dims.
+            R = self._rotation_frame(a)                                            # (E,3,3)
+            self._R_frame = R  # cached for the eval-recording rotated-stiffness-frame marker
+            if self._full:
+                kdiag = geom_scale(a[:, 0:6], self._k_lo, self._k_hi)              # (E,6)
+            else:
+                # Position gains policy-set; orientation gains held at the constants.
+                kpos = geom_scale(a[:, 0:3], self._k_lo[:, 0:3], self._k_hi[:, 0:3])  # (E,3)
+                krot = self._k_const[3:6].unsqueeze(0).expand(E, 3)                   # (E,3)
+                kdiag = torch.cat((kpos, krot), dim=1)                                # (E,6)
+            K = self._rotate_blockdiag(R, kdiag)
+            D = self._rotate_blockdiag(R, self._crit_damp(kdiag))
             return K, D
 
-        # cholesky: SPD K, damping deferred (zeros).
-        K = self._build_cholesky_K(a, self._k_lo, self._k_hi)
-        return K, torch.zeros((E, 6, 6), device=self.device)
+        # cholesky: full SPD K with matrix critical damping. Full mode builds the whole 6x6;
+        # otherwise the policy sets the position 3x3 and the rotation block is constant.
+        if self._full:
+            K = self._build_cholesky_block(a, self._k_lo, self._k_hi)
+            return K, self._crit_damp_matrix(K)
+        Kpos = self._build_cholesky_block(a, self._k_lo[:, 0:3], self._k_hi[:, 0:3])
+        Krot, Drot = self._const_rot_block(self._k_const, E)
+        return block_diag_2(Kpos, Krot), block_diag_2(self._crit_damp_matrix(Kpos), Drot)
 
     def _build_force_K(self, a):
-        """Force stiffness K_f (no damping), per ``self._mode`` with force/torque bounds."""
+        """Force stiffness K_f (no damping), mirroring the pose-K formulation exactly.
+
+        For rotated/cholesky the policy controls only the force (translation) 3x3 block's
+        gains by default; with ``full_gain_matrix`` it controls all 6 DOFs. In ``rotated`` the
+        shared R rotates both the force and torque blocks regardless — full mode only switches
+        the torque gains between policy-set and the constants. In ``cholesky`` the non-full
+        torque block is the constant diagonal.
+        """
         E = self.num_envs
         if self._mode == "constant":
             return torch.diag_embed(self._kf_const.unsqueeze(0).expand(E, 6))
         if self._mode == "variable_diagonal":
             return torch.diag_embed(geom_scale(a, self._kf_lo, self._kf_hi))
         if self._mode == "rotated":
-            kdiag = geom_scale(a[:, 0:6], self._kf_lo, self._kf_hi)
-            Rf = block_diag_2(*self._rot_blocks(a[:, 6:12]))
-            return Rf @ torch.diag_embed(kdiag) @ Rf.transpose(1, 2)
-        return self._build_cholesky_K(a, self._kf_lo, self._kf_hi)
+            R = self._rotation_frame(a)
+            if self._full:
+                kdiag = geom_scale(a[:, 0:6], self._kf_lo, self._kf_hi)
+            else:
+                # Force (translation) gains policy-set; torque gains held at the constants;
+                # the shared R rotates both blocks either way (mirrors pose K).
+                kpos = geom_scale(a[:, 0:3], self._kf_lo[:, 0:3], self._kf_hi[:, 0:3])
+                ktor = self._kf_const[3:6].unsqueeze(0).expand(E, 3)
+                kdiag = torch.cat((kpos, ktor), dim=1)
+            return self._rotate_blockdiag(R, kdiag)
+        # cholesky
+        if self._full:
+            return self._build_cholesky_block(a, self._kf_lo, self._kf_hi)
+        Kpos = self._build_cholesky_block(a, self._kf_lo[:, 0:3], self._kf_hi[:, 0:3])
+        Ktor, _ = self._const_rot_block(self._kf_const, E)
+        return block_diag_2(Kpos, Ktor)
 
     # ------------------------------------------------------------------ helpers
     @staticmethod
@@ -142,33 +335,84 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         """Critical damping for a diagonal stiffness vector: D = 2*sqrt(K)."""
         return 2.0 * torch.sqrt(kdiag.clamp_min(0.0))
 
-    @staticmethod
-    def _rot_blocks(v6):
-        """3x3 rotation R from a 6-D vector, returned twice for block-diagonal blkdiag(R,R)."""
-        R = rotation_6d_to_matrix(v6)
-        return R, R
+    def _rotation_frame(self, a):
+        """(E,3,3) rotation frame R for ``rotated`` mode from a gain-action block ``a``.
 
-    def _build_cholesky_K(self, a, lo, hi):
-        """Block-diagonal SPD K from two independent 3x3 Cholesky factors.
-
-        ``a`` is (E,12) = [pos_diag(3), pos_off(3), rot_diag(3), rot_off(3)]. The L diagonal is
-        geometrically scaled with the *sqrt* of the per-channel K bounds (since K=LLᵀ squares
-        it); the L off-diagonal is ``chol_offdiag_rho * sqrt(lo*hi) * clamp(a,-1,1)`` using the
-        block's scalar bound product.
+        Fixed-rotation variant (``fixed_rotation_rpy`` set) returns the constant config frame
+        broadcast to the env batch — ``a`` carries only the diagonal gains, no rot6d tail.
+        Otherwise R is decoded (Gram-Schmidt) from the trailing 6 dims of ``a``.
         """
-        sqrt_lo = torch.sqrt(lo.clamp_min(0.0))
-        sqrt_hi = torch.sqrt(hi.clamp_min(0.0))
+        if self._fixed_rot:
+            return self._R_fixed.expand(a.shape[0], 3, 3)
+        return rotation_6d_to_matrix(a[:, -6:])
 
-        lp_diag = geom_scale(a[:, 0:3], sqrt_lo[:, 0:3], sqrt_hi[:, 0:3])
-        lr_diag = geom_scale(a[:, 6:9], sqrt_lo[:, 3:6], sqrt_hi[:, 3:6])
+    @staticmethod
+    def _rotate_blockdiag(R, kdiag):
+        """Block-diagonal congruence ``blkdiag(R,R) diag(k) blkdiag(R,R)ᵀ`` for (E,6) ``k``.
 
-        ref_pos = torch.sqrt((lo[0, 0] * hi[0, 0]).clamp_min(0.0))
-        ref_rot = torch.sqrt((lo[0, 3] * hi[0, 3]).clamp_min(0.0))
-        lp_off = self._chol_rho * ref_pos * a[:, 3:6].clamp(-1.0, 1.0)
-        lr_off = self._chol_rho * ref_rot * a[:, 9:12].clamp(-1.0, 1.0)
+        The shared 3x3 rotation ``R`` is applied to both the position (k[:,0:3]) and
+        orientation (k[:,3:6]) sub-blocks, yielding a (E,6,6) block-diagonal SPD matrix
+        whose translation/orientation blocks stay decoupled.
+        """
+        RT = R.transpose(1, 2)
+        top = R @ torch.diag_embed(kdiag[:, 0:3]) @ RT
+        bot = R @ torch.diag_embed(kdiag[:, 3:6]) @ RT
+        return block_diag_2(top, bot)
 
-        Lp = build_lower_triangular_3x3(lp_diag, lp_off)
-        Lr = build_lower_triangular_3x3(lr_diag, lr_off)
-        Kp = Lp @ Lp.transpose(1, 2)
-        Kr = Lr @ Lr.transpose(1, 2)
-        return block_diag_2(Kp, Kr)
+    def _const_rot_block(self, k_const, E):
+        """Constant rotation/torque (K, D) 3x3 blocks from ``k_const[3:6]``.
+
+        Matches how ``constant`` mode sets gains, so the rotation (pose) / torque (force)
+        axes keep fixed gains in the rotated/cholesky formulations instead of being
+        policy-driven. Pass the pose constants for K/D; force callers pass the force
+        constants and ignore the returned D.
+        """
+        krot = k_const[3:6].unsqueeze(0).expand(E, 3)   # (E,3)
+        return torch.diag_embed(krot), torch.diag_embed(self._crit_damp(krot))
+
+    @staticmethod
+    def _crit_damp_matrix(K, zeta=1.0):
+        """Matrix critical damping for a symmetric PSD stiffness K (E,n,n).
+
+        Eigendecompose K = V diag(λ) Vᵀ (orthonormal V) and return
+        ``D = 2 V diag(ζ √λ) Vᵀ`` with ζ=1 for critical damping. Batched and fully on
+        the input device/dtype via ``torch.linalg.eigh`` (no host transfers), so it
+        parallelizes across envs. Reduces to ``D = 2√K`` when K is diagonal.
+        """
+        # Symmetrize for numerical safety (eigh reads the lower triangle anyway) and clamp
+        # eigenvalues at 0 to guard against tiny negative round-off in the PSD K.
+        Ksym = 0.5 * (K + K.transpose(-1, -2))
+        evals, evecs = torch.linalg.eigh(Ksym)                 # (E,n), (E,n,n)
+        d = 2.0 * zeta * torch.sqrt(evals.clamp_min(0.0))      # (E,n)
+        return evecs @ torch.diag_embed(d) @ evecs.transpose(-1, -2)
+
+    def _build_cholesky_block(self, a, lo, hi):
+        """Single n×n SPD block in variance/correlation form from a leading action slice.
+
+        ``n`` is inferred from ``lo`` (3 for the position-only block, 6 for the full matrix);
+        ``a`` is consumed as [diag(n), off(n*(n-1)/2)]. The block is ``K = diag(√k)·Corr·diag(√k)``:
+
+          * ``k = geom_scale(diag, lo, hi)`` sets the diagonal stiffness EXACTLY in ``[lo, hi]``;
+          * ``Corr = C Cᵀ`` is a correlation matrix, where C is the lower-triangular factor with
+            unit diagonal and strictly-lower entries ``chol_offdiag_rho * clamp(off, -1, 1)``,
+            then row-normalized to unit length.
+
+        Because the rows of C are unit-norm, ``Corr`` has unit diagonal and (Cauchy–Schwarz)
+        ``|Corr[i,j]| = |⟨row_i, row_j⟩| ≤ 1``, so the congruence gives ``diag(K) = k`` exactly
+        and ``|K[i,j]| ≤ √(k_i k_j)`` — K stays SPD and the diagonal can never exceed ``hi`` no
+        matter the coupling. ``rho`` is the soft knob: ``rho=0`` -> pure diagonal (no coupling);
+        a single off-diagonal entry is capped at ``|Corr| ≤ rho/√(1+rho²)``, rising toward the
+        ±1 ceiling as rho grows. (Replaces the old raw ``K=LLᵀ`` form whose off-diagonal energy
+        added into — and blew up — the diagonal, compounded by an off-diagonal scaled in
+        stiffness units (~√(lo·hi)) instead of √-stiffness units.)
+        """
+        n = lo.shape[-1]
+        n_off = n * (n - 1) // 2
+        k = geom_scale(a[:, 0:n], lo, hi)                  # (E,n) diagonal stiffness in [lo, hi]
+        s = torch.sqrt(k.clamp_min(0.0))                   # √k for the diag(√k)·Corr·diag(√k) congruence
+        off = self._chol_rho * a[:, n:n + n_off].clamp(-1.0, 1.0)  # strictly-lower entries of C (tril order)
+        C = build_lower_triangular(torch.ones_like(k), off)
+        C = C / C.norm(dim=2, keepdim=True)                # normalize each row to unit length
+        corr = C @ C.transpose(1, 2)                       # correlation matrix (unit diagonal)
+        S = torch.diag_embed(s)
+        return S @ corr @ S                                # SPD, diag(K) = k exactly

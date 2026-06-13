@@ -1,0 +1,337 @@
+runner_cfg:
+  task: Isaac-AutoMate-Assembly-Direct-v0
+  agent_type: sac
+  env_cfg_overrides:
+    sim.physx.gpu_collision_stack_size: 268435456
+    tasks.insertion.if_sbc: false
+  automate_assembly_id: '00652'
+  automate_grasp_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # peg IN-HAND offset from nominal grasp [x,y,z (m), roll,pitch,yaw (deg)] (plug-local); 0 = nominal grasp
+  num_envs: 16
+  num_agents: 3
+  total_timesteps: 5000
+  eval_timesteps: 150
+  memory_size: 10000
+  seed: -1
+sac_cfg:
+  experiment:
+    directory: /home/hunter/generalized_hybrid_vic_action_space/runs/automate_00652
+    experiment_name: VIC_OD_POS
+    write_interval: 75
+    checkpoint_interval: auto
+    store_separately: false
+    wandb: false
+    wandb_kwargs: {}
+  gradient_steps: 8
+  batch_size: 1024
+  discount_factor: 0.99
+  polyak: 0.005
+  actor_lr: 0.0001
+  critic_lr: 0.0001
+  entropy_lr: 0.0001
+  weight_decay: 0.01
+  learning_rate_scheduler:
+  - null
+  - null
+  - null
+  learning_rate_scheduler_kwargs:
+  - {}
+  - {}
+  - {}
+  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor_kwargs: {}
+  random_timesteps: 0
+  learning_starts: 150
+  grad_norm_clip: 0.0
+  learn_entropy: true
+  initial_entropy_value: 0.01
+  target_entropy: -13.5
+  rewards_shaper: null
+  rewards_shaper_scale: null
+  gripper_action_idx: null
+  mixed_precision: false
+  recorder:
+    enabled: true
+    record_every_k_resets: 1
+    width: 240
+    height: 180
+    camera_pos:
+    - 1.0
+    - 0.0
+    - 0.35
+    camera_quat:
+    - -0.3535534
+    - 0.6123724
+    - 0.6123724
+    - -0.3535534
+    focal_length: 24.0
+    focus_distance: 0.05
+    horizontal_aperture: 20.955
+    clipping_range:
+    - 0.1
+    - 20.0
+    fps: 30
+    output_subdir: videos
+ppo_cfg:
+  experiment:
+    directory: ''
+    experiment_name: ''
+    write_interval: auto
+    checkpoint_interval: auto
+    store_separately: false
+    wandb: false
+    wandb_kwargs: {}
+  rollouts: 16
+  learning_epochs: 8
+  mini_batches: 2
+  discount_factor: 0.99
+  gae_lambda: 0.95
+  policy_lr: 0.0003
+  value_lr: 0.0003
+  weight_decay: 0.0
+  learning_rate_scheduler: null
+  learning_rate_scheduler_kwargs: {}
+  observation_preprocessor: null
+  observation_preprocessor_kwargs: {}
+  value_preprocessor: null
+  value_preprocessor_kwargs: {}
+  random_timesteps: 0
+  learning_starts: 0
+  grad_norm_clip: 0.5
+  ratio_clip: 0.2
+  value_clip: 0.2
+  entropy_loss_scale: 0.0
+  value_loss_scale: 1.0
+  kl_threshold: 0.0
+  time_limit_bootstrap: false
+  gripper_action_idx: null
+  rewards_shaper: null
+  rewards_shaper_scale: null
+  mixed_precision: false
+  recorder:
+    enabled: false
+    record_every_k_resets: 20
+    width: 240
+    height: 180
+    camera_pos:
+    - 1.0
+    - 0.0
+    - 0.35
+    camera_quat:
+    - -0.3535534
+    - 0.6123724
+    - 0.6123724
+    - -0.3535534
+    focal_length: 24.0
+    focus_distance: 0.05
+    horizontal_aperture: 20.955
+    clipping_range:
+    - 0.1
+    - 20.0
+    fps: 30
+    output_subdir: videos
+model_cfg:
+  actor:
+    act_init_std: 1.0
+    actor_n: 2
+    actor_latent: 512
+    last_layer_scale: 0.1
+    clip_log_std: true
+    min_log_std: -20.0
+    max_log_std: 2.0
+    reduction: sum
+    use_state_dependent_std: false
+    bernoulli_action_dims: null
+    force_zero_action_dims:
+    - 3
+    - 4
+    selection_init_bias: -2.2
+    selection_distribution: product
+  critic:
+    critic_output_init_mean: 0.0
+    critic_n: 4
+    critic_latent: 1024
+    clip_actions: false
+controller_cfg:
+  ema_factor: 0.2
+  pos_action_bounds:
+  - 0.1
+  - 0.1
+  - 0.1
+  rot_action_bounds:
+  - 0.01
+  - 0.01
+  - 0.01
+  pos_action_threshold:
+  - 0.1
+  - 0.1
+  - 0.1
+  rot_action_threshold:
+  - 0.01
+  - 0.01
+  - 0.01
+  reset_joints:
+  - 0.0
+  - 0.0
+  - 0.0
+  - -1.87
+  - 0.0
+  - 1.8675
+  - 0.785398
+  reset_task_prop_gains:
+  - 1000
+  - 1000
+  - 1000
+  - 50
+  - 50
+  - 50
+  reset_rot_deriv_scale: 10.0
+  default_task_prop_gains:
+  - 100
+  - 100
+  - 100
+  - 30
+  - 30
+  - 30
+  default_dof_pos_tensor:
+  - 0.0
+  - 0.0
+  - 0.0
+  - -1.87
+  - 0.0
+  - 1.8675
+  - 0.785398
+  kp_null: 10.0
+  kd_null: 6.3246
+  ema_factor_range:
+  - 0.025
+  - 0.1
+  task_prop_gains_noise_level:
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  pos_threshold_noise_level:
+  - 0.25
+  - 0.25
+  - 0.25
+  rot_threshold_noise_level:
+  - 0.29
+  - 0.29
+  - 0.29
+  default_dead_zone:
+  - 5.0
+  - 5.0
+  - 5.0
+  - 1.0
+  - 1.0
+  - 1.0
+  control_type: ctrl-action-interface
+  gain_min:
+  - 70.71
+  - 70.71
+  - 70.71
+  - 21.21
+  - 21.21
+  - 21.21
+  gain_max:
+  - 141.42
+  - 141.42
+  - 141.42
+  - 42.43
+  - 42.43
+  - 42.43
+  damping_min:
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  damping_max:
+  - 100.0
+  - 100.0
+  - 100.0
+  - 10.0
+  - 10.0
+  - 10.0
+  force_gain_min:
+  - 0.35
+  - 0.35
+  - 0.35
+  - 0.07
+  - 0.07
+  - 0.07
+  force_gain_max:
+  - 0.705
+  - 0.705
+  - 0.705
+  - 0.141
+  - 0.141
+  - 0.141
+  apply_ema_to_gains: false
+  force_axes:
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  force_action_bounds:
+  - 20.0
+  - 20.0
+  - 20.0
+  torque_action_bounds:
+  - 0.25
+  - 0.25
+  - 0.25
+  force_action_threshold:
+  - 2.0
+  - 2.0
+  - 2.0
+  torque_action_threshold:
+  - 0.01
+  - 0.01
+  - 0.01
+  default_task_force_gains:
+  - 0.5
+  - 0.5
+  - 0.5
+  - 0.1
+  - 0.1
+  - 0.1
+  async_z_force_bounds: true
+  apply_ema_force: false
+  no_sel_ema: true
+  target_init_mode: zero
+  ema_mode: action
+  use_delta_force: false
+  gain_mapping: cholesky
+  use_hybrid_force: false
+  chol_offdiag_rho: 0.9
+  full_gain_matrix: false
+noise_cfg:
+  fixed_asset_pos:
+  - 0.001
+  - 0.001
+  - 0.001
+  fingertip_pos: 0.00025
+  fingertip_rot_deg: 0.1
+  ft_force: 1.0
+sensor_cfg:
+  contact:
+    enabled: true
+    contact_force_threshold: 1.0
+    log_contact_state: true
+    append_to_policy_obs: false
+    append_to_critic_state: true
+    held_prim_expr: /World/envs/env_.*/HeldAsset
+    fixed_prim_expr: /World/envs/env_.*/FixedAsset
+loss_cfg:
+  action_l2_enabled: false
+  action_l2_policy_weight: 0.0
+  action_l2_critic_weight: 0.0
+  supervised_selection_enabled: false
+  supervised_selection_policy_weight: 1.0
+  supervised_selection_critic_weight: 0.0

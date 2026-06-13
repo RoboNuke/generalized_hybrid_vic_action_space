@@ -42,7 +42,9 @@ def select_grid_indices(returns: torch.Tensor) -> torch.Tensor:
 
     ``returns`` has shape ``(num_envs,)``. If ``num_envs < 12``, fill with the
     available envs (no padding tile — caller will see a shorter grid). The
-    "middle 4" are the four envs whose returns are closest to the median.
+    "middle 4" are the four envs whose returns are closest to the median. Within
+    every row the four indices are sorted by DESCENDING return, so each row reads
+    high -> low return left to right.
     """
     n = int(returns.numel())
     if n == 0:
@@ -52,10 +54,12 @@ def select_grid_indices(returns: torch.Tensor) -> torch.Tensor:
         # Not enough envs to differentiate; just return them best-first.
         return torch.flip(sorted_idx, dims=(0,))
 
-    best = torch.flip(sorted_idx[-4:], dims=(0,))  # descending
-    worst = sorted_idx[:4]  # ascending (truly worst first)
+    # Each row is sorted by DESCENDING return so every row reads high -> low left to right.
+    best = torch.flip(sorted_idx[-4:], dims=(0,))   # highest returns, descending
+    worst = torch.flip(sorted_idx[:4], dims=(0,))   # lowest returns, still descending within the row
 
-    # 4 envs nearest the median return.
+    # 4 envs nearest the median return (selected by distance), then re-ordered by descending
+    # return so the middle row is sorted the same way as the others.
     median_val = returns[sorted_idx[n // 2]]
     dist = (returns - median_val).abs()
     # Exclude indices already used in best/worst.
@@ -65,6 +69,7 @@ def select_grid_indices(returns: torch.Tensor) -> torch.Tensor:
     dist_masked = dist.clone()
     dist_masked[used] = float("inf")
     middle = torch.topk(dist_masked, k=4, largest=False).indices
+    middle = middle[torch.argsort(returns[middle], descending=True)]
 
     return torch.cat([best, middle, worst], dim=0)
 
@@ -121,6 +126,8 @@ def build_grid_video(
     term_step: torch.Tensor,
     is_success: torch.Tensor,
     values: torch.Tensor | None,
+    engaged: torch.Tensor | None = None,
+    success_seq: torch.Tensor | None = None,
 ) -> np.ndarray:
     """Compose the 3x4 grid video.
 
@@ -129,12 +136,18 @@ def build_grid_video(
     :param returns: ``(num_envs,)`` float — final episode return per env (frozen
         at first termination during the session).
     :param term_step: ``(num_envs,)`` int64 — first-termination step, or ``T``
-        if the env survived the whole session. Borders are drawn for ``t >=
-        term_step[i]``.
+        if the env survived the whole session.
     :param is_success: ``(num_envs,)`` bool — success flag at first termination.
+        Used only for the legacy terminal border (when ``success_seq`` is None).
     :param values: ``(num_envs, T)`` float (or None) — per-step ``min(Q1, Q2)``.
         Stale entries past ``term_step`` are ignored (overlay shows the value at
         ``term_step`` once frozen).
+    :param success_seq: ``(num_envs, T)`` bool (or None) — PER-STEP "in success
+        position" flag. When provided, the border is drawn per frame: **green** on
+        steps in the success position, **orange** on steps merely engaged, none
+        otherwise (the terminal red/green behavior is disabled).
+    :param engaged: ``(num_envs, T)`` bool (or None) — PER-STEP engagement flag,
+        used for the orange border. Ignored unless ``success_seq`` is provided.
     :returns: ``(T, gridH, gridW, 3)`` uint8 numpy array.
     """
     selected = select_grid_indices(returns)
@@ -142,9 +155,11 @@ def build_grid_video(
     n_show = min(n_sel, TILES)
     selected = selected[:n_show]
 
-    # Freeze frames past termination.
-    frames = _freeze_frames(frames, term_step)
-    sel_frames = frames[selected].cpu().numpy()  # (n_show, T, H, W, 3) uint8
+    # Subset to the selected tiles FIRST, then freeze only those. Freezing the full
+    # M-trajectory stack would clone every collected buffer (M x T x H x W x 3); at high
+    # recorder resolutions that extra copy is gigabytes and can OOM the host. Advanced
+    # indexing already copies, so only the 12 kept trajectories are ever cloned.
+    sel_frames = _freeze_frames(frames[selected], term_step[selected]).cpu().numpy()  # (n_show, T, H, W, 3)
     sel_returns = returns[selected].cpu().numpy()
     sel_term = term_step[selected].cpu().numpy()
     sel_succ = is_success[selected].cpu().numpy().astype(bool)
@@ -152,6 +167,13 @@ def build_grid_video(
         sel_values = values[selected].cpu().numpy()  # (n_show, T)
     else:
         sel_values = None
+    # Per-step engagement / success borders (preferred when available).
+    sel_success_seq = (
+        success_seq[selected].cpu().numpy().astype(bool) if success_seq is not None else None
+    )
+    sel_engaged = (
+        engaged[selected].cpu().numpy().astype(bool) if engaged is not None else None
+    )
 
     T = sel_frames.shape[1]
     H = sel_frames.shape[2]
@@ -174,7 +196,20 @@ def build_grid_video(
             y = row * H
             ts = int(sel_term[tile_idx])
             terminated_now = t >= ts
-            border_color = "green" if sel_succ[tile_idx] else "red"
+            if sel_success_seq is not None:
+                # Per-step border, frozen at termination: green in the success
+                # position, orange when (only) engaged, none otherwise.
+                tt = min(t, ts, T - 1)
+                if sel_success_seq[tile_idx, tt]:
+                    show_border, border_color = True, "green"
+                elif sel_engaged is not None and sel_engaged[tile_idx, tt]:
+                    show_border, border_color = True, "orange"
+                else:
+                    show_border, border_color = False, None
+            else:
+                # Legacy: a single terminal border, green on success else red.
+                show_border = terminated_now
+                border_color = "green" if sel_succ[tile_idx] else "red"
             tot_rew = float(sel_returns[tile_idx])
             if sel_values is not None:
                 # Freeze value at termination.
@@ -187,7 +222,7 @@ def build_grid_video(
                 sel_frames[tile_idx, t],
                 x,
                 y,
-                show_border=terminated_now,
+                show_border=show_border,
                 border_color=border_color,
                 tot_rew=tot_rew,
                 v_est=v_est,
@@ -209,6 +244,49 @@ def write_gif(grid: np.ndarray, path: str, fps: int) -> None:
         loop=0,
         optimize=False,
     )
+
+
+def write_mp4(grid: np.ndarray, path: str, fps: int) -> None:
+    """Save ``grid`` (``(T, H, W, 3)`` uint8 numpy) as an H.264 MP4.
+
+    Far smaller and smoother to play back than a GIF at video resolutions (a 1080p GIF
+    is hundreds of MB and stutters because viewers can't decode frames fast enough). Uses
+    the ffmpeg binary bundled with ``imageio-ffmpeg``; ``yuv420p`` keeps it playable in
+    browsers / QuickTime, which require even frame dimensions, so a stray odd row/column
+    is trimmed.
+    """
+    import imageio
+
+    h, w = grid.shape[1], grid.shape[2]
+    h2, w2 = h - (h % 2), w - (w % 2)
+    g = grid[:, :h2, :w2, :] if (h2, w2) != (h, w) else grid
+    writer = imageio.get_writer(
+        path, format="FFMPEG", fps=int(max(1, fps)), codec="libx264",
+        quality=8, macro_block_size=1, pixelformat="yuv420p",
+    )
+    try:
+        for t in range(g.shape[0]):
+            writer.append_data(np.ascontiguousarray(g[t]))
+    finally:
+        writer.close()
+
+
+def write_video(grid: np.ndarray, path_base: str, fps: int, fmt: str = "mp4") -> str:
+    """Write ``grid`` to ``<path_base>.<fmt>`` and return the path written.
+
+    ``fmt`` is ``"mp4"`` (H.264; recommended — compact and smooth) or ``"gif"`` (large and
+    laggy at video resolutions, kept for compatibility).
+    """
+    fmt = str(fmt).lower()
+    if fmt == "mp4":
+        path = f"{path_base}.mp4"
+        write_mp4(grid, path, fps)
+    elif fmt == "gif":
+        path = f"{path_base}.gif"
+        write_gif(grid, path, fps)
+    else:
+        raise ValueError(f"recorder video_format must be 'mp4' or 'gif', got {fmt!r}")
+    return path
 
 
 def write_tb_video(image_writer, tag: str, grid: np.ndarray, fps: int, global_step: int) -> None:

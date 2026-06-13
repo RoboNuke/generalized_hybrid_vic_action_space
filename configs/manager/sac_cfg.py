@@ -23,7 +23,15 @@ class RecorderCfg:
     record_every_k_resets: int = 20
     """Open a recording session every K-th observed *global* reset (a step where
     ``(terminated | truncated).all()`` is True). Per-env async resets in between
-    do not count. The first session opens at the first global reset."""
+    do not count. The first session opens at the first global reset (unless
+    ``record_on_start`` is set — then a session also opens on the very first step)."""
+
+    record_on_start: bool = False
+    """When True, open a recording session immediately on the first ``step()``
+    instead of waiting for the first global reset. Lets the captured episode line
+    up with the env's first rollout, so ``eval_timesteps`` can be a single episode
+    (``max_episode_length``) rather than needing a spare warm-up episode. Default
+    False preserves the train-time cadence (first session at the K-th global reset)."""
 
     width: int = 240
     """Per-tile camera width in pixels."""
@@ -52,7 +60,19 @@ class RecorderCfg:
     """PinholeCamera near/far clip planes (m). RoboNuke default."""
 
     fps: int = 30
-    """Playback rate for the saved GIF and TB video."""
+    """Playback rate for the saved video and TB video."""
+
+    video_format: str = "mp4"
+    """Output container for the recorded grid: ``"mp4"`` (H.264 — compact and smooth, the
+    default and strongly recommended at video resolutions) or ``"gif"`` (huge and stuttery
+    for large frames; kept only for compatibility)."""
+
+    num_trajectories: int = 24
+    """Used only by the standalone per-agent recorder (``learning/record.py`` /
+    ``learning/recording_eval.py``): collect at least this many complete episode
+    trajectories (running as many full-batch episodes as needed), then select the
+    best-4 / median-4 / worst-4 by return for the 3x4 grid. Has no effect on the
+    in-training ``RecordingWrapper``."""
 
     output_subdir: str = "videos"
     """Subdirectory under the SAC experiment dir where GIFs are written."""

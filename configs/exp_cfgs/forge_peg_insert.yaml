@@ -67,3 +67,13 @@ sensor_cfg:
     enabled: true                  # mount an IsaacLab ContactSensor on the peg, filtered vs the hole
     contact_force_threshold: 1.0   # N; per-axis EE-frame |force| above this => in contact (1.0 matches upstream)
     log_contact_state: true        # log Contact / In-Contact {X,Y,Z,Any} fractions to TensorBoard
+  energy:
+    enabled: true                  # log per-step energy/effort metrics under the energy_metrics/ tab
+    battery_scale: 1.0             # scale on the Σ τ² copper-loss proxy for electrical draw
+
+noise_cfg:                         # observation noise, pushed onto env_cfg.obs_rand (inherits ForgeObsRandCfg).
+                                   # Values below are the Forge defaults; set any to 0 / [0,0,0] to disable.
+  fingertip_pos: 0.00025           # m; per-step Gaussian on EE position obs
+  fingertip_rot_deg: 0.1           # deg; per-step axis-angle perturbation of EE quaternion obs
+  ft_force: 1.0                    # N; per-step Gaussian on force-sensor obs
+  fixed_asset_pos: [0.001, 0.001, 0.001]  # m; per-reset offset of fixed-asset obs frame (held for the episode)

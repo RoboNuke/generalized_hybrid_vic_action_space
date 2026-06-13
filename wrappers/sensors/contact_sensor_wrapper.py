@@ -37,6 +37,8 @@ import torch
 # Scene key the sensor is registered under (shared by installer + wrapper).
 CONTACT_SENSOR_KEY = "held_fixed_contact_sensor"
 _AXIS_NAMES = ("X", "Y", "Z")
+# Per-axis contact width produced by the ContactSensor (one flag per translation axis).
+CONTACT_DIM = len(_AXIS_NAMES)
 # Matches the per-env index in a cloned prim path (e.g. ".../env_0/...") so a concrete
 # env-0 prim path can be turned back into the cross-env ".../env_.*/..." regex the
 # ContactSensor expects.
@@ -94,8 +96,8 @@ def _resolve_contact_body_expr(root_expr: str) -> str:
     return root_expr
 
 
-def install_contact_sensor(contact_cfg: Any) -> None:
-    """Patch ``FactoryEnv._setup_scene`` to register the ContactSensor before clone.
+def install_contact_sensor(contact_cfg: Any, env_class: Any = None) -> None:
+    """Patch ``<env_class>._setup_scene`` to register the ContactSensor before clone.
 
     Mirrors the recorder-camera install in the runner: wrap the first
     ``clone_environments`` call so the sensor is created and registered into
@@ -103,10 +105,17 @@ def install_contact_sensor(contact_cfg: Any) -> None:
     then (Factory spawns them earlier in ``_setup_scene``) and were spawned with
     ``activate_contact_sensors=True``, so the ContactSensor simply attaches to them.
 
+    ``env_class`` is the direct-API env class whose ``_setup_scene`` actually runs at
+    ``gym.make`` for the task. Defaults to ``FactoryEnv`` (covers Factory + Forge, which
+    inherits ``_setup_scene``). AutoMate's ``AssemblyEnv`` does NOT subclass ``FactoryEnv``
+    and defines its own ``_setup_scene`` (it likewise calls ``clone_environments`` last and
+    uses ``HeldAsset``/``FixedAsset`` prims with ``activate_contact_sensors=True``), so the
+    runner passes ``env_class=AssemblyEnv`` for ``Isaac-AutoMate-*`` tasks.
+
     The configured ``held_prim_expr``/``fixed_prim_expr`` name the asset *roots*; the
     contact-reporting rigid body is a child prim whose name is asset-specific, so the
     actual sensor/filter paths are resolved via :func:`_resolve_contact_body_expr` from
-    the (env-0) prims that Factory spawns earlier in ``_setup_scene``.
+    the (env-0) prims that the env spawns earlier in ``_setup_scene``.
 
     The sensor is created and registered into ``scene.sensors`` BEFORE the wrapped
     ``clone_environments`` call: the per-env rigid-contact views are set up during
@@ -119,9 +128,13 @@ def install_contact_sensor(contact_cfg: Any) -> None:
     shim restores the previously-captured clone and calls it, so both shims fire.
     """
     from isaaclab.sensors import ContactSensor
-    from isaaclab_tasks.direct.factory.factory_env import FactoryEnv
 
-    _original_setup_scene = FactoryEnv._setup_scene
+    if env_class is None:
+        from isaaclab_tasks.direct.factory.factory_env import FactoryEnv
+
+        env_class = FactoryEnv
+
+    _original_setup_scene = env_class._setup_scene
 
     def _patched_setup_scene(self):
         _orig_clone = self.scene.clone_environments
@@ -145,9 +158,9 @@ def install_contact_sensor(contact_cfg: Any) -> None:
         self.scene.clone_environments = _shim_clone
         return _original_setup_scene(self)
 
-    FactoryEnv._setup_scene = _patched_setup_scene
+    env_class._setup_scene = _patched_setup_scene
     print(
-        f"[contact-sensor] FactoryEnv._setup_scene patched to install "
+        f"[contact-sensor] {env_class.__name__}._setup_scene patched to install "
         f"'{CONTACT_SENSOR_KEY}' (threshold={contact_cfg.contact_force_threshold} N)."
     )
 
@@ -217,6 +230,13 @@ class ContactSensorWrapper(gym.Wrapper):
         # updated for this step, and fingertip_midpoint_quat reflects the current pose.
         if self._initialized:
             self._update_contact()
+        # Expose the RAW per-axis contact bool (num_envs, 3) on the info dict so agents
+        # can buffer it as a supervised-selection target / append it as an input feature.
+        # Separate key from the to_log / per_env_to_log logging path; the outer scorer
+        # wrapper passes info through unchanged. Absent until the sensor's first update.
+        in_contact = getattr(self.unwrapped, "in_contact", None)
+        if in_contact is not None and isinstance(out[4], dict):
+            out[4]["in_contact"] = in_contact.float()
         return out
 
     def reset(self, **kwargs):

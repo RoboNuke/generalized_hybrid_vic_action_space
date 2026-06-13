@@ -1,0 +1,178 @@
+# AutoMate Assembly (peg/socket insertion) + Control Action Interface (ctrl-action-interface).
+# Wrapped by AutoMateForgeAdapter so the AutoMate env presents as a FORGE env (force sensor,
+# FORGE reward minus success-prediction, FORGE obs noise, contact sensor). Actions stay
+# AutoMate-native (6-D pose); the wrapper appends VIC gain dims. No success-prediction action.
+# CtrlActionInterfaceWrapper produces pose stiffness K (and matrix critical damping) from a
+# config-selectable action-space formulation; all actions are in [-1, 1] and scaled internally.
+#
+# Action-dim formula: base 6 + 2*N + pdim + (pdim if use_hybrid_force),
+#   N = sum(force_axes); pdim: constant=0, variable_diagonal=6, cholesky=6|21, rotated=9|12.
+#   This config (cholesky + full_gain_matrix, force off, N=0): pdim=21 -> 6 + 0 + 21 + 0 = 27
+#   continuous (no dims zeroed; AutoMate, like Factory, does NOT zero Rx,Ry => force_zero_action_dims: null).
+# target_entropy = -(continuous actions)/2 = -27/2 = -13.5.
+# Unknown headers/keys are hard errors; omitted sections/fields fall back to defaults.
+
+runner_cfg:
+  task: Isaac-AutoMate-Assembly-Direct-v0
+  automate_assembly_id: "00652"     # plug/socket pair to run (e.g. "00015", "00652"); adapter recomputes asset paths
+  automate_grasp_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # peg IN-HAND offset from nominal grasp [x,y,z (m), roll,pitch,yaw (deg)] (plug-local); 0 = nominal grasp
+  agent_type: sac                   # "sac" (default) or "ppo"; selects sac_cfg vs ppo_cfg
+  num_envs: 4
+  num_agents: 3
+  total_timesteps: 5_000
+  eval_timesteps: 75
+  memory_size: 5000 #500_000
+  seed: -1
+
+  # PhysX GPU collision-stack buffer. Default 2^26 (~67M) overflows with 768 envs
+  # (num_envs 256 * num_agents 3) of peg/socket contact — bump it (or lower num_envs/num_agents).
+  env_cfg_overrides:
+    sim.physx.gpu_collision_stack_size: 268435456   # 2^28 (~268M)
+    tasks.insertion.if_sbc: false   # disable SBC spawn curriculum -> fixed full-disassembly spawn (Forge-like)
+
+loss_cfg:
+  supervised_selection_enabled: false
+  supervised_selection_policy_weight: 1.0
+  supervised_selection_critic_weight: 0.0
+
+sac_cfg:
+  gradient_steps: 8
+  batch_size: 1024
+  discount_factor: 0.99
+  polyak: 0.005
+  actor_lr: 1.0e-4
+  critic_lr: 1.0e-4
+  entropy_lr: 1.0e-4
+  weight_decay: 1.0e-2
+  random_timesteps: 0
+  learning_starts: 150
+  learn_entropy: true
+  initial_entropy_value: 1.0e-2
+  target_entropy: -13.5            # -(continuous actions)/2 = -(6 base + 21 cholesky-full gains)/2  (no dims zeroed)
+  grad_norm_clip: 0.0
+  mixed_precision: false
+  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor_kwargs: {}
+  rewards_shaper_scale: null
+  gripper_action_idx: null
+  recorder:
+    enabled: false
+    record_every_k_resets: 1
+  experiment:
+    directory: automate_00652
+    experiment_name: ""
+    write_interval: 75
+    checkpoint_interval: auto
+
+model_cfg:
+  actor:
+    act_init_std: 1.0
+    selection_distribution: product  # hybrid-only: "product" (independent) or "match" (selection-conditioned)
+    selection_init_bias: -2.2         # hybrid-only: sigmoid(-2.2)~=0.10 force prob => ~90% position-dominant at init
+    actor_n: 2
+    actor_latent: 512
+    last_layer_scale: 0.1
+    clip_log_std: true
+    min_log_std: -20.0
+    max_log_std: 2.0
+    reduction: sum
+    use_state_dependent_std: false
+    bernoulli_action_dims: null
+    force_zero_action_dims: [3, 4]     # AutoMate (like Factory) forces upright but does NOT zero the Rx,Ry action inputs => all base dims continuous
+  critic:
+    critic_output_init_mean: 0.0 #50 before
+    critic_n: 4
+    critic_latent: 1024
+    clip_actions: false
+
+controller_cfg:
+  # ---- control type selector (the single switch) ----
+  # "pose"                  : No wrapper
+  # "pose-VICES"            : Applies VICPoseWrapper (diagonal vic only)
+  # "hybrid"                : HybridForcePositionWrapper (selection + force only)
+  # "hybrid-vic"            : HybridVICWrapper (full raw gain mats + sel + force)
+  # "ctrl-action-interface" : CtrlActionInterfaceWrapper (different parameterization of hyprid-vic)
+  control_type: ctrl-action-interface
+
+  # ---- formulation selector (the single switch) ----
+  # "constant"          : fixed diagonal K from default_task_prop_gains (K_f from
+  #                       default_task_force_gains); 0 extra action dims.
+  # "variable_diagonal" : per-axis diagonal K, 6 dims, geometric scaling.
+  # "cholesky"          : block-diagonal SPD K = blkdiag(L_pos L_posᵀ, L_rot L_rotᵀ), 12 dims
+  #                       (per block: 3 L-diagonal + 3 L-off-diagonal). D = zeros for now.
+  # "rotated"           : diagonal K (6) + 6-D rotation vector (6) = 12 dims; R applied as
+  #                       blkdiag(R,R) to the full 6x6.
+  gain_mapping: cholesky #"constant" #
+
+  # Toggle force control. When false: NO selection/force-target dims, K_f = zeros, and
+  # force_axes MUST be all-zero. When true: force_axes selects eligible axes (adds 2*N dims)
+  # and K_f gets its own gain dims (same formulation as pose K).
+  use_hybrid_force: false
+  force_axes: [0, 0, 0, 0, 0, 0]   # x,y,z force-eligible (must be all-zero when use_hybrid_force=false)
+  async_z_force_bounds: true
+  # ---- shared per-axis bounds [x,y,z,Rx,Ry,Rz], geometric scaling k = lo*(hi/lo)^((a+1)/2) ----
+  # Centered (geometrically) on AutoMate's default_task_prop_gains [100,100,100,30,30,30] with
+  # ratio hi/lo = 2 (default*sqrt(2), default/sqrt(2)) — same fractional spread as the Forge configs.
+  gain_min: [70.71, 70.71, 70.71, 21.21, 21.21, 21.21] # pose stiffness K (position x3, rotation x3)
+  gain_max: [141.42, 141.42, 141.42, 42.43, 42.43, 42.43]
+
+  # ---- base-pose action scaling (copied onto env_cfg.ctrl) ----
+  # These restore AutoMate's NATIVE values. ControlCfg subclasses Forge/Factory CtrlCfg, so
+  # WITHOUT setting them here the runner's ctrl copy loop silently applies Factory's scales
+  # (pos 0.02, rot 0.097, bounds 0.05/1.0). action[0:3]*pos_action_threshold = position delta
+  # (m), clamped to +/-pos_action_bounds around the socket frame; action[3:6]*rot_action_threshold
+  # = axis-angle delta (rad), clamped to +/-rot_action_bounds.
+  pos_action_threshold: [0.1, 0.1, 0.1]     # AutoMate native: +/-1 action -> +/-0.1 m
+  rot_action_threshold: [0.01, 0.01, 0.01]  # AutoMate native: +/-0.01 rad
+  pos_action_bounds: [0.1, 0.1, 0.1]        # AutoMate native: clamp +/-0.1 m around socket
+  rot_action_bounds: [0.01, 0.01, 0.01]     # AutoMate native
+
+  # ---- reset / default robot posture + operating stiffness (copied onto env_cfg.ctrl) ----
+  # Also restored to AutoMate NATIVE values; otherwise the ctrl copy loop applies the inherited
+  # Forge/Factory values (default_task_prop_gains 565/28, reset_task_prop_gains 300/20, and
+  # Factory's reset_joints / default_dof_pos_tensor arm posture).
+  default_task_prop_gains: [100, 100, 100, 30, 30, 30]    # AutoMate: operating stiffness (constant-mode K + damping/reset base)
+  reset_task_prop_gains: [1000, 1000, 1000, 50, 50, 50]   # AutoMate: settle stiffness during reset
+  reset_joints: [0.0, 0.0, 0.0, -1.870, 0.0, 1.8675, 0.785398]           # AutoMate: arm reset joint pose
+  default_dof_pos_tensor: [0.0, 0.0, 0.0, -1.870, 0.0, 1.8675, 0.785398] # AutoMate: null-space posture target
+
+  # Policy commands the pose stiffness directly. (AutoMate has no per-reset gain randomization,
+  # so this is inert here — kept for parity; it would disable Forge's [0.41]x6 randomization.)
+  task_prop_gains_noise_level: [0, 0, 0, 0, 0, 0]
+
+  # NOT USED BEFORE
+  force_gain_min: [0.35, 0.35, 0.35, 0.07, 0.07, 0.07]  # force stiffness K_f (force x3, torque x3)
+  force_gain_max: [0.705, 0.705, 0.705, 0.141, 0.141, 0.141]
+
+  # Cholesky-only: off-diagonal L entry = chol_offdiag_rho * sqrt(lo*hi) * clamp(a,-1,1).
+  # 0.0 => diagonal-only (equivalent to variable_diagonal but with 12 dims). Increase to
+  # allow within-block (translation- or rotation-) axis coupling.
+  chol_offdiag_rho: 0.9
+
+  # cholesky/rotated only: learn the full 6-DOF gain matrix (position + orientation)
+  # instead of the translational 3x3 block alone. Changes action dim => re-tune
+  # target_entropy if enabled.
+  full_gain_matrix: false
+
+  # ---- hybrid force-control fields (used on force-eligible axes when use_hybrid_force) ----
+  force_action_bounds: [20.0, 20.0, 20.0]
+  torque_action_bounds: [0.25, 0.25, 0.25]
+  force_action_threshold: [2.0, 2.0, 2.0]
+  torque_action_threshold: [0.01, 0.01, 0.01]
+
+  default_task_force_gains: [0.5, 0.5, 0.5, 0.1, 0.1, 0.1]   # K_f diagonal in "constant" mode
+  #default_task_force_gains: [2.8, 2.8, 2.8, 0.1, 0.1, 0.1]
+  async_z_force_bounds: true
+  apply_ema_force: false
+  no_sel_ema: true
+  ema_mode: action
+  # NOTE: damping D is derived (2*sqrt(K), or zeros for cholesky), so damping_min/max are
+  # unused here; gain_min/gain_max (pose stiffness) ARE used.
+
+sensor_cfg:
+  contact:
+    enabled: true                  # mount an IsaacLab ContactSensor on the peg, filtered vs the socket
+    contact_force_threshold: 1.0 #TODO   # N; per-axis EE-frame |force| above this => in contact (1.0 matches upstream)
+    log_contact_state: true        # log Contact / In-Contact {X,Y,Z,Any} fractions to TensorBoard
+    append_to_policy_obs: false
+    append_to_critic_state: true

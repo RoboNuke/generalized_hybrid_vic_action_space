@@ -40,6 +40,7 @@ class SAC(BlockAgent):
         cfg: SAC_CFG | dict = {},
         num_agents: int = 1,
         aux_losses: "AuxLossManager | None" = None,
+        contact_axes: list[int] | None = None,
     ) -> None:
         """Soft Actor-Critic (SAC) with per-agent block-parallel independence.
 
@@ -74,6 +75,7 @@ class SAC(BlockAgent):
             device=device,
             cfg=SAC_CFG(**cfg) if isinstance(cfg, dict) else cfg,
             num_agents=num_agents,
+            contact_axes=contact_axes,
         )
 
         # Asymmetric actor-critic: when ``state_space`` is provided, the critic
@@ -221,6 +223,9 @@ class SAC(BlockAgent):
                 self.memory.create_tensor(name="next_states", size=self.state_space, dtype=torch.float32)
                 self._tensors_names.extend(["states", "next_states"])
 
+            # Optional ground-truth contact tensor for the supervised-selection loss.
+            self._maybe_create_contact_tensor()
+
     # --------------------------------------------------------------
     # Interaction
     # --------------------------------------------------------------
@@ -239,7 +244,13 @@ class SAC(BlockAgent):
             n = observations.shape[0]
             actions = torch.rand(n, *self.action_space.shape, device=self.device) * 2.0 - 1.0
             return actions, {}
-        with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
+        # no_grad: these actions are for environment interaction only — the update
+        # re-runs the policy forward on replay-buffer minibatches for the gradient.
+        # Without this, the returned actions carry a live autograd graph that the
+        # controller wrappers' EMA buffers (e.g. hybrid_force_position_wrapper's
+        # self.ema_actions / the base env's self.actions) splice in-place across
+        # steps, growing an unbounded graph that OOMs the GPU after a few thousand steps.
+        with torch.no_grad(), torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
             actions, outputs = self.policy.act(inputs, role="policy")
         return actions, outputs
 
@@ -285,6 +296,10 @@ class SAC(BlockAgent):
                     )
                 extra_kwargs["states"] = states
                 extra_kwargs["next_states"] = next_states
+            # One-step-aligned contact ground truth for the SSL (no-op unless contact_axes).
+            self._buffer_contact_for_write(
+                terminated=terminated, truncated=truncated, infos=infos, add_kwargs=extra_kwargs
+            )
             self.memory.add_samples(
                 observations=observations,
                 actions=actions,
@@ -322,25 +337,6 @@ class SAC(BlockAgent):
         # batch_size argument as per-agent and internally returns N * batch_size
         # rows partitioned [agent0 | agent1 | ...].
         B = self.cfg.batch_size
-
-        # One-shot init-time action diagnostic: snapshot tanh saturation BEFORE any
-        # gradient step touches the policy. Writes "Action / |a| ... (init)" tags so
-        # init behavior is visible separately from the running average produced by
-        # the in-loop tracking below (which is post-update by construction).
-        if not getattr(self, "_logged_init_action_diag", False) and self.write_interval > 0:
-            with torch.no_grad():
-                init_sampled = self.memory.sample(
-                    names=["observations"], batch_size=B
-                )[0][0]
-                init_inputs = {"observations": self._observation_preprocessor(init_sampled, train=False)}
-                init_actions, _ = self.policy.act(init_inputs, role="policy")
-                init_abs_a = init_actions.abs()
-                init_sat = (init_abs_a > 0.99).float()
-            init_split = lambda t: t.view(N, B, -1)
-            self.track_per_agent("Action / |a| max (init)",  init_split(init_abs_a).amax(dim=(1, 2)))
-            self.track_per_agent("Action / |a| mean (init)", init_split(init_abs_a).mean(dim=(1, 2)))
-            self.track_per_agent("Action / saturation rate (init)", init_split(init_sat).mean(dim=(1, 2)))
-            self._logged_init_action_diag = True
 
         for gradient_step in range(self.cfg.gradient_steps):
             sampled_list = self.memory.sample(
@@ -540,9 +536,9 @@ class SAC(BlockAgent):
                 # Both dicts are {} when no aux loss targets that side, so these
                 # loops are no-ops in the vanilla case.
                 for term_name, value in aux_policy_raw.items():
-                    self.track_per_agent(f"Loss/{term_name}_raw_actor", value)
+                    self.track_per_agent(f"Loss/ {term_name}_raw_actor", value)
                 for term_name, value in aux_critic_raw.items():
-                    self.track_per_agent(f"Loss/{term_name}_raw_critic", value)
+                    self.track_per_agent(f"Loss/ {term_name}_raw_critic", value)
 
                 self.track_per_agent("Q-network / Q1 (max)",  split(critic_1_values).amax(dim=(1, 2)))
                 self.track_per_agent("Q-network / Q1 (min)",  split(critic_1_values).amin(dim=(1, 2)))
@@ -563,6 +559,17 @@ class SAC(BlockAgent):
                 self.track_per_agent("Action / |a| mean",      split(abs_a).mean(dim=(1, 2)))
                 self.track_per_agent("Action / saturation rate", split(saturation).mean(dim=(1, 2)))
                 self.track_per_agent("Action / log_prob (mean)", split(log_prob).mean(dim=(1, 2)))
+
+                # Pose-action magnitude — the first 6 action dims are the raw,
+                # pre-scaled pose command (x, y, z, rx, ry, rz) the policy emits
+                # before the env rescales to physical units. Tracks the average
+                # magnitude and its spread per axis so we can see how hard the
+                # policy drives each pose channel independent of gain/gripper dims.
+                with torch.no_grad():
+                    pose_abs_pa = split(abs_a[..., :6])        # (N, B, 6)
+                for i, axis in enumerate(("x", "y", "z", "rx", "ry", "rz")):
+                    self.track_per_agent(f"Action / pose |{axis}| mean", pose_abs_pa[..., i].mean(dim=1))
+                    self.track_per_agent(f"Action / pose |{axis}| std",  pose_abs_pa[..., i].std(dim=1))
 
                 # Continuous-action L2 norm — surfaces "do nothing" collapse.
                 # If the policy parks all continuous dims near 0 (e.g. when the

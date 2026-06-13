@@ -36,6 +36,10 @@ class FactoryWrapper(RewardDecompositionWrapper):
         # Latest per-env curr_successes captured by the reward-log hook (per-step
         # geometric success indicator).
         self._latest_curr_successes: torch.Tensor | None = None
+        # Latest per-env curr_engaged captured by the reward-log hook (per-step
+        # geometric engagement indicator — peg close to socket). Read from the
+        # rew_dict; mirrors curr_successes for the engagement-rate metric.
+        self._latest_curr_engaged: torch.Tensor | None = None
         # Latest per-env unscaled rew_dict (per-step) captured by the reward-log
         # hook. Used to emit per-agent `logs_rew/<term>` to TB by partitioning
         # the per-env values across agent slices in the SAC consumer.
@@ -51,6 +55,12 @@ class FactoryWrapper(RewardDecompositionWrapper):
 
         def hooked_factory_log(rew_dict, curr_successes):
             self._latest_curr_successes = curr_successes.clone()
+            # Engagement indicator rides in the rew_dict (curr_engaged term), not
+            # as a separate hook arg — capture it for the engagement-rate metric.
+            eng = rew_dict.get("curr_engaged")
+            self._latest_curr_engaged = (
+                eng.detach().clone() if isinstance(eng, torch.Tensor) else None
+            )
             # Capture per-env unscaled rew_dict for per-agent logs_rew/<term>.
             # Only per-env tensors are publishable per-agent; upstream Factory
             # has at least one global scalar term (`action_penalty_ee =
@@ -132,6 +142,8 @@ class FactoryWrapper(RewardDecompositionWrapper):
         info["per_env_logs_rew"] = self._latest_rew_dict
         if self._latest_curr_successes is not None:
             info["per_env_curr_successes"] = self._latest_curr_successes
+        if self._latest_curr_engaged is not None:
+            info["per_env_curr_engaged"] = self._latest_curr_engaged
         info["per_env_ep_success_times"] = self._unwrapped.ep_success_times.clone()
 
         # Per-env episode-end capture: at this point, _accumulate_per_env_term

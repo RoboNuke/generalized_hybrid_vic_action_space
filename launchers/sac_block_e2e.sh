@@ -2,14 +2,16 @@
 # launchers/sac_block_e2e.sh — full train -> save -> load -> eval smoke test.
 #
 # Usage:
-#   sac_block_e2e.sh <config_path> <experiment_name> [--no_eval]
+#   sac_block_e2e.sh <config_path> <experiment_name> [--no_eval] [--experiment_directory <dir>]
 #
 # Reads task / num_envs / num_agents / total_timesteps / eval_timesteps / memory_size
 # from runner_cfg in the supplied YAML. Override anything one-off via runner CLI flags
 # in the python invocations below.
 #
 # Flags:
-#   --no_eval   Skip the post-training eval pass (still verifies checkpoints exist).
+#   --no_eval                      Skip the post-training eval pass (still verifies checkpoints exist).
+#   --experiment_directory <dir>   Override sac_cfg.experiment.directory (the "family" subdir
+#                                  under <logdir>); lets you save runs to different places.
 #
 # Fail loud, fail fast: any silent miss is a bug, not an expected outcome.
 set -Eeuo pipefail
@@ -17,7 +19,7 @@ trap 'echo "[launcher] FAILED at ${BASH_SOURCE[0]}:${LINENO} (exit $?)" >&2' ERR
 
 # ===== Args =====
 if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <config_path> <experiment_name> [--no_eval]" >&2
+    echo "Usage: $0 <config_path> <experiment_name> [--no_eval] [--experiment_directory <dir>]" >&2
     echo "  e.g. $0 configs/exp_cfgs/cartpole.yaml cartpole_run1" >&2
     exit 2
 fi
@@ -25,9 +27,13 @@ CONFIG_PATH="$1"
 EXPERIMENT_NAME="$2"
 shift 2
 RUN_EVAL=1
+EXPERIMENT_DIRECTORY=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --no_eval) RUN_EVAL=0 ;;
+        --experiment_directory)
+            [[ $# -ge 2 ]] || { echo "[launcher] --experiment_directory requires a value" >&2; exit 2; }
+            EXPERIMENT_DIRECTORY="$2"; shift ;;
         *) echo "[launcher] unknown argument: $1" >&2; exit 2 ;;
     esac
     shift
@@ -42,7 +48,16 @@ PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 LOGDIR="${LOGDIR:-$PROJECT_ROOT/runs}"
 
 RUNNER="$PROJECT_ROOT/learning/runner.py"
-EXP_DIR="$LOGDIR/$EXPERIMENT_NAME"
+# Final per-run output dir mirrors runner.py: <logdir>/<family>/<experiment_name>.
+# The family subdir is sac_cfg.experiment.directory, which --experiment_directory
+# overrides. Replicate the runner's legacy collapse: if family basename equals the
+# logdir basename, the family level is dropped (runs/runs/<exp> -> runs/<exp>).
+EXP_FAMILY_DIR="$LOGDIR"
+if [[ -n "$EXPERIMENT_DIRECTORY" \
+      && "$(basename "$EXPERIMENT_DIRECTORY")" != "$(basename "$LOGDIR")" ]]; then
+    EXP_FAMILY_DIR="$LOGDIR/$EXPERIMENT_DIRECTORY"
+fi
+EXP_DIR="$EXP_FAMILY_DIR/$EXPERIMENT_NAME"
 EVAL_EXP_NAME="${EXPERIMENT_NAME}_eval"
 
 # Resolve config to absolute (allow caller to pass a project-root-relative path).
@@ -72,6 +87,13 @@ NUM_AGENTS="$("$PYTHON" -c "import yaml,sys; print(yaml.safe_load(open('$CONFIG_
 
 echo "[launcher] python=$(command -v "$PYTHON")  config=$CONFIG_PATH  experiment=$EXPERIMENT_NAME  num_agents=$NUM_AGENTS"
 
+# Optional --experiment_directory passthrough: only forward the flag when the
+# caller set it, so an empty value falls back to the YAML's experiment.directory.
+EXP_DIR_FLAG=()
+if [[ -n "$EXPERIMENT_DIRECTORY" ]]; then
+    EXP_DIR_FLAG=(--experiment_directory "$EXPERIMENT_DIRECTORY")
+fi
+
 # ===== Train =====
 # Ctrl-C (SIGINT, exit 130) is treated as "interrupted, proceed to eval with whatever
 # was last flushed to disk". Any other nonzero exit (OOM=137, segfault=139, ValueError
@@ -83,6 +105,7 @@ TRAIN_RC=0
     --config "$CONFIG_PATH" \
     --experiment_name "$EXPERIMENT_NAME" \
     --logdir "$LOGDIR" \
+    "${EXP_DIR_FLAG[@]}" \
     --mode train \
     --headless || TRAIN_RC=$?
 
@@ -123,11 +146,12 @@ if [[ "$RUN_EVAL" -eq 1 ]]; then
         --config "$CONFIG_PATH" \
         --experiment_name "$EVAL_EXP_NAME" \
         --logdir "$LOGDIR" \
+        "${EXP_DIR_FLAG[@]}" \
         --checkpoint "$EXP_DIR" \
         --mode eval \
         --headless
 
-    echo "[launcher] done. train=$EXP_DIR  eval=$LOGDIR/$EVAL_EXP_NAME"
+    echo "[launcher] done. train=$EXP_DIR  eval=$EXP_FAMILY_DIR/$EVAL_EXP_NAME"
 else
     echo "[launcher] === EVAL skipped (--no_eval) ==="
     echo "[launcher] done. train=$EXP_DIR"

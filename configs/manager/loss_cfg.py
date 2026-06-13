@@ -35,3 +35,16 @@ class LossCfg:
     action_l2_critic_weight: float = 0.0
     """Weight applied to the action-L2 loss on the critic optimizer. This loss is
     policy-only, so a nonzero value here is rejected at build time — keep it 0.0."""
+
+    # ---- supervised_selection: BCE(selection prob, ground-truth contact) (policy-only) ----
+    supervised_selection_enabled: bool = False
+    """Enable the supervised selection loss (SSL): BCE between the hybrid policy's per-axis
+    selection probability and the ground-truth contact state of the force-eligible axes.
+    Requires a hybrid control_type AND sensor_cfg.contact.enabled (the runner validates)."""
+
+    supervised_selection_policy_weight: float = 0.0
+    """Weight applied to the SSL on the policy (actor) optimizer."""
+
+    supervised_selection_critic_weight: float = 0.0
+    """Weight applied to the SSL on the critic optimizer. The SSL is policy-only, so a
+    nonzero value here is rejected at build time — keep it 0.0."""

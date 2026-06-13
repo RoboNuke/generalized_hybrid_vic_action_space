@@ -44,6 +44,10 @@ class ForgeWrapper(RewardDecompositionWrapper):
         # Latest per-env curr_successes captured by the reward-log hook (per-step
         # geometric success indicator).
         self._latest_curr_successes: torch.Tensor | None = None
+        # Latest per-env curr_engaged captured by the reward-log hook (per-step
+        # geometric engagement indicator — peg close to socket). Read from the
+        # rew_dict; mirrors curr_successes for the engagement-rate metric.
+        self._latest_curr_engaged: torch.Tensor | None = None
         # Latest per-env unscaled rew_dict (per-step). Combined across both the
         # factory and forge log hooks for per-agent logs_rew/<term> metrics.
         self._latest_rew_dict: dict[str, torch.Tensor] = {}
@@ -62,6 +66,12 @@ class ForgeWrapper(RewardDecompositionWrapper):
 
         def hooked_factory_log(rew_dict, curr_successes):
             self._latest_curr_successes = curr_successes.clone()
+            # Engagement indicator rides in the rew_dict (curr_engaged term), not
+            # as a separate hook arg — capture it for the engagement-rate metric.
+            eng = rew_dict.get("curr_engaged")
+            self._latest_curr_engaged = (
+                eng.detach().clone() if isinstance(eng, torch.Tensor) else None
+            )
             # Capture per-env unscaled rew_dict (factory terms) for per-agent
             # logs_rew/<term>. Only per-env tensors (shape (num_envs,)) are
             # publishable per-agent; upstream Factory has at least one global
@@ -101,7 +111,7 @@ class ForgeWrapper(RewardDecompositionWrapper):
         constructed in ``FactoryEnv._get_factory_rew_dict`` (keypoint and engagement
         terms have scale 1.0; action penalties are negative)."""
         cfg = self._unwrapped.cfg_task
-        return {
+        scales = {
             "kp_baseline": 1.0,
             "kp_coarse": 1.0,
             "kp_fine": 1.0,
@@ -110,6 +120,14 @@ class ForgeWrapper(RewardDecompositionWrapper):
             "curr_engaged": 1.0,
             "curr_success": 1.0,
         }
+        # AutoMate native-reward terms (present only on the AutoMate task cfg, routed via the
+        # adapter's _log_factory_metrics). Positive contributions; guarded so native Forge —
+        # which lacks these fields — is unaffected. Lets Episode_Reward/<term> scale correctly.
+        if hasattr(cfg, "sdf_rwd_scale"):
+            scales["sdf"] = float(cfg.sdf_rwd_scale)
+        if hasattr(cfg, "imitation_rwd_scale"):
+            scales["imitation"] = float(cfg.imitation_rwd_scale)
+        return scales
 
     def _forge_scales(self) -> dict[str, float]:
         """Forge-specific reward scales. ``success_pred_error`` is dynamic — it
@@ -168,6 +186,8 @@ class ForgeWrapper(RewardDecompositionWrapper):
         info["per_env_logs_rew"] = self._latest_rew_dict
         if self._latest_curr_successes is not None:
             info["per_env_curr_successes"] = self._latest_curr_successes
+        if self._latest_curr_engaged is not None:
+            info["per_env_curr_engaged"] = self._latest_curr_engaged
         info["per_env_ep_success_times"] = self._unwrapped.ep_success_times.clone()
         # Forge-specific: per-threshold first-prediction-success step.
         first_pred = getattr(self._unwrapped, "first_pred_success_tx", None)

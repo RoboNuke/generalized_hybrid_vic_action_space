@@ -27,10 +27,27 @@ def build_parser() -> argparse.ArgumentParser:
              f"Defaults to {_DEFAULT_CONFIG_PATH}.",
     )
     parser.add_argument(
+        "--overlay",
+        type=str,
+        action="append",
+        default=None,
+        help="Path to an overlay YAML deep-merged over --config before validation. "
+             "Only needs the keys it changes (e.g. a sac_cfg.recorder block). Repeatable; "
+             "later overlays win. Nested mappings merge key-by-key; lists/scalars replace.",
+    )
+    parser.add_argument(
         "--experiment_name",
         type=str,
         default=None,
         help="Overrides sac_cfg.experiment.experiment_name from --config.",
+    )
+    parser.add_argument(
+        "--experiment_directory",
+        type=str,
+        default=None,
+        help="Overrides sac_cfg/ppo_cfg.experiment.directory from --config (the "
+             "'family' subdir under --logdir). Lets you save runs to different "
+             "places without editing the YAML.",
     )
     parser.add_argument(
         "--logdir",
@@ -45,6 +62,31 @@ def build_parser() -> argparse.ArgumentParser:
              "to 'runs/' when omitted.",
     )
     parser.add_argument("--mode", type=str, choices=["train", "eval"], default="train")
+    parser.add_argument(
+        "--record_agent_dir",
+        type=str,
+        default=None,
+        help="Path to a SINGLE trained agent's folder (e.g. runs/log_dir/1_fixed/0, "
+             "containing checkpoints/ckpt_*.pt). Switches the runner into per-agent "
+             "recording mode: forces num_agents=1, loads ONLY this agent's weights "
+             "(its own policy + twin critics), collects --num_trajectories complete "
+             "episodes, and writes an agent-specific best/median/worst grid GIF. "
+             "Defaults --config to <record_agent_dir>/config.yaml when --config is unset.",
+    )
+    parser.add_argument(
+        "--num_trajectories",
+        type=int,
+        default=None,
+        help="Record mode only: collect at least this many complete trajectories "
+             "before composing the grid. Overrides sac_cfg.recorder.num_trajectories.",
+    )
+    parser.add_argument(
+        "--record_output_dir",
+        type=str,
+        default=None,
+        help="Record mode only: where to write the GIF. Defaults to "
+             "<record_agent_dir>/<recorder.output_subdir>.",
+    )
     parser.add_argument(
         "--checkpoint",
         type=str,
@@ -81,42 +123,14 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _apply_env_cfg_overrides(env_cfg, overrides: dict) -> None:
-    """Apply ``runner_cfg.env_cfg_overrides`` to an Isaac Lab env_cfg in place.
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
 
-    Each key is a dotted path resolved by ``getattr`` against ``env_cfg``; the
-    final segment is set with ``setattr``. Strict — if any intermediate or leaf
-    attribute is missing, raises ``AttributeError`` with the full path so typos
-    fail loudly instead of being silently absorbed by the dataclass.
-    """
-    if not overrides:
-        return
-    for dotted_path, value in overrides.items():
-        if not isinstance(dotted_path, str) or not dotted_path:
-            raise ValueError(
-                f"env_cfg_overrides keys must be non-empty dotted strings, got {dotted_path!r}"
-            )
-        parts = dotted_path.split(".")
-        target = env_cfg
-        for segment in parts[:-1]:
-            if not hasattr(target, segment):
-                raise AttributeError(
-                    f"env_cfg_overrides: '{dotted_path}' — '{segment}' not found on "
-                    f"{type(target).__name__}"
-                )
-            target = getattr(target, segment)
-        leaf = parts[-1]
-        if not hasattr(target, leaf):
-            raise AttributeError(
-                f"env_cfg_overrides: '{dotted_path}' — '{leaf}' not found on "
-                f"{type(target).__name__}"
-            )
-        setattr(target, leaf, value)
-        print(f"[runner] env_cfg override: {dotted_path} = {value}")
-
-
-def main() -> None:
-    args = build_parser().parse_args()
+    # Per-agent recording mode: default the base config to the one snapshotted
+    # next to the checkpoint (runner dumps it to <agent_dir>/config.yaml at train
+    # time) when the caller didn't pass --config explicitly.
+    if args.record_agent_dir is not None and args.config == _DEFAULT_CONFIG_PATH:
+        args.config = os.path.join(args.record_agent_dir, "config.yaml")
 
     # If the chosen YAML has ``sac_cfg.recorder.enabled: true``, IsaacLab will
     # refuse to spawn the recorder TiledCamera without ``--enable_cameras``.
@@ -124,8 +138,25 @@ def main() -> None:
     # user doesn't have to remember to pass it.
     try:
         import yaml as _yaml
+
+        def _deep_merge_peek(_base, _ov):
+            _out = dict(_base)
+            for _k, _v in _ov.items():
+                if isinstance(_out.get(_k), dict) and isinstance(_v, dict):
+                    _out[_k] = _deep_merge_peek(_out[_k], _v)
+                else:
+                    _out[_k] = _v
+            return _out
+
         with open(args.config) as _f:
             _peek = _yaml.safe_load(_f) or {}
+        # Apply the same overlays here so an overlay that flips recorder.enabled on
+        # (e.g. a record overlay) still triggers the --enable_cameras auto-force.
+        for _ov_path in (args.overlay or []):
+            with open(_ov_path) as _ovf:
+                _ov_peek = _yaml.safe_load(_ovf) or {}
+            if isinstance(_ov_peek, dict):
+                _peek = _deep_merge_peek(_peek, _ov_peek)
         _agent_type_peek = str(_peek.get("runner_cfg", {}).get("agent_type", "sac")).lower()
         _cfg_key = "ppo_cfg" if _agent_type_peek == "ppo" else "sac_cfg"
         if (
@@ -162,11 +193,9 @@ def main() -> None:
     # regardless of CWD.
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-    import gymnasium as gym
     import torch
 
     import isaaclab_tasks  # noqa: F401  registers Isaac-* gym ids
-    from isaaclab_tasks.utils import parse_env_cfg
     from skrl.trainers.torch import SequentialTrainer
     from skrl.utils import set_seed
 
@@ -182,19 +211,15 @@ def main() -> None:
     from learning.ppo import PPO
     from learning.losses import AuxLossManager
     from configs.manager import ConfigManager
-    from wrappers import (
-        default_wrapper_for_task,
-        fallback_wrapper_name,
-        make_wrapper,
-    )
 
     # Load all registered configs from a single YAML file (defaults to configs/default.yaml).
-    loaded = ConfigManager.load(args.config)
+    loaded = ConfigManager.load(args.config, overlay_paths=args.overlay)
     runner_cfg = loaded["runner_cfg"]
     sac_cfg = loaded["sac_cfg"]
     ppo_cfg = loaded["ppo_cfg"]
     model_cfg = loaded["model_cfg"]
     controller_cfg = loaded["controller_cfg"]
+    noise_cfg = loaded["noise_cfg"]
     sensor_cfg = loaded["sensor_cfg"]
     # Auxiliary-loss switches (which extra losses are on and their per-target
     # weights). Absent loss_cfg section -> all-off default -> vanilla SAC.
@@ -215,6 +240,9 @@ def main() -> None:
     if args.task is not None:            runner_cfg.task = args.task
     if args.num_envs is not None:        runner_cfg.num_envs = args.num_envs
     if args.num_agents is not None:      runner_cfg.num_agents = args.num_agents
+    # Per-agent recording: one agent's slice is loaded into a num_agents=1 run, so
+    # the env, policy, and twin critics all belong to that single agent.
+    if args.record_agent_dir is not None: runner_cfg.num_agents = 1
     if args.total_timesteps is not None: runner_cfg.total_timesteps = args.total_timesteps
     if args.eval_timesteps is not None:  runner_cfg.eval_timesteps = args.eval_timesteps
     if args.memory_size is not None:     runner_cfg.memory_size = args.memory_size
@@ -240,176 +268,11 @@ def main() -> None:
     set_seed(runner_cfg.seed if runner_cfg.seed >= 0 else None)
 
     # ---- env ----
-    total_envs = runner_cfg.num_envs * runner_cfg.num_agents
-    env_cfg = parse_env_cfg(runner_cfg.task, device=args.device, num_envs=total_envs)
-    _apply_env_cfg_overrides(env_cfg, runner_cfg.env_cfg_overrides)
+    from learning.env_setup import build_env
 
-    # Push the controller config's ctrl fields onto env_cfg.ctrl so the base controller
-    # (and factory_control_utils) see the YAML-overridable gains. ControlCfg subclasses the
-    # env's ForgeCtrlCfg, so it carries every ctrl field by inheritance — copy exactly the
-    # fields the env's ctrl cfg declares (avoids any hardcoded field list).
-    if hasattr(env_cfg, "ctrl"):
-        for f in dataclasses.fields(type(env_cfg.ctrl)):
-            if hasattr(controller_cfg, f.name):
-                setattr(env_cfg.ctrl, f.name, getattr(controller_cfg, f.name))
-
-    # Inject the recorder camera. Direct envs like Factory/Forge construct
-    # their scenes manually inside ``FactoryEnv._setup_scene`` and never read
-    # ``env_cfg.scene.<sensor>`` cfg attrs — so the auto-discovery path used
-    # by manager-based envs (e.g. cartpole_camera) doesn't fire for them.
-    # Cartpole's working pattern is: spawn the TiledCamera USD prim under
-    # ``/World/envs/env_.*/Camera`` BEFORE ``self.scene.clone_environments(...)``
-    # runs (so the clone replicates env_0 -> env_1..N including the camera),
-    # then register with ``scene.sensors``. We bolt that pattern onto Factory
-    # by wrapping ``FactoryEnv._setup_scene``: run the original (which spawns
-    # the table/robot/peg AND calls clone_environments at its tail), but
-    # intercept the FIRST ``self.scene.clone_environments`` call from inside
-    # the original via a one-shot instance-level shim that does:
-    #   1. spawn TiledCamera on env_0
-    #   2. call original clone_environments (replicates env_0 -> all envs)
-    #   3. register the sensor with scene._sensors
-    if agent_type == "sac" and sac_cfg.recorder.enabled:
-        from isaaclab.sensors import TiledCamera, TiledCameraCfg
-        from isaaclab.sim.spawners.sensors import PinholeCameraCfg
-        from isaaclab_tasks.direct.factory.factory_env import FactoryEnv
-        from wrappers.recording import CAMERA_KEY as _RECORDER_CAMERA_KEY
-
-        rec = sac_cfg.recorder
-        cam_cfg = TiledCameraCfg(
-            prim_path=f"/World/envs/env_.*/{_RECORDER_CAMERA_KEY}",
-            offset=TiledCameraCfg.OffsetCfg(
-                pos=tuple(rec.camera_pos),
-                rot=tuple(rec.camera_quat),
-                convention="ros",
-            ),
-            data_types=["rgb"],
-            spawn=PinholeCameraCfg(
-                focal_length=float(rec.focal_length),
-                focus_distance=float(rec.focus_distance),
-                horizontal_aperture=float(rec.horizontal_aperture),
-                clipping_range=tuple(rec.clipping_range),
-            ),
-            width=int(rec.width),
-            height=int(rec.height),
-            update_period=0.0,
-        )
-
-        _original_factory_setup_scene = FactoryEnv._setup_scene
-
-        def _patched_factory_setup_scene(self):
-            # Install a one-shot instance-level shim on this scene's
-            # ``clone_environments`` so the camera spawn happens between
-            # Factory's manual robot/peg/table spawns and its clone call.
-            _orig_clone = self.scene.clone_environments
-
-            def _shim_clone(*args, **kwargs):
-                # Restore first to make this fire exactly once.
-                self.scene.clone_environments = _orig_clone
-                print(
-                    f"[recorder] spawning TiledCamera at {cam_cfg.prim_path} "
-                    "before clone_environments…",
-                    flush=True,
-                )
-                cam = TiledCamera(cam_cfg)
-                ret = _orig_clone(*args, **kwargs)
-                self.scene._sensors[_RECORDER_CAMERA_KEY] = cam
-                print(
-                    f"[recorder] env clone complete; camera registered as "
-                    f"scene.sensors[{_RECORDER_CAMERA_KEY!r}].",
-                    flush=True,
-                )
-                return ret
-
-            self.scene.clone_environments = _shim_clone
-            return _original_factory_setup_scene(self)
-
-        FactoryEnv._setup_scene = _patched_factory_setup_scene
-        print(
-            f"[runner] recorder enabled: TiledCamera '{_RECORDER_CAMERA_KEY}' "
-            f"({rec.width}x{rec.height}) will spawn inside FactoryEnv._setup_scene "
-            f"pre-clone; record_every_k_resets={rec.record_every_k_resets}"
-        )
-
-    # Contact sensor: must be registered with the scene DURING env construction
-    # (before InteractiveScene.clone_environments), so patch FactoryEnv._setup_scene
-    # here, before gym.make. Forge/Factory only — the sensor mounts on the held/fixed
-    # peg-insertion assets. The runtime ContactSensorWrapper (added below) reads it.
-    contact_enabled = sensor_cfg.contact.enabled
-    if contact_enabled:
-        if not (runner_cfg.task.startswith("Isaac-Forge-")
-                or runner_cfg.task.startswith("Isaac-Factory-")):
-            raise ValueError(
-                f"sensor_cfg.contact.enabled=True requires a Forge/Factory task (held/fixed "
-                f"peg-insertion assets), but task is {runner_cfg.task!r}."
-            )
-        # ContactSensor reads per-env bodies via the USD stage (create_rigid_body_view),
-        # but Factory/Forge default to clone_in_fabric=True, which keeps the cloned
-        # env_1..N bodies in Fabric only — so the sensor finds just env_0 and fails its
-        # body-count check. Fabric cloning is incompatible with contact sensors, so turn
-        # it off here (a no-op for the camera recorder above).
-        if getattr(env_cfg.scene, "clone_in_fabric", False):
-            env_cfg.scene.clone_in_fabric = False
-            print("[runner] contact sensor enabled: forcing scene.clone_in_fabric=False "
-                  "(fabric clones are invisible to the contact sensor's body view).")
-        from wrappers.sensors.contact_sensor_wrapper import install_contact_sensor
-        install_contact_sensor(sensor_cfg.contact)
-
-    env = gym.make(runner_cfg.task, cfg=env_cfg, render_mode=None)
-
-    # Control wrapper (must wrap the raw gym env BEFORE the scorer/IsaacLabWrapper so the
-    # expanded action/obs/state spaces are visible when the models are built below). The
-    # control wrapper monkeypatches env.unwrapped's control hooks and grows the action
-    # space; "pose" uses the base controller and adds nothing.
-    control_type = controller_cfg.control_type
-    # For hybrid control types, keep a reference to the control wrapper so the runner
-    # can read its selection/position/force action layout for the hybrid actor.
-    ctrl_wrapper = None
-    if control_type == "pose-VICES":
-        from wrappers.controllers.vic_pose_wrapper import VICPoseWrapper
-        env = VICPoseWrapper(env, controller_cfg)
-        print(f"[runner] control wrapper: VICPoseWrapper (control_type={control_type})")
-    elif control_type == "hybrid":
-        from wrappers.controllers.hybrid_force_position_wrapper import HybridForcePositionWrapper
-        env = HybridForcePositionWrapper(env, controller_cfg, num_agents=runner_cfg.num_agents)
-        ctrl_wrapper = env
-        print(f"[runner] control wrapper: HybridForcePositionWrapper (control_type={control_type})")
-    elif control_type == "hybrid-vic":
-        from wrappers.controllers.hybrid_vic_wrapper import HybridVICWrapper
-        env = HybridVICWrapper(env, controller_cfg, num_agents=runner_cfg.num_agents)
-        ctrl_wrapper = env
-        print(f"[runner] control wrapper: HybridVICWrapper (control_type={control_type})")
-    elif control_type == "ctrl-action-interface":
-        from wrappers.controllers.ctrl_action_interface import CtrlActionInterfaceWrapper
-        env = CtrlActionInterfaceWrapper(env, controller_cfg, num_agents=runner_cfg.num_agents)
-        ctrl_wrapper = env
-        print(
-            f"[runner] control wrapper: CtrlActionInterfaceWrapper "
-            f"(control_type={control_type}, gain_mapping={controller_cfg.gain_mapping})"
-        )
-    elif control_type != "pose":
-        raise ValueError(f"[runner] unknown controller_cfg.control_type: {control_type!r}")
-
-    # Contact-sensor wrapper (logging-only): sits at the same layer as the control
-    # wrappers (inside the scorer/IsaacLabWrapper) so the per-axis in-contact flags it
-    # writes into extras['to_log'] each step are forwarded to TensorBoard by the
-    # scorer's _forward_to_log. Does not change the action/obs/state spaces.
-    if contact_enabled:
-        from wrappers.sensors.contact_sensor_wrapper import ContactSensorWrapper
-        env = ContactSensorWrapper(env, sensor_cfg.contact)
-        print(
-            f"[runner] contact-sensor wrapper attached "
-            f"(threshold={sensor_cfg.contact.contact_force_threshold} N, "
-            f"log_contact_state={sensor_cfg.contact.log_contact_state})"
-        )
-
-    # Always wrap with a subclass of skrl's IsaacLabWrapper. The wrapper is chosen
-    # by task prefix (e.g. "forge"/"factory"/"lift"); when no task-specific wrapper
-    # matches, fall back to RewardDecompositionWrapper so every manager-based task
-    # gets per-env per-term reward logging in per-episode units (matches the units
-    # of `Reward / Total reward (mean)`). Direct-API envs without a reward_manager
-    # fall through gracefully — the hook is a no-op.
-    selected_wrapper = default_wrapper_for_task(runner_cfg.task) or fallback_wrapper_name()
-    env = make_wrapper(selected_wrapper, env)
+    env, ctrl_wrapper, is_automate_assembly, env_cfg, total_envs = build_env(
+        args, runner_cfg, sac_cfg, ppo_cfg, controller_cfg, noise_cfg, sensor_cfg, agent_type
+    )
 
     device = torch.device(args.device)
     n_agents = runner_cfg.num_agents
@@ -432,20 +295,23 @@ def main() -> None:
 
     # Observation preprocessor: YAML carries the class as a string name; the agent
     # resolves it via the registry. We inject the runtime kwargs (size, device) here
-    # since YAML can't carry a Box space or torch.device object. Skip if user
-    # explicitly set kwargs already.
+    # since YAML can't carry a Box space or torch.device object. These two keys are
+    # runtime-only and are ALWAYS overwritten (never setdefault): a config reloaded
+    # from a dumped config.yaml carries them back as lossy repr strings
+    # (e.g. "Box(-inf, inf, (30,), float32)") that would otherwise reach the
+    # preprocessor verbatim and crash. Other user kwargs (epsilon, ...) are preserved.
     if active_cfg.observation_preprocessor is not None:
         if not isinstance(active_cfg.observation_preprocessor_kwargs, dict):
             active_cfg.observation_preprocessor_kwargs = {}
-        active_cfg.observation_preprocessor_kwargs.setdefault("size", obs_space)
-        active_cfg.observation_preprocessor_kwargs.setdefault("device", device)
+        active_cfg.observation_preprocessor_kwargs["size"] = obs_space
+        active_cfg.observation_preprocessor_kwargs["device"] = device
 
     # PPO value preprocessor (single shared RunningStandardScaler over scalar values).
     if agent_type == "ppo" and ppo_cfg.value_preprocessor is not None:
         if not isinstance(ppo_cfg.value_preprocessor_kwargs, dict):
             ppo_cfg.value_preprocessor_kwargs = {}
-        ppo_cfg.value_preprocessor_kwargs.setdefault("size", 1)
-        ppo_cfg.value_preprocessor_kwargs.setdefault("device", device)
+        ppo_cfg.value_preprocessor_kwargs["size"] = 1
+        ppo_cfg.value_preprocessor_kwargs["device"] = device
 
     # ---- models ----
     actor_kwargs = dataclasses.asdict(model_cfg.actor)
@@ -571,6 +437,12 @@ def main() -> None:
     exp_name = args.experiment_name or cfg.experiment.experiment_name or f"{runner_cfg.task}_{agent_type}_N{n_agents}"
     cfg.experiment.experiment_name = exp_name
 
+    # CLI > YAML for the experiment "family" directory. Applied before the
+    # final-directory computation below so --experiment_directory redirects runs
+    # without touching the YAML.
+    if args.experiment_directory is not None:
+        cfg.experiment.directory = args.experiment_directory
+
     # Final per-run output dir = <log_root>/<family>/<experiment_name>
     #   * log_root: --logdir CLI (e.g. "runs/", or absolute), default "runs/".
     #   * family:   sac_cfg.experiment.directory from YAML (e.g. "pick_block",
@@ -596,7 +468,48 @@ def main() -> None:
     if not os.path.isabs(final_directory):
         final_directory = os.path.join(_PROJECT_ROOT, final_directory)
     cfg.experiment.directory = final_directory
-    print(f"[runner] experiment dir: {os.path.join(final_directory, exp_name)}")
+    if args.record_agent_dir is None:
+        print(f"[runner] experiment dir: {os.path.join(final_directory, exp_name)}")
+
+    # Record mode writes no tensorboard output — only the GIF. Suppress per-agent
+    # writers (write_interval=0) and point the (otherwise unused) experiment dir at a
+    # throwaway under the agent folder so the runs tree stays clean. The record branch
+    # rmtree's it before exit.
+    if args.record_agent_dir is not None:
+        cfg.experiment.write_interval = 0
+        cfg.experiment.directory = os.path.abspath(args.record_agent_dir)
+        cfg.experiment.experiment_name = ".record_run"
+        print(f"[runner] record mode: scratch experiment dir "
+              f"{os.path.join(cfg.experiment.directory, cfg.experiment.experiment_name)} "
+              "(removed on exit; GIF goes to the agent's videos/ dir)")
+
+    # Supervised-selection loss (SSL): when enabled, the agent buffers the per-axis
+    # contact ground truth (sliced to the force-eligible axes) as the BCE target. The
+    # eligible axes come from controller_cfg.force_axes (ascending = x,y,z order), so the
+    # contact width tracks sum(force_axes), aligned 1:1 with the hybrid selection head.
+    contact_axes = None
+    if loss_cfg.supervised_selection_enabled:
+        eligible = [i for i, v in enumerate(controller_cfg.force_axes) if v]
+        if not sensor_cfg.contact.enabled:
+            raise ValueError(
+                "loss_cfg.supervised_selection_enabled=True requires "
+                "sensor_cfg.contact.enabled=True (the contact sensor provides the target)."
+            )
+        if ctrl_wrapper is None:
+            raise ValueError(
+                "loss_cfg.supervised_selection_enabled=True requires a hybrid control_type "
+                "(a selection head); got control_type="
+                f"{controller_cfg.control_type!r}."
+            )
+        if not eligible or any(a not in (0, 1, 2) for a in eligible):
+            raise ValueError(
+                "supervised_selection requires translational force-eligible axes (force_axes "
+                f"nonzero ⊆ {{0,1,2}} = x,y,z); the 3-axis ContactSensor has no rotational "
+                f"contact. Got force_axes={list(controller_cfg.force_axes)}."
+            )
+        contact_axes = eligible
+        print(f"[runner] supervised selection loss: contact_axes={contact_axes} "
+              f"(force-eligible x/y/z; contact_dim={len(contact_axes)})")
 
     # ---- agent ----
     agent_cls = SAC if agent_type == "sac" else PPO
@@ -614,7 +527,101 @@ def main() -> None:
         # returns an empty (no-op) manager when nothing is enabled. Both SAC and
         # PPO accept and apply this.
         aux_losses=AuxLossManager.from_cfg(loss_cfg),
+        contact_axes=contact_axes,
     )
+
+    # ---- per-agent recording mode ----
+    # Loads ONE agent's slice (its own policy + twin critics) into this num_agents=1
+    # run, collects complete trajectories, and writes an agent-specific grid GIF.
+    # Self-contained: it never builds a trainer and exits via os._exit() so the
+    # training path below is untouched.
+    if args.record_agent_dir is not None:
+        if agent_type != "sac":
+            raise NotImplementedError(
+                "--record_agent_dir is SAC-only (the V-Est overlay uses the twin critics)."
+            )
+        if not sac_cfg.recorder.enabled:
+            raise ValueError(
+                "--record_agent_dir requires sac_cfg.recorder.enabled=true so the recorder "
+                "TiledCamera is injected into the scene (set it in your --overlay record config)."
+            )
+        from learning.recording_eval import collect_and_record
+        from wrappers.recording import CAMERA_KEY
+
+        rc = 0
+        try:
+            # init() wires up preprocessors/checkpoint modules; write_interval was
+            # forced to 0 (no TB writers / tfevents). Then load ONLY this agent's
+            # weights via the slot loader — it skips optimizer state, so a slice of an
+            # N>1 checkpoint loads cleanly into this 1-agent run (agent.load() refuses
+            # that).
+            # trainer_cfg=None: skrl's base.init does dataclasses.asdict(trainer_cfg)
+            # and only special-cases None (-> {}); a plain dict would raise. We don't
+            # train, so the trainer cfg is irrelevant here.
+            agent.init(trainer_cfg=None)
+            agent._load_one_into_slot(args.record_agent_dir, target_slot=0, step=args.checkpoint_step)
+            agent.training = False
+            agent.enable_models_training_mode(False)
+
+            scene = env.unwrapped.scene
+            if not hasattr(scene, "sensors") or CAMERA_KEY not in scene.sensors:
+                raise RuntimeError(
+                    f"recorder TiledCamera ({CAMERA_KEY!r}) not found in scene; build_env "
+                    "should have injected it when recorder.enabled=true."
+                )
+            camera = scene.sensors[CAMERA_KEY]
+            max_ep_len = int(getattr(env.unwrapped, "max_episode_length", 0))
+            n_traj = (
+                args.num_trajectories
+                if args.num_trajectories is not None
+                else sac_cfg.recorder.num_trajectories
+            )
+            out_dir = args.record_output_dir or os.path.join(
+                args.record_agent_dir, sac_cfg.recorder.output_subdir
+            )
+            print(f"[record] agent_dir={args.record_agent_dir}  num_trajectories={n_traj}  "
+                  f"num_envs={env.num_envs}  max_ep_len={max_ep_len}  out_dir={out_dir}", flush=True)
+
+            gif_path = collect_and_record(
+                env=env,
+                agent=agent,
+                recorder_cfg=sac_cfg.recorder,
+                camera=camera,
+                max_episode_length=max_ep_len,
+                num_trajectories=int(n_traj),
+                output_dir=out_dir,
+            )
+            print(f"[record] DONE -> {gif_path}", flush=True)
+        except BaseException as e:  # noqa: BLE001 - flush before Isaac teardown
+            import traceback
+            print(f"[record] FAILED: {type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
+            rc = 1
+
+        # Teardown ordering mirrors the trainer path: on FAILURE we os._exit(1)
+        # BEFORE simulation_app.close(), because Isaac's shutdown frequently forces
+        # its own exit code and would otherwise mask our failure (making the batch
+        # launcher mark a crashed run as OK).
+        try:
+            env.close()
+        except Exception as e:
+            print(f"[record] env.close() raised: {e!r}", flush=True)
+        # Remove the throwaway experiment dir created by agent.init().
+        try:
+            import shutil
+            _tmp = os.path.join(os.path.abspath(args.record_agent_dir), ".record_run")
+            if os.path.isdir(_tmp):
+                shutil.rmtree(_tmp, ignore_errors=True)
+        except Exception:
+            pass
+        sys.stdout.flush(); sys.stderr.flush()
+        if rc != 0:
+            os._exit(1)
+        try:
+            simulation_app.close()
+        except Exception as e:
+            print(f"[record] simulation_app.close() raised: {e!r}", flush=True)
+        os._exit(0)
 
     # ---- trainer ----
     # `total_timesteps` is interpreted as raw env_steps (env.step() calls). One env_step
@@ -719,16 +726,42 @@ def main() -> None:
             env.close()
         except Exception as e:
             print(f"[runner] env.close() raised: {e!r}", flush=True)
-        # If training raised, exit non-zero NOW — Isaac's simulation_app.close()
-        # internally calls os._exit(0) on shutdown, which would otherwise mask
-        # our exception and report rc=0 to the launcher.
+
+        # Flush + close every per-agent writer synchronously. BOTH exit paths below
+        # use os._exit(), which skips Python/atexit cleanup — so the writers'
+        # background flush threads never run. Flush here or lose the final interval's
+        # scalars and any buffered image events. (write_tracking_data already flushes
+        # scalars on each interval; this also covers the image writers, which are
+        # otherwise never flushed, and the trailing partial interval.)
+        for _w in (getattr(agent, "per_agent_writers", None) or []):
+            try:
+                _w.flush(); _w.close()
+            except Exception as e:
+                print(f"[runner] per-agent writer flush/close raised: {e!r}", flush=True)
+        for _w in (getattr(agent, "per_agent_image_writers", None) or []):
+            try:
+                _w.flush(); _w.close()
+            except Exception as e:
+                print(f"[runner] per-agent image writer flush/close raised: {e!r}", flush=True)
+        sys.stdout.flush(); sys.stderr.flush()
+
+        # If training raised, exit non-zero NOW so the launcher sees the failure.
         if train_exc is not None:
-            sys.stdout.flush(); sys.stderr.flush()
             os._exit(1)
+
+        # SUCCESS: tear down Isaac, then FORCE a clean, deterministic exit. We do not
+        # rely on simulation_app.close()'s own exit behavior or on normal interpreter
+        # teardown to set the exit code — Isaac Sim's C++/CUDA/PhysX shutdown
+        # frequently segfaults/aborts AFTER all real work is done, which makes a fully
+        # successful run report a nonzero exit code. The batch launcher
+        # (exp_file_launcher.bash) captures $? and would then mark the run FAILED even
+        # though everything succeeded. Mirroring the os._exit(1) path above, an
+        # explicit os._exit(0) guarantees rc=0 once we've gotten this far.
         try:
             simulation_app.close()
         except Exception as e:
             print(f"[runner] simulation_app.close() raised: {e!r}", flush=True)
+        os._exit(0)
 
 
 if __name__ == "__main__":
