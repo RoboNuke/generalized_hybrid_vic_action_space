@@ -34,13 +34,17 @@ where ``pdim`` depends on ``gain_mapping``:
     damped (matrix critical damping ``D = 2·K^{1/2}``).
   * ``rotated``           (pdim=9 | 12) — diagonal K + a 6-D rotation vector -> 3x3 rotation R
     (Gram-Schmidt) applied block-diagonally with R SHARED across blocks:
-    ``K = blkdiag(R,R) diag(k) blkdiag(R,R)ᵀ``. R rotates BOTH the position and orientation
-    blocks in all cases. By default only the position diagonal gains are policy-set, the
-    orientation gains held at the constants (3 diag + 6 rot6d = 9); with ``full_gain_matrix``
-    all 6 diagonals are policy-set (6 diag + 6 rot6d = 12). The shared R keeps rot6d at 6 dims
-    either way. Setting ``fixed_rotation_rpy = [roll, pitch, yaw]`` (degrees) instead FIXES R to
-    that constant frame: the rot6d dims drop out (pdim = 3 or 6, diagonal gains only) while R
-    still rotates both blocks of K / D / K_f exactly as the learned variant does.
+    ``K = blkdiag(R,R) diag(k) blkdiag(R,R)ᵀ``. R is anchored to the held asset's NOMINAL in-hand
+    frame ``F_flip`` (the live EEF flipped 180° about y, matching factory's grasp convention) and
+    composed to world (``R_world = R_eef · R_flip · R_local``) before building K, so the stiffness
+    axes ride with the gripper and a given rpy means the same orientation as ``rel_grasp_rot_init_deg``
+    on every axis. R rotates BOTH the position and orientation blocks in all cases. By default only
+    the position diagonal gains are policy-set, the orientation gains held at the constants (3 diag +
+    6 rot6d = 9); with ``full_gain_matrix`` all 6 diagonals are policy-set (6 diag + 6 rot6d = 12).
+    The shared R keeps rot6d at 6 dims either way. Setting ``fixed_rotation_rpy = [roll, pitch, yaw]``
+    (degrees) instead FIXES the local frame to that constant: the rot6d dims drop out (pdim = 3 or 6,
+    diagonal gains only) while R still rotates both blocks of K / D / K_f exactly as the learned
+    variant does.
 
 Scaling is geometric ``k = lo * (hi/lo)^((a+1)/2)`` with per-channel bounds (position /
 rotation for K; force / torque for K_f); a lower bound < eps yields 0 on that channel.
@@ -50,7 +54,7 @@ rotation for K; force / torque for K_f); a lower bound < eps yields 0 on that ch
 import math
 
 import torch
-from isaaclab.utils.math import quat_apply, quat_from_matrix
+from isaaclab.utils.math import quat_apply, quat_from_matrix, matrix_from_quat
 
 from .hybrid_vic_wrapper import HybridVICWrapper
 from .factory_control_utils import (
@@ -110,12 +114,24 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         dev = self.device
         self._chol_rho = float(cfg.chol_offdiag_rho)
 
-        # Constant rotation frame R (1,3,3) shared by K/D/K_f when fixed_rotation_rpy is set.
-        # Config supplies roll/pitch/yaw in DEGREES (easier to author); convert to radians here.
+        # Constant local rotation frame R_local (1,3,3) shared by K/D/K_f when fixed_rotation_rpy
+        # is set; layered on the held-asset nominal frame F_flip in _rotation_frame. Config supplies
+        # roll/pitch/yaw in DEGREES (easier to author); convert to radians here.
         self._R_fixed = (
             euler_xyz_to_matrix(*[math.radians(v) for v in self._fixed_rpy], device=dev)
             if self._fixed_rot else None
         )
+
+        # Held asset's NOMINAL in-hand frame is the EEF flipped 180° about y. This mirrors
+        # factory's grasp placement (flip_z_quat = (0,0,1,0); factory_env.py:782-783): the peg's
+        # body frame sits flipped relative to the gripper, and rel_grasp_rot_init_deg is applied in
+        # THAT frame. The rotated stiffness R is anchored to the same frame (F_flip = R_eef @ R_flip)
+        # so a given rpy means the same orientation for the stiffness ellipsoid as for the grasp
+        # tilt, on every axis (not just y). Built from the identical quaternion the env uses so the
+        # two conventions cannot drift apart.
+        self._R_flip = matrix_from_quat(
+            torch.tensor([[0.0, 0.0, 1.0, 0.0]], dtype=torch.float32, device=dev)
+        )  # (1,3,3) = Ry(180)
 
         # Per-axis geometric bounds as (1, 6) tensors [x, y, z, Rx, Ry, Rz]: pose stiffness K
         # from gain_min/max, force stiffness K_f from force_gain_min/max.
@@ -137,15 +153,25 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         # each step in _build_pose_KD for the rotated stiffness frame.
         self._viz_rotation = bool(cfg.visualize_rotation_frame)
         self._viz_peg_tip = bool(cfg.visualize_peg_tip_frame)
-        self._viz_world = bool(cfg.visualize_world_frame)
+        self._viz_eef = bool(cfg.visualize_eef_frame)
         self._rotation_frame_scale = float(cfg.rotation_frame_axis_scale)
         self._peg_tip_frame_scale = float(cfg.peg_tip_frame_axis_scale)
-        self._world_frame_scale = float(cfg.world_frame_axis_scale)
-        self._peg_tip_offset_z = float(cfg.peg_tip_offset_z)
+        self._eef_frame_scale = float(cfg.eef_frame_axis_scale)
         self._marker_rotation = None
         self._marker_peg_tip = None
-        self._marker_world = None
+        self._marker_eef = None
         self._R_frame = None
+
+        # Translational stiffness ellipsoid. Eigenvalues of the position 3x3 block of K are linearly
+        # mapped from the scalar position-gain range [lo, hi] to a semi-axis length in [min, max] m.
+        self._viz_ellipsoid = bool(cfg.visualize_stiffness_ellipsoid)
+        self._ellipsoid_compliance = bool(cfg.stiffness_ellipsoid_compliance)
+        self._ellip_min = float(cfg.stiffness_ellipsoid_min_scale)
+        self._ellip_max = float(cfg.stiffness_ellipsoid_max_scale)
+        self._ellip_opacity = float(cfg.stiffness_ellipsoid_opacity)
+        self._ellip_lo = float(self._k_lo[0, :3].min())
+        self._ellip_den = max(float(self._k_hi[0, :3].max()) - self._ellip_lo, 1e-6)
+        self._marker_ellipsoid = None
 
     def _extra_action_dims(self):
         return self._pdim + (self._pdim if self._use_hybrid else 0)
@@ -198,7 +224,30 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         # eval-recording frame markers. This runs in _pre_physics_step, so marker transforms
         # are set before the recorder camera renders the frame (no one-step lag).
         super()._compute_control_targets()
+        self._log_rotation_frame_angle()
         self._update_frame_viz()
+
+    def _log_rotation_frame_angle(self):
+        """Log the angle (deg) between the policy's rotation-frame z-axis and the peg-tip z-axis.
+
+        Only meaningful for gain_mapping="rotated" (the only mode that emits R); silently skipped
+        otherwise. ``_R_frame`` is the stiffness rotation already composed to WORLD coordinates
+        (same convention the rotated-stiffness-frame marker draws it with), so its z-axis is
+        R[:, :, 2]; the peg-tip frame z-axis is the held asset's local +z mapped to world via
+        held_quat. Tag carries exactly one '/'.
+        """
+        if self._mode != "rotated" or self._R_frame is None:
+            return
+        if not hasattr(self.unwrapped, "extras"):
+            return
+        env = self.unwrapped
+        z_net = self._R_frame[:, :, 2]                                   # (E,3) world z of R
+        local_z = torch.zeros((self.num_envs, 3), device=self.device)
+        local_z[:, 2] = 1.0
+        z_peg = quat_apply(env.held_quat, local_z)                       # (E,3) world z of peg tip
+        cos = (z_net * z_peg).sum(dim=1).clamp(-1.0, 1.0)                # both already unit-norm
+        angle_deg = torch.rad2deg(torch.acos(cos))                      # (E,)
+        self.unwrapped.extras["to_log"]["RotationFrame/z_angle"] = angle_deg
 
     def _update_frame_viz(self):
         """Draw the enabled eval-recording axis frames at the peg tip / EEF.
@@ -207,10 +256,10 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         stiffness frame additionally requires gain_mapping="rotated" (else there's no R). All
         markers default off, so training pays nothing here.
         """
-        if not (self._viz_rotation or self._viz_peg_tip or self._viz_world):
+        if not (self._viz_rotation or self._viz_peg_tip or self._viz_eef or self._viz_ellipsoid):
             return
 
-        from .frame_viz import AxisFrameMarker
+        from .frame_viz import AxisFrameMarker, EllipsoidMarker
 
         env = self.unwrapped
         env_origins = env.scene.env_origins                                  # (E,3) world
@@ -218,13 +267,18 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
 
         show_rotation = self._viz_rotation and self._mode == "rotated" and self._R_frame is not None
 
-        # Peg tip in absolute world coords (shared by the rotated + peg-tip frames). held_pos is
-        # env-relative in the Factory env, so add env_origins; the tip is offset along the held
-        # asset's local +z.
-        if self._viz_peg_tip or show_rotation:
-            offset = torch.zeros((E, 3), device=self.device)
-            offset[:, 2] = self._peg_tip_offset_z
-            tip_pos_w = env.held_pos + env_origins + quat_apply(env.held_quat, offset)
+        # Peg tip pose in absolute world coords (shared by the rotated, peg-tip, and ellipsoid
+        # markers). Read the env's OWN geometric base frame for the held asset — the point it uses
+        # for keypoints and success — via factory_utils.get_held_base_pose, which already bakes in
+        # the task and FORGE asset offsets (peg height, gear/nut base offsets) from cfg_task. No local
+        # offset knob to keep in sync. held_base_pos is env-relative (held_pos is), so add env_origins.
+        if self._viz_peg_tip or show_rotation or self._viz_ellipsoid:
+            from isaaclab_tasks.direct.factory import factory_utils
+            held_base_pos, held_base_quat = factory_utils.get_held_base_pose(
+                env.held_pos, env.held_quat, env.cfg_task.name,
+                env.cfg_task.fixed_asset_cfg, E, self.device,
+            )
+            tip_pos_w = held_base_pos + env_origins
 
         if show_rotation:
             if self._marker_rotation is None:
@@ -236,15 +290,44 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
             if self._marker_peg_tip is None:
                 self._marker_peg_tip = AxisFrameMarker(
                     "/World/Visuals/PegTipFrame", self._peg_tip_frame_scale)
-            self._marker_peg_tip.update(tip_pos_w, env.held_quat)
+            # The held asset's ACTUAL orientation (carries the grasp tilt). The stiffness R is
+            # anchored to the peg-nominal frame F_flip and the real peg sits at F_flip @ grasp_tilt,
+            # so this frame coincides with the rotated-stiffness frame exactly when
+            # fixed_rotation_rpy == rel_grasp_rot_init_deg — that overlap is the alignment check.
+            self._marker_peg_tip.update(tip_pos_w, held_base_quat)
 
-        if self._viz_world:
-            if self._marker_world is None:
-                self._marker_world = AxisFrameMarker(
-                    "/World/Visuals/WorldFrameAtEEF", self._world_frame_scale)
-            identity = torch.zeros((E, 4), device=self.device)
-            identity[:, 0] = 1.0
-            self._marker_world.update(env.fingertip_midpoint_pos + env_origins, identity)
+        if self._viz_eef:
+            if self._marker_eef is None:
+                self._marker_eef = AxisFrameMarker(
+                    "/World/Visuals/EEFFrame", self._eef_frame_scale)
+            # The actual fingertip (EEF) orientation. The rotated stiffness R is anchored to the
+            # peg-nominal frame F_flip = R_eef @ R_flip — this EEF frame flipped 180° about y — and
+            # the stiffness frame sits fixed_rotation_rpy from THAT (equivalently, it coincides with
+            # the actual peg-tip frame when fixed_rotation_rpy == rel_grasp_rot_init_deg).
+            self._marker_eef.update(
+                env.fingertip_midpoint_pos + env_origins, env.fingertip_midpoint_quat)
+
+        if self._viz_ellipsoid:
+            if self._marker_ellipsoid is None:
+                self._marker_ellipsoid = EllipsoidMarker(
+                    "/World/Visuals/StiffnessEllipsoid", opacity=self._ellip_opacity)
+            # Principal axes/magnitudes of the ACTUAL applied translational stiffness (position 3x3
+            # block of K_pose) via eigendecomposition — correct for every gain_mapping, including
+            # cholesky coupling. eigh returns ascending eigenvalues with orthonormal eigenvector
+            # columns; column i is the principal axis for eigenvalue i.
+            evals, evecs = torch.linalg.eigh(self._K_pose[:, :3, :3])     # (E,3), (E,3,3)
+            # Linear eigenvalue -> semi-axis map over the position gain range; compliance reverses it
+            # (stiff axis short). Clamp so out-of-range eigenvalues land on the endpoints.
+            t = ((evals - self._ellip_lo) / self._ellip_den).clamp(0.0, 1.0)
+            if self._ellipsoid_compliance:
+                t = 1.0 - t
+            scales = self._ellip_min + t * (self._ellip_max - self._ellip_min)   # (E,3)
+            # eigh's eigenvector matrix may be improper (det -1); flip one column so it is a valid
+            # rotation for quat_from_matrix (axis sign is irrelevant for a symmetric ellipsoid).
+            flip = (torch.linalg.det(evecs) < 0).unsqueeze(-1)                   # (E,1)
+            col0 = torch.where(flip, -evecs[:, :, 0], evecs[:, :, 0])
+            evecs = torch.stack((col0, evecs[:, :, 1], evecs[:, :, 2]), dim=2)
+            self._marker_ellipsoid.update(tip_pos_w, quat_from_matrix(evecs), scales)
 
     def _build_pose_KD(self, a):
         """Pose stiffness K and critically-damped D, per ``self._mode``.
@@ -273,8 +356,9 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
             # Rotate a critically-damped diagonal by R. R is shared across blocks and rotates
             # BOTH the position and orientation blocks in every case; ``full_gain_matrix`` only
             # decides whether the orientation diagonal gains are policy-set or held at the
-            # constants — never whether they're rotated. With ``fixed_rotation_rpy`` R is the
-            # constant config frame; otherwise it's decoded from the trailing 6 action dims.
+            # constants — never whether they're rotated. R is anchored to the peg-nominal frame
+            # F_flip (see _rotation_frame): with ``fixed_rotation_rpy`` the local frame is the
+            # config constant, otherwise it's decoded from the trailing 6 action dims.
             R = self._rotation_frame(a)                                            # (E,3,3)
             self._R_frame = R  # cached for the eval-recording rotated-stiffness-frame marker
             if self._full:
@@ -336,15 +420,29 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         return 2.0 * torch.sqrt(kdiag.clamp_min(0.0))
 
     def _rotation_frame(self, a):
-        """(E,3,3) rotation frame R for ``rotated`` mode from a gain-action block ``a``.
+        """(E,3,3) world-frame stiffness rotation R for ``rotated`` mode from a gain-action ``a``.
 
-        Fixed-rotation variant (``fixed_rotation_rpy`` set) returns the constant config frame
-        broadcast to the env batch — ``a`` carries only the diagonal gains, no rot6d tail.
-        Otherwise R is decoded (Gram-Schmidt) from the trailing 6 dims of ``a``.
+        The rotation is defined RELATIVE TO THE HELD ASSET'S NOMINAL IN-HAND FRAME ``F_flip`` (the
+        EEF flipped 180° about y, matching factory's grasp convention), not the world or the raw
+        EEF. ``R_local`` (config-fixed or policy-emitted) orients the stiffness ellipsoid in that
+        peg-body frame, and we compose to the world-frame R that builds K/D/K_f (which act on the
+        world-frame pose error):
+
+            ``R_world = R_(world←eef) · R_flip · R_local``
+
+        Anchoring to ``F_flip`` makes a given rpy mean the same orientation for the stiffness
+        ellipsoid as for ``rel_grasp_rot_init_deg`` on every axis (the raw-EEF anchor only agreed
+        on y, the flip axis). The stiffness axes still ride with the gripper as it reorients.
+        ``R_local`` is the constant config frame in the fixed-rotation variant (``fixed_rotation_rpy``
+        set; ``a`` carries only the diagonal gains, no rot6d tail), else decoded (Gram-Schmidt) from
+        the trailing 6 dims of ``a``.
         """
         if self._fixed_rot:
-            return self._R_fixed.expand(a.shape[0], 3, 3)
-        return rotation_6d_to_matrix(a[:, -6:])
+            R_local = self._R_fixed.expand(a.shape[0], 3, 3)
+        else:
+            R_local = rotation_6d_to_matrix(a[:, -6:])
+        R_eef = matrix_from_quat(self.unwrapped.fingertip_midpoint_quat)        # (E,3,3) world←eef
+        return R_eef @ self._R_flip @ R_local                                   # world←peg-nominal←stiffness
 
     @staticmethod
     def _rotate_blockdiag(R, kdiag):

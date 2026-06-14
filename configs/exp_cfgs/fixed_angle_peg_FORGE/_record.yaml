@@ -16,17 +16,21 @@
 # Coordinate-frame axis markers drawn into the recorded video. Each is independent;
 # flip any of the visualize_* flags to false to hide it, and tune its *_axis_scale
 # (meters) separately. The rotated stiffness frame only appears when the agent's
-# gain_mapping is "rotated" (otherwise it is silently skipped); the peg-tip and world
-# frames appear in any mode. peg_tip_offset_z places the two peg-tip frames at the peg
-# tip (along the held asset's local +z from its root).
+# gain_mapping is "rotated" (otherwise it is silently skipped); the peg-tip and EEF
+# frames appear in any mode. The peg-tip position comes from the env's own held-asset
+# base frame (task/FORGE offsets included) — no offset to configure here.
 controller_cfg:
   visualize_rotation_frame: true        # rotation R, at the peg tip (rotated mode only)
   rotation_frame_axis_scale: 0.02
   visualize_peg_tip_frame: true         # peg's own orientation, at the peg tip
   peg_tip_frame_axis_scale: 0.02
-  visualize_world_frame: true           # world-aligned axes, at the robot EEF
-  world_frame_axis_scale: 0.02
-  peg_tip_offset_z: 0.025
+  visualize_eef_frame: true             # actual fingertip (EEF) orientation, at the robot EEF
+  eef_frame_axis_scale: 0.02
+  visualize_stiffness_ellipsoid: true   # translational stiffness ellipsoid (eigendecomp of K_pos)
+  stiffness_ellipsoid_min_scale: 0.002  # 0.2 cm semi-axis at the min gain
+  stiffness_ellipsoid_max_scale: 0.02   # 2 cm   semi-axis at the max gain
+  stiffness_ellipsoid_compliance: false # false=stiffness (stiff=long), true=compliance (stiff=short)
+  stiffness_ellipsoid_opacity: 0.35     # surface opacity [0..1]; lower = more see-through
 
 runner_cfg:
   # num_agents is forced to 1 by record mode regardless of this value; pinned here

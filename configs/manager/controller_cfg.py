@@ -87,6 +87,11 @@ class ControlCfg(ForgeCtrlCfg):
     # is FIXED to this orientation instead of being emitted by the policy. Drops the 6 rot6d
     # action dims (and their force-block mirror when use_hybrid_force); the policy still sets
     # the diagonal gains. None => R is learned from the action space (default rotated mode).
+    # NOTE: in either case R is anchored to the held asset's NOMINAL in-hand frame F_flip (the EEF
+    # flipped 180° about y, matching factory's grasp convention), not world or the raw EEF — it is
+    # composed to world before building K, so the stiffness axes track the gripper AND this rpy
+    # means the same orientation as rel_grasp_rot_init_deg on every axis. So [0,30,0] here lines the
+    # stiffness ellipsoid up with the same-valued grasp tilt. This rpy is the orientation in F_flip.
     fixed_rotation_rpy: list | None = None
 
     # When True, command full 3-DOF orientation (roll/pitch/yaw) via a delta-axis-angle
@@ -108,12 +113,27 @@ class ControlCfg(ForgeCtrlCfg):
     # peg-tip frame (the held asset's own orientation), drawn at the peg tip.
     visualize_peg_tip_frame: bool = False
     peg_tip_frame_axis_scale: float = 0.04
-    # world frame (identity / world-aligned axes), drawn at the robot end-effector.
-    visualize_world_frame: bool = False
-    world_frame_axis_scale: float = 0.06
-    # Offset (meters) along the held asset's local +z from its root pose to the peg tip; sized
-    # for the 8 mm peg (height ~= 0.05 m). Shared by the rotated and peg-tip frames.
-    peg_tip_offset_z: float = 0.025
+    # EEF frame (the fingertip_midpoint orientation), drawn at the robot end-effector. This is
+    # the frame the rotated stiffness R is defined relative to, so the stiffness frame should be
+    # exactly fixed_rotation_rpy away from it.
+    visualize_eef_frame: bool = False
+    eef_frame_axis_scale: float = 0.06
+    # Translational stiffness ellipsoid (the position 3x3 block of K), drawn at the peg tip. Its
+    # principal axes/magnitudes come from an eigendecomposition of the ACTUAL applied K_pos, so it
+    # is correct for every gain_mapping (including cholesky coupling, which no single frame shows).
+    # Each eigenvalue is LINEARLY mapped from the position gain range [min(gain_min[:3]),
+    # max(gain_max[:3])] to a semi-axis length in [min_scale, max_scale] meters (out-of-range
+    # eigenvalues clamp to the endpoints). compliance=False => STIFF axis is LONG (length grows with
+    # gain); compliance=True reverses the map so a stiff axis is SHORT (displacement-under-unit-force
+    # intuition). Defaults: 0.2 cm at the min gain, 2 cm at the max gain.
+    visualize_stiffness_ellipsoid: bool = False
+    stiffness_ellipsoid_min_scale: float = 0.002   # semi-axis length (m) at the min gain
+    stiffness_ellipsoid_max_scale: float = 0.02    # semi-axis length (m) at the max gain
+    stiffness_ellipsoid_compliance: bool = False   # False=stiffness (stiff=long), True=compliance (stiff=short)
+    stiffness_ellipsoid_opacity: float = 0.35      # surface opacity [0..1]; lower = more see-through
+    # NOTE: the peg-tip position is read directly from the env's geometric base frame
+    # (factory_utils.get_held_base_pose, which bakes in the task/FORGE asset offsets) — there is
+    # deliberately no peg-tip offset knob here to keep in sync.
 
     def __post_init__(self):
         if self.control_type not in CONTROL_TYPES:

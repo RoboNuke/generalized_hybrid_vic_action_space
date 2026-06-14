@@ -324,6 +324,53 @@ def build_env(
         from wrappers.sensors.grasp_tilt_wrapper import install_grasp_rot_randomization
         install_grasp_rot_randomization(runner_cfg.rel_grasp_rot_init_deg, runner_cfg.grasp_rot_mode)
 
+    # Optional rigid peg-gripper weld (Forge/Factory peg_insert only): author a per-env FixedJoint
+    # so the peg is mounted to the gripper instead of held by friction. RunnerCfg already enforces
+    # grasp_rot_mode=='fixed' (constant grasp); here we also require the peg_insert task and force
+    # the env-side prerequisites (no fabric clones so the joints land on real USD prims; no in-grip
+    # position jitter so the constant weld frame agrees with the reset teleport).
+    if runner_cfg.glue_peg_to_gripper:
+        if not (runner_cfg.task.startswith("Isaac-Forge-")
+                or runner_cfg.task.startswith("Isaac-Factory-")):
+            raise ValueError(
+                "runner_cfg.glue_peg_to_gripper=True requires a Forge/Factory peg-insertion task, "
+                f"but task is {runner_cfg.task!r}."
+            )
+        if getattr(env_cfg.task, "name", None) != "peg_insert":
+            raise ValueError(
+                "runner_cfg.glue_peg_to_gripper=True supports the 'peg_insert' task only (the weld "
+                f"transform mirrors the peg_insert grasp), but env_cfg.task.name="
+                f"{getattr(env_cfg.task, 'name', None)!r}."
+            )
+        # Author the joints on real USD prims (fabric clones are USD-invisible), matching the
+        # contact-sensor path.
+        if getattr(env_cfg.scene, "clone_in_fabric", False):
+            env_cfg.scene.clone_in_fabric = False
+            print("[runner] glue_peg_to_gripper enabled: forcing scene.clone_in_fabric=False "
+                  "(the weld joints must be authored on real per-env prims).")
+        # A constant weld frame requires a deterministic in-grip pose: zero the per-reset position
+        # jitter so the reset teleport target equals the welded transform (else PhysX fights it).
+        if any(float(v) != 0.0 for v in getattr(env_cfg.task, "held_asset_pos_noise", [])):
+            print(f"[runner] glue_peg_to_gripper enabled: zeroing held_asset_pos_noise "
+                  f"(was {list(env_cfg.task.held_asset_pos_noise)}) so the constant weld frame "
+                  "matches the reset teleport.")
+            env_cfg.task.held_asset_pos_noise = [0.0 for _ in env_cfg.task.held_asset_pos_noise]
+        # Resolve the concrete env class to patch (only resolved above when a camera/contact
+        # sensor needed it).
+        if _env_cls is None:
+            import importlib
+
+            _entry = gym.spec(runner_cfg.task).entry_point
+            if not isinstance(_entry, str) or ":" not in _entry:
+                raise RuntimeError(
+                    f"cannot resolve the env class to weld for task {runner_cfg.task!r}; "
+                    f"gym entry_point={_entry!r} is not a 'module:Class' string."
+                )
+            _mod_name, _cls_name = _entry.split(":")
+            _env_cls = getattr(importlib.import_module(_mod_name), _cls_name)
+        from wrappers.sensors.peg_weld_wrapper import install_peg_weld
+        install_peg_weld(runner_cfg.rel_grasp_rot_init_deg, env_class=_env_cls)
+
     env = gym.make(runner_cfg.task, cfg=env_cfg, render_mode=None)
 
     # AutoMate-as-Forge adapter: must wrap the raw env BEFORE the control wrapper, since the

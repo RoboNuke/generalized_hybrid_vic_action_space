@@ -75,6 +75,20 @@ class RunnerCfg:
     when ``"fixed"`` it is a constant signed offset applied every reset (e.g. ``[0, -45, 0]`` =
     a steady -45° pitch). All-zero = no tilt. Ignored when ``grasp_rot_mode`` is ``"none"``."""
 
+    glue_peg_to_gripper: bool = False
+    """Rigidly weld the held peg to the gripper for the whole rollout (Forge/Factory
+    ``peg_insert`` only). When True, a per-env ``UsdPhysics.FixedJoint`` is authored between the
+    fingertip body and the peg body before play, so the peg is mounted to the gripper instead of
+    held by friction (which lets it creep). Forces are preserved (the welded peg stays dynamic;
+    its peg-vs-socket reaction transmits through the joint). Installs
+    :func:`~wrappers.sensors.peg_weld_wrapper.install_peg_weld`.
+
+    Requires :attr:`grasp_rot_mode` ``== "fixed"``: a GPU-pipeline joint's local frame is parsed
+    at play time and cannot change between steps, so the welded peg-in-gripper transform must be a
+    constant — only well-defined for a deterministic (fixed) grasp. When enabled, the runner also
+    forces the env's ``held_asset_pos_noise`` to zero (a nonzero per-reset in-grip position jitter
+    would disagree with the constant weld frame and make PhysX fight the reset teleport)."""
+
     num_envs: int
     """Envs PER agent. Total Isaac envs = ``num_envs * num_agents``."""
 
@@ -140,6 +154,15 @@ class RunnerCfg:
                 "RunnerCfg.rel_grasp_rot_init_deg components must be >= 0 for "
                 "grasp_rot_mode='random' (symmetric ± range), "
                 f"got {self.rel_grasp_rot_init_deg!r}"
+            )
+        # A constant peg-gripper weld is only well-defined for a deterministic grasp: the GPU
+        # pipeline parses a joint's local frame at play time and cannot change it per step.
+        if self.glue_peg_to_gripper and self.grasp_rot_mode != "fixed":
+            raise ValueError(
+                "RunnerCfg.glue_peg_to_gripper=True requires grasp_rot_mode='fixed' "
+                "(a constant grasp). The welded peg-in-gripper transform is authored once before "
+                "play and cannot change between physics steps on the GPU pipeline, so a randomized "
+                f"or absent grasp tilt is not supported. Got grasp_rot_mode={self.grasp_rot_mode!r}."
             )
         # Fragile pegs reset individual envs out of sync; the native Factory/Forge reset path
         # assumes all envs reset together, so the efficient per-env reset is mandatory.
