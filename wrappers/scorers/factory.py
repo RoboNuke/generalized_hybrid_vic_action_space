@@ -94,6 +94,10 @@ class FactoryWrapper(RewardDecompositionWrapper):
             "action_grad_penalty": -float(cfg.action_grad_penalty_scale),
             "curr_engaged": 1.0,
             "curr_success": 1.0,
+            # Optional orientation keypoint term (wrappers/scorers/kp_z_align_reward.py); scale 1.0
+            # like the other kp_* terms. Only present in rew_dict when kp_z_align_enabled, so a
+            # static entry is a harmless no-op otherwise.
+            "kp_z_align": 1.0,
         }
 
     def _accumulate_per_env_term(

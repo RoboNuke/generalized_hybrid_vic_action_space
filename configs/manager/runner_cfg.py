@@ -89,6 +89,25 @@ class RunnerCfg:
     forces the env's ``held_asset_pos_noise`` to zero (a nonzero per-reset in-grip position jitter
     would disagree with the constant weld frame and make PhysX fight the reset teleport)."""
 
+    kp_z_align_enabled: bool = False
+    """Add the ``kp_z_align`` orientation keypoint reward (Forge/Factory peg-insertion only).
+    When True, a reward term pulls the held peg's z-axis onto the socket's z-axis — rewarding the
+    orientation alignment that a tilted grasp (:attr:`grasp_rot_mode`) fights and that the base
+    keypoint reward only weakly constrains. The term is ``squashing_fn(angle, a, b)`` over the
+    peg-axis-vs-socket-axis angle (radians), summed into the reward with scale 1.0 (like the other
+    ``kp_*`` terms) and published as ``logs_rew/kp_z_align``. The angle is computed from the true
+    peg/socket poses (reward-side, privileged) and never enters any observation. Installs
+    :func:`~wrappers.scorers.kp_z_align_reward.install_kp_z_align_reward`."""
+
+    kp_z_align_a: float = 20.0
+    """Steepness ``a`` of the ``kp_z_align`` squashing function ``1/(exp(a·x)+b+exp(-a·x))``.
+    Larger => a sharper reward basin (only near-perfect alignment scores). Ignored when
+    :attr:`kp_z_align_enabled` is False."""
+
+    kp_z_align_b: float = 1.33
+    """Offset ``b`` of the ``kp_z_align`` squashing function; sets the peak height ``1/(2+b)`` at
+    perfect alignment (angle = 0). Ignored when :attr:`kp_z_align_enabled` is False."""
+
     num_envs: int
     """Envs PER agent. Total Isaac envs = ``num_envs * num_agents``."""
 

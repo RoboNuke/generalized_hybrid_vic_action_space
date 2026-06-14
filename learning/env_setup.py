@@ -324,6 +324,20 @@ def build_env(
         from wrappers.sensors.grasp_tilt_wrapper import install_grasp_rot_randomization
         install_grasp_rot_randomization(runner_cfg.rel_grasp_rot_init_deg, runner_cfg.grasp_rot_mode)
 
+    # Optional orientation keypoint reward (Forge/Factory peg insertion only): patch
+    # FactoryEnv._get_factory_rew_dict to add a kp_z_align term that rewards aligning the peg
+    # z-axis with the socket z-axis. Must run before gym.make (it patches the env class).
+    if runner_cfg.kp_z_align_enabled:
+        if not (runner_cfg.task.startswith("Isaac-Forge-")
+                or runner_cfg.task.startswith("Isaac-Factory-")):
+            raise ValueError(
+                "runner_cfg.kp_z_align_enabled=True requires a Forge/Factory peg-insertion task "
+                "(it patches FactoryEnv._get_factory_rew_dict), but task is "
+                f"{runner_cfg.task!r}."
+            )
+        from wrappers.scorers.kp_z_align_reward import install_kp_z_align_reward
+        install_kp_z_align_reward(runner_cfg.kp_z_align_a, runner_cfg.kp_z_align_b)
+
     # Optional rigid peg-gripper weld (Forge/Factory peg_insert only): author a per-env FixedJoint
     # so the peg is mounted to the gripper instead of held by friction. RunnerCfg already enforces
     # grasp_rot_mode=='fixed' (constant grasp); here we also require the peg_insert task and force
