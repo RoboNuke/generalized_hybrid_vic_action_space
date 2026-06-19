@@ -18,8 +18,9 @@ runner_cfg:
   agent_type: sac                   # "sac" (default) or "ppo"; selects sac_cfg vs ppo_cfg
   num_envs: 256
   num_agents: 3
-  total_timesteps: 15_000
+  total_timesteps: 10_000
   eval_timesteps: 150
+  glue_peg_to_gripper: true
   memory_size: 2_000_000
   seed: -1
   grasp_rot_mode: fixed                 # none | random | fixed. how the peg is grasped relative
@@ -53,13 +54,14 @@ sac_cfg:
   learning_starts: 300
   learn_entropy: true
   initial_entropy_value: 1.0e-2
-  target_entropy: -10.0            # PLACEHOLDER (action dim varies with gain_mapping); re-tune later
+  target_entropy: -5            # = -|continuous|/2 = -10/2 (7 base + 3 rotated diag gains (fixed R, 3-DOF))
   grad_norm_clip: 0.0
   mixed_precision: false
   observation_preprocessor: RunningStandardScaler
   observation_preprocessor_kwargs: {}
   rewards_shaper_scale: null
   gripper_action_idx: null
+  phase_split_families: [RotationFrame, Impedance_Stiffness]
   recorder:
     enabled: false
   experiment:
@@ -83,6 +85,7 @@ model_cfg:
     use_state_dependent_std: false
     bernoulli_action_dims: null
     force_zero_action_dims: null #[3, 4]   # Forge zeros pose Rx,Ry; sel/force/gain dims appended after
+    scale_down_action_dims: [0, 1, 2, 3, 4, 5]   # apply last_layer_scale to ONLY the 6 pose deltas (3 pos + 3 orient); gain/selection dims stay unshrunk so they explore
   critic:
     critic_output_init_mean: 0.0 #50 before
     critic_n: 4
@@ -175,18 +178,19 @@ controller_cfg:
   # NOTE: damping D is derived (2*sqrt(K), or zeros for cholesky), so damping_min/max are
   # unused here; gain_min/gain_max (pose stiffness) ARE used.
 
-  visualize_rotation_frame: true        # rotation R, at the peg tip (rotated mode only)
-  rotation_frame_axis_scale: 0.02
-  visualize_peg_tip_frame: true         # peg's own orientation, at the peg tip
-  peg_tip_frame_axis_scale: 0.02
-  visualize_eef_frame: true             # actual fingertip (EEF) orientation, at the robot EEF
-  eef_frame_axis_scale: 0.02
 
-  visualize_stiffness_ellipsoid: true   # translational stiffness ellipsoid (eigendecomp of K_pos)
-  stiffness_ellipsoid_min_scale: 0.002  # 0.2 cm semi-axis at the min gain
-  stiffness_ellipsoid_max_scale: 0.02   # 2 cm   semi-axis at the max gain
-  stiffness_ellipsoid_compliance: false # false=stiffness (stiff=long), true=compliance (stiff=short)
-  stiffness_ellipsoid_opacity: 0.05     # surface opacity [0..1]; lower = more see-through
+  #visualize_rotation_frame: true        # rotation R, at the peg tip (rotated mode only)
+  #rotation_frame_axis_scale: 0.02
+  #visualize_peg_tip_frame: false         # peg's own orientation, at the peg tip
+  #peg_tip_frame_axis_scale: 0.02
+  #visualize_eef_frame: false             # actual fingertip (EEF) orientation, at the robot EEF
+  #eef_frame_axis_scale: 0.02
+
+  #visualize_stiffness_ellipsoid: true   # translational stiffness ellipsoid (eigendecomp of K_pos)
+  #stiffness_ellipsoid_min_scale: 0.001  # 0.2 cm semi-axis at the min gain
+  #stiffness_ellipsoid_max_scale: 0.01   # 2 cm   semi-axis at the max gain
+  #stiffness_ellipsoid_compliance: false # false=stiffness (stiff=long), true=compliance (stiff=short)
+  #stiffness_ellipsoid_opacity: 0.95     # surface opacity [0..1]; lower = more see-through
 
 sensor_cfg:
   contact:

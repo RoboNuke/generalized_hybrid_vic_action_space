@@ -277,6 +277,10 @@ class HybridForcePositionWrapper(gym.Wrapper):
         if self._original_pre_physics_step:
             self._original_pre_physics_step(action.clone())
 
+        # Stash the raw (pre-EMA) network action so logging hooks can compare it against the
+        # post-EMA control_actions (e.g. ctrl-action-interface's commanded-orientation metric).
+        self._raw_action = action
+
         self._apply_ema_to_actions(action)
         self.unwrapped.actions = self.ema_actions.clone()
 

@@ -189,6 +189,7 @@ class BlockSimBaActor(GaussianMixin, Model):
         use_state_dependent_std: bool = False,
         bernoulli_action_dims: list[int] | None = None,
         force_zero_action_dims: list[int] | None = None,
+        scale_down_action_dims: list[int] | None = None,
     ):
         Model.__init__(
             self,
@@ -282,8 +283,30 @@ class BlockSimBaActor(GaussianMixin, Model):
             ).to(device)
 
         with torch.no_grad():
-            # Scale only the action-output rows (first _policy_out_dim).
-            self.actor_mean.fc_out.weight[:, : self._policy_out_dim, :] *= last_layer_scale
+            # Down-scale the final-layer mean weights at init. By default EVERY policy-output
+            # row (first _policy_out_dim) is scaled uniformly. If scale_down_action_dims is
+            # given, only the listed env-facing action dims are scaled and the rest keep scale
+            # 1.0 — so configs can damp e.g. the pose deltas without also shrinking the gain /
+            # selection dims toward zero (which otherwise leaves their actions stuck near the
+            # zero-action midpoint and unexplored).
+            w = self.actor_mean.fc_out.weight
+            if scale_down_action_dims is None:
+                w[:, : self._policy_out_dim, :] *= last_layer_scale
+            else:
+                # Map each requested action-vector dim to its backbone-output row
+                # ([continuous_means | bernoulli_logits]); force-zero dims have no row.
+                cont_pos = {d: i for i, d in enumerate(self.continuous_dims)}
+                bern_pos = {d: self.num_continuous + i for i, d in enumerate(self.bernoulli_dims)}
+                mult = torch.ones(self._policy_out_dim, device=device)
+                for d in sorted(set(scale_down_action_dims)):
+                    if d < 0 or d >= self.num_actions:
+                        raise ValueError(
+                            f"scale_down_action_dims index {d} out of range [0, {self.num_actions})"
+                        )
+                    row = cont_pos.get(d, bern_pos.get(d))
+                    if row is not None:  # force-zero dims carry no weights -> nothing to scale
+                        mult[row] = last_layer_scale
+                w[:, : self._policy_out_dim, :] *= mult.view(1, -1, 1)
 
     def compute(self, inputs, role):
         obs = inputs["observations"]

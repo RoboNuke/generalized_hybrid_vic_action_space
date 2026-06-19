@@ -40,6 +40,12 @@ class FactoryWrapper(RewardDecompositionWrapper):
         # geometric engagement indicator — peg close to socket). Read from the
         # rew_dict; mirrors curr_successes for the engagement-rate metric.
         self._latest_curr_engaged: torch.Tensor | None = None
+        # Pre-reset snapshot of the env's `ep_succeeded` latch (1 if the episode
+        # reached the instantaneous success state on AT LEAST ONE step). Captured
+        # in the hook AFTER the upstream log updates the latch but BEFORE Isaac
+        # Lab's in-step `_reset_idx` zeros it for terminating envs. Drives the
+        # Episode / Ever success rate metric.
+        self._latest_ep_succeeded: torch.Tensor | None = None
         # Latest per-env unscaled rew_dict (per-step) captured by the reward-log
         # hook. Used to emit per-agent `logs_rew/<term>` to TB by partitioning
         # the per-env values across agent slices in the SAC consumer.
@@ -74,7 +80,12 @@ class FactoryWrapper(RewardDecompositionWrapper):
                 if isinstance(val, torch.Tensor) and val.dim() > 0 and val.shape[0] == num_envs
             }
             self._accumulate_per_env_term(rew_dict, self._factory_scales())
-            return original_factory_log(rew_dict, curr_successes)
+            out = original_factory_log(rew_dict, curr_successes)
+            # original_factory_log has now latched first-successes into
+            # ep_succeeded for this step (incl. the terminal step). Snapshot it
+            # before the post-_get_rewards reset clears it for done envs.
+            self._latest_ep_succeeded = self._unwrapped.ep_succeeded.bool().clone()
+            return out
 
         unwrapped._log_factory_metrics = hooked_factory_log
 
@@ -148,6 +159,10 @@ class FactoryWrapper(RewardDecompositionWrapper):
             info["per_env_curr_successes"] = self._latest_curr_successes
         if self._latest_curr_engaged is not None:
             info["per_env_curr_engaged"] = self._latest_curr_engaged
+        # Pre-reset "ever succeeded this episode" latch (see _latest_ep_succeeded).
+        # Drives Episode / Ever success rate vs. the terminal-step Success rate.
+        if self._latest_ep_succeeded is not None:
+            info["per_env_ever_success"] = self._latest_ep_succeeded
         info["per_env_ep_success_times"] = self._unwrapped.ep_success_times.clone()
 
         # Per-env episode-end capture: at this point, _accumulate_per_env_term

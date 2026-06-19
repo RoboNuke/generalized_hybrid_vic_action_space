@@ -191,8 +191,27 @@ class SAC_CFG(AgentCfg):
     works regardless of whether the gripper dim is sampled from a Gaussian or
     a Bernoulli (see ``model_cfg.actor.bernoulli_action_dims``)."""
 
+    phase_split_families: list[str] = dataclasses.field(default_factory=list)
+    """Per-env metric families to split by insertion phase (free_space / search /
+    insertion) in the per-agent TensorBoard logs. Each entry is a ``{family}`` — the
+    text before the single ``/`` in a per-env ``to_log`` tag (e.g. ``"energy_metrics"``
+    for ``energy_metrics/avg_force``). For every listed family, each of its tags is
+    re-emitted as ``{family}_{phase}/{metric_name}`` (e.g. ``energy_metrics_search/
+    avg_force``), reduced over only the envs in that phase each step (same
+    max/min/mean/dist convention as the un-split tag), and the un-split tag is NOT
+    logged. Phase per env: free_space = no contact and not engaged, search = in contact
+    but not engaged, insertion = engaged (contact irrelevant). Requires the
+    contact-sensor and Forge/Factory scorer wrappers (they publish the contact +
+    engagement signals); listing a family without them raises. Empty list disables it."""
+
     mixed_precision: bool = False
     """Whether to enable automatic mixed precision for higher performance."""
+
+    log_histograms: bool = True
+    """Whether to write TensorBoard histograms for ``(dist)`` metrics. When False, ``(dist)``
+    tags still emit their mean + std scalars — only the (memory-heavy) per-interval histogram is
+    skipped, and the separate per-agent image SummaryWriters stay idle. Set False to cut host-RAM
+    / disk pressure from histogram event buffering on long runs."""
 
     recorder: RecorderCfg = dataclasses.field(default_factory=RecorderCfg)
     """Configures the optional ``RecordingWrapper`` (3x4-grid GIFs + TB videos).

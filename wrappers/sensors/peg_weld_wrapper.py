@@ -111,24 +111,26 @@ def _compute_peg_in_fingertip(env, tilt_deg: Sequence[float]):
     fingerpad = env.cfg_task.robot_cfg.franka_fingerpad_length
 
     # Base held-asset relative pose for peg_insert: pure +z offset, identity orientation.
-    rel_pos = torch.zeros((1, 3), device=device)
+    # NOTE: keep every tensor float32 — the env's torch_utils (TorchScript) refuse mixed
+    # dtypes, and np.deg2rad below yields float64, so cast the Euler angles explicitly.
+    rel_pos = torch.zeros((1, 3), device=device, dtype=torch.float32)
     rel_pos[0, 2] = height - fingerpad
-    identity = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device)
+    identity = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device, dtype=torch.float32)
 
     # Fixed grasp tilt, composed onto the (identity) base exactly as grasp_tilt_wrapper:
     # rel_quat = quat_mul(quat_conjugate(perturb), base).
-    r, p, y = (np.deg2rad(float(v)) for v in tilt_deg)
+    r, p, y = (float(np.deg2rad(float(v))) for v in tilt_deg)
     perturb = torch_utils.quat_from_euler_xyz(
-        torch.tensor([r], device=device),
-        torch.tensor([p], device=device),
-        torch.tensor([y], device=device),
+        torch.tensor([r], device=device, dtype=torch.float32),
+        torch.tensor([p], device=device, dtype=torch.float32),
+        torch.tensor([y], device=device, dtype=torch.float32),
     )
     rel_quat = torch_utils.quat_mul(torch_utils.quat_conjugate(perturb), identity)
 
     # asset_in_hand = inverse(held_asset_relative); peg_in_fingertip = flip_z ∘ asset_in_hand.
     ah_quat, ah_pos = torch_utils.tf_inverse(rel_quat, rel_pos)
-    flip_z = torch.tensor([[0.0, 0.0, 1.0, 0.0]], device=device)
-    zeros3 = torch.zeros((1, 3), device=device)
+    flip_z = torch.tensor([[0.0, 0.0, 1.0, 0.0]], device=device, dtype=torch.float32)
+    zeros3 = torch.zeros((1, 3), device=device, dtype=torch.float32)
     p0_quat, p0_pos = torch_utils.tf_combine(flip_z, zeros3, ah_quat, ah_pos)
     return p0_pos[0].tolist(), p0_quat[0].tolist()  # ([x,y,z], [w,x,y,z])
 
@@ -196,6 +198,12 @@ def install_peg_weld(rel_grasp_rot_init_deg: Sequence[float], env_class: Any = N
             joint = UsdPhysics.FixedJoint.Define(stage, joint_path)
             joint.CreateBody0Rel().SetTargets([Sdf.Path(fingertip.GetPath().pathString)])
             joint.CreateBody1Rel().SetTargets([Sdf.Path(peg_body.GetPath().pathString)])
+            # CRITICAL: weld the robot link to the peg as a MAXIMAL-coordinate joint. Without this,
+            # PhysX tries to fold the joint into the robot's reduced-coordinate articulation and
+            # adds the peg as a child link — but the peg is already its own articulation, so the
+            # articulation parse fails ("Failed to create articulation at .../Robot/root_joint").
+            # excludeFromArticulation=True solves it as a separate loop constraint instead.
+            joint.CreateExcludeFromArticulationAttr().Set(True)
             # localPose0 = peg_in_fingertip (frame on the fingertip that the joint pins to the
             # peg's body origin); localPose1 = identity (peg body origin == its root pose).
             joint.CreateLocalPos0Attr().Set(Gf.Vec3f(*(float(v) for v in pos0)))

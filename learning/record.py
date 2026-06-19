@@ -58,8 +58,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Collect at least this many trajectories before composing the grid "
              "(overrides recorder.num_trajectories).",
     )
-    p.add_argument("--checkpoint_step", type=int, default=None,
-                   help="Specific ckpt step to load; default = latest.")
+    p.add_argument("--checkpoint_step", type=lambda v: v if v == "best" else int(v), default=None,
+                   help="Specific ckpt step to load, or 'best' for the agent's ckpt_best.pt "
+                        "(highest-success-rate checkpoint); default = latest.")
     p.add_argument("--output_dir", type=str, default=None,
                    help="Where to write the GIF. Default <agent_dir>/<recorder.output_subdir>.")
     p.add_argument("--device", type=str, default=None, help="Torch/sim device, e.g. cuda:0.")

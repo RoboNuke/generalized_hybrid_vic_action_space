@@ -39,6 +39,12 @@ from models.block_simba import (
 from models.preprocessor_wrapper import PerAgentPreprocessorWrapper
 
 
+# Insertion-task phases for per-phase metric splitting (cfg.phase_split_families).
+# Ordered so the phase id is the tuple index: 0 free_space, 1 search, 2 insertion.
+# Classification priority is insertion > search > free_space (see _compute_phase_ids).
+_PHASE_NAMES = ("free_space", "search", "insertion")
+
+
 class BlockAgent(Agent):
     """Base class holding the algorithm-agnostic block-parallel machinery.
 
@@ -90,6 +96,12 @@ class BlockAgent(Agent):
         # picks up both event streams together.
         self.per_agent_image_writers: list = []
         self.per_agent_tracking: list[collections.defaultdict] = []
+        # Per-agent RAW per-env sample buffers for "(dist)" metrics, accumulated over the
+        # write interval and emitted as mean+std scalars plus a histogram (see
+        # write_tracking_data). Kept separate from per_agent_tracking because these retain raw
+        # per-env values (not the env-mean), so the std/histogram reflect the true spatial
+        # + temporal distribution over the interval rather than a distribution of env-means.
+        self.per_agent_dist_tracking: list[collections.defaultdict] = []
         # Episode totals / lengths accumulated since the last write_interval flush.
         # write_tracking_data computes max/min/mean over the interval and then clears,
         # so the published values reflect ONLY the episodes that finished in the
@@ -104,6 +116,18 @@ class BlockAgent(Agent):
         # flush. Same semantics/lifecycle as the success buffer above (cleared in
         # write_tracking_data after emit) — drives the Episode / Engagement rate metric.
         self._per_agent_episodes_this_interval_engaged: list[list[int]] = []
+        # Per-env (total_envs) "engaged on ANY step this episode" latch, OR-accumulated from
+        # the single per_env_curr_engaged info signal each step and cleared per-env on episode
+        # end. Lets Episode / Engagement rate count a trajectory as engaged if it engaged at
+        # ANY point in the rollout (not just the terminal step). Lazily sized on first step.
+        self._ever_engaged_latch: torch.Tensor | None = None
+        # Finished-trajectory "ever succeeded this episode" labels (the pre-reset
+        # ep_succeeded latch), same lifecycle as the buffers above — drives the
+        # Episode / Ever success rate metric. Unlike Episode / Success rate (peg
+        # inserted on the TERMINAL step only), this counts a trajectory that
+        # reached success on ANY step, so the gap between the two surfaces
+        # transient insertions that were not held to episode end.
+        self._per_agent_episodes_this_interval_ever: list[list[int]] = []
         # Per-agent per-trajectory forward-distance accumulator (filled when a
         # task-specific wrapper publishes `info["per_env_episode_distance"]`),
         # cleared in write_tracking_data after emit. Currently the AntSuccess
@@ -228,10 +252,12 @@ class BlockAgent(Agent):
                     TorchSummaryWriter(log_dir=agent_log_dir)
                 )
                 self.per_agent_tracking.append(collections.defaultdict(list))
+                self.per_agent_dist_tracking.append(collections.defaultdict(list))
                 self._per_agent_track_rewards.append([])
                 self._per_agent_track_timesteps.append([])
                 self._per_agent_episodes_this_interval.append([])
                 self._per_agent_episodes_this_interval_engaged.append([])
+                self._per_agent_episodes_this_interval_ever.append([])
                 self._per_agent_distances_this_interval.append([])
                 self._per_agent_velocities_this_interval.append([])
                 self._best_success_rate.append(-1.0)
@@ -244,7 +270,26 @@ class BlockAgent(Agent):
 
     def write_tracking_data(self, *, timestep: int, timesteps: int) -> None:
         """Flush per-agent tracking buckets to per-agent writers."""
+        # Per-interval memory snapshot (process-global; mirrored to every agent's writer under the
+        # Stats family, next to "Stats / Algorithm update time"). Linear host_rss growth ⇒ a host
+        # leak; growing gpu_alloc/reserved ⇒ a GPU leak. Cheap to compute once per flush.
+        try:
+            import psutil
+            _host_rss_gb = psutil.Process(os.getpid()).memory_info().rss / 1e9
+        except Exception:
+            _host_rss_gb = None
+        if torch.cuda.is_available():
+            _gpu_alloc_gb = torch.cuda.memory_allocated() / 1e9
+            _gpu_reserved_gb = torch.cuda.memory_reserved() / 1e9
+        else:
+            _gpu_alloc_gb = _gpu_reserved_gb = None
+
         for i, writer in enumerate(self.per_agent_writers):
+            if _host_rss_gb is not None:
+                writer.add_scalar(tag="Stats / Host RSS (GB)", value=_host_rss_gb, timestep=timestep)
+            if _gpu_alloc_gb is not None:
+                writer.add_scalar(tag="Stats / GPU allocated (GB)", value=_gpu_alloc_gb, timestep=timestep)
+                writer.add_scalar(tag="Stats / GPU reserved (GB)", value=_gpu_reserved_gb, timestep=timestep)
             for tag, values in self.per_agent_tracking[i].items():
                 if not values:
                     continue
@@ -301,10 +346,10 @@ class BlockAgent(Agent):
                     timestep=timestep,
                 )
 
-            # Engagement rate over trajectories that finished since the last flush.
-            # Same source/lifecycle as success rate, but for the curr_engaged flag
-            # (peg close to socket). Cleared after emit so the rate reflects only
-            # this-interval episodes (no rolling-window lag).
+            # Engagement rate over trajectories that finished since the last flush:
+            # fraction of episodes that were engaged (curr_engaged) on ANY step of the
+            # rollout (see the per-env ever-engaged latch above), not just the terminal
+            # step. Cleared after emit so the rate reflects only this-interval episodes.
             eng = self._per_agent_episodes_this_interval_engaged[i]
             if eng:
                 interval_engagement_rate = float(np.mean(eng))
@@ -314,6 +359,19 @@ class BlockAgent(Agent):
                     timestep=timestep,
                 )
                 eng.clear()
+
+            # Ever-success rate over trajectories that finished since the last
+            # flush: fraction that reached success on at least one step (vs. the
+            # terminal-step-only Success rate). Same source/lifecycle as above;
+            # cleared after emit so it reflects only this-interval episodes.
+            ever = self._per_agent_episodes_this_interval_ever[i]
+            if ever:
+                writer.add_scalar(
+                    tag="Episode / Ever success rate",
+                    value=float(np.mean(ever)),
+                    timestep=timestep,
+                )
+                ever.clear()
 
             # Per-trajectory forward distance (max/min/mean) — populated only when
             # a task-specific wrapper publishes per_env_episode_distance.
@@ -334,6 +392,43 @@ class BlockAgent(Agent):
                 writer.add_scalar(tag="Episode / Velocity (min)",  value=float(arr.min()),  timestep=timestep)
                 writer.add_scalar(tag="Episode / Velocity (mean)", value=float(arr.mean()), timestep=timestep)
                 vel_list.clear()
+
+            # "(dist)" metrics: emit mean + std scalars (skrl writer) and a histogram
+            # (torch image writer — skrl's writer has no add_histogram) over the raw per-env
+            # values accumulated this interval. Std (sqrt of variance) is published rather than
+            # variance because it shares the metric's units and is the more intuitive spread
+            # measure. The base tag drops the " (dist)" suffix; the two scalars keep exactly one
+            # '/'. Cleared after emit so each interval is fresh.
+            dist_tracking = self.per_agent_dist_tracking[i]
+            if dist_tracking:
+                img_writer = (
+                    self.per_agent_image_writers[i]
+                    if i < len(self.per_agent_image_writers) else None
+                )
+                wrote_hist = False
+                # cfg.log_histograms gates ONLY the histogram; the mean/std scalars below always
+                # fire for both "(dist)" and "(stat)". Disable to cut histogram host-RAM/disk cost.
+                log_histograms = bool(getattr(self.cfg, "log_histograms", True))
+                for tag, values in dist_tracking.items():
+                    if not values:
+                        continue
+                    # is_dist selects the suffix to strip ("(stat)" tags never get a histogram);
+                    # "(dist)" tags additionally get a histogram unless log_histograms is False.
+                    is_dist = tag.endswith(" (dist)")
+                    suffix = " (dist)" if is_dist else " (stat)"
+                    base = tag[: -len(suffix)]
+                    arr = np.asarray(values, dtype=np.float64)
+                    writer.add_scalar(tag=f"{base}_mean", value=float(arr.mean()), timestep=timestep)
+                    writer.add_scalar(tag=f"{base}_std",  value=float(arr.std()),  timestep=timestep)
+                    # add_histogram raises on a degenerate (all-equal) array; skip it then —
+                    # the mean/std scalars already capture a constant-stiffness baseline (std=0).
+                    if (is_dist and log_histograms and img_writer is not None
+                            and float(arr.max()) > float(arr.min())):
+                        img_writer.add_histogram(base, arr, timestep)
+                        wrote_hist = True
+                dist_tracking.clear()
+                if wrote_hist:
+                    img_writer.flush()
 
             self.per_agent_tracking[i].clear()
             # Persist synchronously: skrl's SummaryWriter flushes on a background
@@ -513,6 +608,15 @@ class BlockAgent(Agent):
                 # disjoint by construction in _forward_to_log).
                 per_env_to_log = infos.get("per_env_to_log")
                 if isinstance(per_env_to_log, dict):
+                    # Optional per-phase metric split (free_space / search / insertion).
+                    # Families listed in cfg.phase_split_families have each of their
+                    # `{family}/{name}` tags re-emitted as `{family}_{phase}/{name}`,
+                    # reduced over only this step's in-phase envs (same max/min/mean/dist
+                    # convention as the un-split path). `phase_ids` is computed lazily on
+                    # the first matching tag — only then are the contact + engagement
+                    # inputs required. See _compute_phase_ids / _track_phase_split.
+                    phase_split = set(getattr(self.cfg, "phase_split_families", None) or ())
+                    phase_ids: torch.Tensor | None = None
                     for tag, vals in per_env_to_log.items():
                         if not torch.is_tensor(vals):
                             raise TypeError(
@@ -524,6 +628,26 @@ class BlockAgent(Agent):
                                 f"per_env_to_log[{tag!r}] has shape {tuple(vals.shape)}, "
                                 f"expected first dim == total_envs ({total_envs})."
                             )
+                        # Phase split takes precedence over the un-split reduction: a
+                        # matched family's tag is replaced by its three per-phase tags
+                        # (never emitted un-split). Family = text before the single '/'.
+                        if phase_split and tag.partition("/")[0].strip() in phase_split:
+                            if phase_ids is None:
+                                phase_ids = self._compute_phase_ids(infos, total_envs)
+                            self._track_phase_split(tag, vals, phase_ids, epa)
+                            continue
+                        # A "(dist)" or "(stat)" tag wants its full per-env distribution kept:
+                        # stash the RAW per-env slice (not the env-mean) so write_tracking_data can
+                        # emit mean + std over the interval (plus a histogram for "(dist)" only).
+                        # Handled here, before the scalar-reduction path below, so it never lands in
+                        # per_agent_tracking.
+                        if tag.endswith("(dist)") or tag.endswith("(stat)"):
+                            for i in range(self.num_agents):
+                                env_lo, env_hi = i * epa, (i + 1) * epa
+                                self.per_agent_dist_tracking[i][tag].extend(
+                                    vals[env_lo:env_hi].float().tolist()
+                                )
+                            continue
                         # Reduce each agent's env partition by the SAME convention
                         # write_tracking_data uses for the interval: a "(max)"/"(min)"
                         # tag suffix takes the per-env peak/trough (so e.g. a max-force
@@ -581,11 +705,12 @@ class BlockAgent(Agent):
                                 agent_succ[done_idx].long().tolist()
                             )
 
-                # Engagement rate (env-driven): identical partitioning to success,
-                # sourced from the per-step curr_engaged flag (peg close to socket)
-                # snapshotted at the reset moment. Records each finished trajectory's
-                # engagement flag so write_tracking_data's interval mean is a true
-                # per-trajectory engagement rate.
+                # Engagement rate (env-driven): a trajectory counts as engaged if the peg was
+                # engaged on ANY step of the rollout, not just the terminal step. We OR the single
+                # per_env_curr_engaged info signal (the one source of truth for "engaged") into a
+                # per-env latch each step, record the latch for finished trajectories, then clear
+                # those envs' latch for the next episode. Same per-agent partitioning as success;
+                # mirrors the Ever success rate semantics so transient engagement isn't missed.
                 curr_eng = infos.get("per_env_curr_engaged")
                 if curr_eng is not None:
                     if not (torch.is_tensor(curr_eng) and curr_eng.dim() > 0
@@ -595,15 +720,52 @@ class BlockAgent(Agent):
                             f"{tuple(curr_eng.shape) if torch.is_tensor(curr_eng) else type(curr_eng).__name__}, "
                             f"expected ({total_envs},)"
                         )
+                    eng_flat = curr_eng.bool().view(-1).to(self.device)
+                    if (self._ever_engaged_latch is None
+                            or self._ever_engaged_latch.shape[0] != total_envs):
+                        self._ever_engaged_latch = torch.zeros(
+                            total_envs, dtype=torch.bool, device=self.device
+                        )
+                    # OR in THIS step's engagement (incl. the terminal step) before recording.
+                    self._ever_engaged_latch |= eng_flat
+                    done_flat = (terminated + truncated).bool().view(-1).to(self.device)
+                    for i in range(self.num_agents):
+                        env_lo, env_hi = i * epa, (i + 1) * epa
+                        done_slice = done_flat[env_lo:env_hi]
+                        if done_slice.any():
+                            agent_eng = self._ever_engaged_latch[env_lo:env_hi]
+                            done_idx = done_slice.nonzero(as_tuple=False).view(-1)
+                            self._per_agent_episodes_this_interval_engaged[i].extend(
+                                agent_eng[done_idx].long().tolist()
+                            )
+                    # Clear the latch for finished trajectories so the next episode starts fresh.
+                    self._ever_engaged_latch[done_flat] = False
+
+                # Ever-success rate (env-driven): identical done-gated, per-agent
+                # partitioning as success/engagement, sourced from the pre-reset
+                # ep_succeeded latch (peg reached the success state on at least one
+                # step of the episode). Records each finished trajectory's latch so
+                # write_tracking_data's interval mean is a true per-trajectory
+                # ever-success rate; its gap to Episode / Success rate is unstable
+                # (transient) insertions not held to the terminal step.
+                curr_ever = infos.get("per_env_ever_success")
+                if curr_ever is not None:
+                    if not (torch.is_tensor(curr_ever) and curr_ever.dim() > 0
+                            and curr_ever.shape[0] == total_envs):
+                        raise ValueError(
+                            f"per_env_ever_success has shape "
+                            f"{tuple(curr_ever.shape) if torch.is_tensor(curr_ever) else type(curr_ever).__name__}, "
+                            f"expected ({total_envs},)"
+                        )
                     done_flat = (terminated + truncated).bool().view(-1)
                     for i in range(self.num_agents):
                         env_lo, env_hi = i * epa, (i + 1) * epa
                         done_slice = done_flat[env_lo:env_hi]
                         if done_slice.any():
-                            agent_eng = curr_eng[env_lo:env_hi]
+                            agent_ever = curr_ever[env_lo:env_hi]
                             done_idx = done_slice.nonzero(as_tuple=False).view(-1)
-                            self._per_agent_episodes_this_interval_engaged[i].extend(
-                                agent_eng[done_idx].long().tolist()
+                            self._per_agent_episodes_this_interval_ever[i].extend(
+                                agent_ever[done_idx].long().tolist()
                             )
 
                 ep_succ_times = infos.get("per_env_ep_success_times")
@@ -714,6 +876,84 @@ class BlockAgent(Agent):
                         )
                         for i in range(self.num_agents):
                             self.per_agent_tracking[i][tag].append(scalar)
+
+    # --------------------------------------------------------------
+    # Per-phase metric splitting (cfg.phase_split_families)
+    # --------------------------------------------------------------
+    def _compute_phase_ids(self, infos: Any, total_envs: int) -> torch.Tensor:
+        """Per-env insertion-task phase id (``(total_envs,)`` long) for metric splitting.
+
+        * ``free_space`` (0): not engaged and no contact on any axis.
+        * ``search``     (1): in contact on some axis but not engaged.
+        * ``insertion``  (2): engaged (contact state irrelevant).
+
+        Sourced from the same per-step signals the episode-rate metrics use:
+        ``infos["per_env_curr_engaged"]`` (peg close to socket, thresholded at 0.5)
+        and ``infos["in_contact"]`` (per-axis contact bool from the contact sensor).
+        Raised loud if either is missing/misshaped — a family was configured for phase
+        splitting without the wrappers that publish these, which would otherwise
+        silently mislabel every step as free_space.
+        """
+        curr_eng = infos.get("per_env_curr_engaged") if isinstance(infos, dict) else None
+        in_contact = infos.get("in_contact") if isinstance(infos, dict) else None
+        if not (torch.is_tensor(curr_eng) and curr_eng.dim() > 0 and curr_eng.shape[0] == total_envs):
+            raise ValueError(
+                "phase_split_families is set but infos['per_env_curr_engaged'] is "
+                f"{tuple(curr_eng.shape) if torch.is_tensor(curr_eng) else type(curr_eng).__name__}, "
+                f"expected a ({total_envs},) tensor (is the Forge/Factory scorer wrapper active?)."
+            )
+        if not (torch.is_tensor(in_contact) and in_contact.dim() > 0 and in_contact.shape[0] == total_envs):
+            raise ValueError(
+                "phase_split_families is set but infos['in_contact'] is "
+                f"{tuple(in_contact.shape) if torch.is_tensor(in_contact) else type(in_contact).__name__}, "
+                f"expected a ({total_envs}, ...) tensor (is the contact-sensor wrapper active?)."
+            )
+        engaged = curr_eng.reshape(total_envs) > 0.5
+        contact_any = (in_contact.reshape(total_envs, -1) != 0).any(dim=1)
+        phase = torch.zeros(total_envs, dtype=torch.long, device=engaged.device)
+        phase[contact_any] = 1          # search (overwritten by insertion below)
+        phase[engaged] = 2              # insertion wins regardless of contact
+        return phase
+
+    def _track_phase_split(
+        self, tag: str, vals: torch.Tensor, phase_ids: torch.Tensor, epa: int
+    ) -> None:
+        """Emit a ``{family}/{name}`` per-env metric as three ``{family}_{phase}/{name}``
+        tags, each reduced over only this step's in-phase envs in the agent's partition.
+
+        Reduction matches the un-split convention picked from the tag suffix: ``(dist)``
+        keeps the raw per-env samples (mean+std+histogram at flush), ``(stat)`` likewise keeps
+        the raw samples but flushes mean+std only (no histogram), ``(max)``/``(min)`` take the
+        per-phase peak/trough, everything else env-means. A phase with no envs this step
+        contributes nothing, so its interval value reflects only the steps in which it was
+        active. New tags keep exactly one '/' (family carries none, and the single-slash tag
+        convention guarantees ``name`` carries none either). The ``(dist)``/``(stat)`` suffix
+        is preserved on ``new_tag`` so write_tracking_data can tell them apart at flush."""
+        family, _, name = tag.partition("/")
+        family = family.strip()
+        name = name.strip()
+        is_dist = tag.endswith("(dist)")
+        is_stat = tag.endswith("(stat)")
+        is_max = tag.endswith("(max)")
+        is_min = tag.endswith("(min)")
+        for i in range(self.num_agents):
+            env_lo, env_hi = i * epa, (i + 1) * epa
+            sl = vals[env_lo:env_hi].float()
+            ph = phase_ids[env_lo:env_hi]
+            for pid, pname in enumerate(_PHASE_NAMES):
+                mask = ph == pid
+                if not mask.any():
+                    continue
+                phase_vals = sl[mask]
+                new_tag = f"{family}_{pname}/{name}"
+                if is_dist or is_stat:
+                    self.per_agent_dist_tracking[i][new_tag].extend(phase_vals.tolist())
+                elif is_max:
+                    self.per_agent_tracking[i][new_tag].append(float(phase_vals.max().item()))
+                elif is_min:
+                    self.per_agent_tracking[i][new_tag].append(float(phase_vals.min().item()))
+                else:
+                    self.per_agent_tracking[i][new_tag].append(float(phase_vals.mean().item()))
 
     # --------------------------------------------------------------
     # Memory-tensor hook (subclass-specific)

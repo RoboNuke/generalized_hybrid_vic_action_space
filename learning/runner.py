@@ -17,6 +17,12 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DEFAULT_CONFIG_PATH = os.path.join(_PROJECT_ROOT, "configs", "exp_cfgs", "default.yaml")
 
 
+def _ckpt_step(value: str):
+    """argparse type for --checkpoint_step: the literal ``"best"`` (loads each agent's
+    ``ckpt_best.pt`` — the highest-success-rate checkpoint) or an integer step."""
+    return value if value == "best" else int(value)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="BlockSimba-SAC trainer/eval")
     parser.add_argument(
@@ -97,9 +103,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--checkpoint_step",
-        type=int,
+        type=_ckpt_step,
         default=None,
-        help="Specific step to load. If omitted, the latest ckpt found is used.",
+        help="Specific step to load, or 'best' to load each agent's ckpt_best.pt "
+             "(highest-success-rate checkpoint). If omitted, the latest ckpt found is used.",
     )
     # All of the following used to be required CLI flags. They now default to
     # None and fall back to runner_cfg in YAML when omitted. Still overridable

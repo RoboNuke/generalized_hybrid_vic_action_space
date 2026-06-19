@@ -338,6 +338,46 @@ def build_env(
         from wrappers.scorers.kp_z_align_reward import install_kp_z_align_reward
         install_kp_z_align_reward(runner_cfg.kp_z_align_a, runner_cfg.kp_z_align_b)
 
+    # Optional insertion-reward rebalancing (Forge/Factory peg insertion only): make the per-step
+    # curr_engaged / curr_success bonus scales configurable (stock 1.0 each) and optionally gate the
+    # engaged bonus on the yaw rotation check. The engaged bonus otherwise dominates the return for a
+    # tilted grasp (hover-at-the-mouth local optimum). Patches FactoryEnv._get_factory_rew_dict
+    # (composes with kp_z_align). Skipped entirely when all knobs are at their stock defaults.
+    _rew_rebalanced = (
+        runner_cfg.curr_engaged_scale != 1.0
+        or runner_cfg.curr_success_scale != 1.0
+        or runner_cfg.engage_check_yaw
+        or runner_cfg.engage_check_z_aligned
+        or runner_cfg.success_check_yaw
+        or runner_cfg.success_check_z_aligned
+        or runner_cfg.ee_success_yaw_deg is not None
+    )
+    if _rew_rebalanced:
+        if not (runner_cfg.task.startswith("Isaac-Forge-")
+                or runner_cfg.task.startswith("Isaac-Factory-")):
+            raise ValueError(
+                "runner_cfg insertion-reward knobs (curr_engaged_scale / curr_success_scale / "
+                "engage_check_yaw / engage_check_z_aligned / success_check_yaw / "
+                "success_check_z_aligned / ee_success_yaw_deg) require a Forge/Factory "
+                f"peg-insertion task (they patch FactoryEnv), but task is {runner_cfg.task!r}."
+            )
+        # ee_success_yaw is a task-cfg field (radians); set it from the degrees knob before gym.make.
+        if runner_cfg.ee_success_yaw_deg is not None and hasattr(env_cfg, "task"):
+            import math
+            env_cfg.task.ee_success_yaw = math.radians(runner_cfg.ee_success_yaw_deg)
+            print(f"[runner] env_cfg.task.ee_success_yaw = {env_cfg.task.ee_success_yaw} rad "
+                  f"({runner_cfg.ee_success_yaw_deg} deg)")
+        from wrappers.scorers.insertion_reward import install_insertion_reward
+        install_insertion_reward(
+            curr_engaged_scale=runner_cfg.curr_engaged_scale,
+            curr_success_scale=runner_cfg.curr_success_scale,
+            engage_check_yaw=runner_cfg.engage_check_yaw,
+            engage_check_z_aligned=runner_cfg.engage_check_z_aligned,
+            success_check_yaw=runner_cfg.success_check_yaw,
+            success_check_z_aligned=runner_cfg.success_check_z_aligned,
+            z_align_max_deg=runner_cfg.z_align_max_deg,
+        )
+
     # Optional rigid peg-gripper weld (Forge/Factory peg_insert only): author a per-env FixedJoint
     # so the peg is mounted to the gripper instead of held by friction. RunnerCfg already enforces
     # grasp_rot_mode=='fixed' (constant grasp); here we also require the peg_insert task and force

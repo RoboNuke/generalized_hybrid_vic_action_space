@@ -40,6 +40,18 @@ class ActorCfg:
     predictions the env will discard. ``None`` or ``[]`` disables. Must not
     overlap with ``bernoulli_action_dims``."""
 
+    scale_down_action_dims: list[int] | None = None
+    """Action dims whose final-layer MEAN weights are multiplied by ``last_layer_scale``
+    at init; every other dim keeps scale 1.0. Indices are into the full env-facing action
+    vector, exactly like ``force_zero_action_dims`` (e.g. ``[0,1,2,3,4,5]`` = the 3 position
+    + 3 orientation pose deltas).
+
+    ``None`` (default) preserves the legacy behavior of scaling EVERY policy output by
+    ``last_layer_scale``. Set this to damp only the pose deltas at init so the gain /
+    selection dims are NOT shrunk toward zero — otherwise their actions sit at the
+    zero-action midpoint and never get explored. Force-zero dims listed here are ignored
+    (they have no learnable weights). Honored by both the plain and hybrid actors."""
+
     selection_init_bias: float = 0.0
     """For HYBRID control tasks only: initial bias added to each per-axis selection
     (Bernoulli) logit, so the initial selection probability is ``sigmoid(bias)``.

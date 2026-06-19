@@ -139,6 +139,9 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
             return torch.tensor(vals, dtype=torch.float32, device=dev).unsqueeze(0)
         self._k_lo, self._k_hi = _row(cfg.gain_min), _row(cfg.gain_max)
         self._kf_lo, self._kf_hi = _row(cfg.force_gain_min), _row(cfg.force_gain_max)
+        # rot_action_bounds (rad) — scales the [-1,1] orientation action into the commanded
+        # axis-angle rotation vector; used only by _log_commanded_orientation.
+        self._rot_action_bounds_row = _row(cfg.rot_action_bounds)        # (1,3) rad
 
         # Constant-mode diagonals (used by the "constant" formulation).
         self._k_const = torch.tensor(
@@ -154,12 +157,15 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         self._viz_rotation = bool(cfg.visualize_rotation_frame)
         self._viz_peg_tip = bool(cfg.visualize_peg_tip_frame)
         self._viz_eef = bool(cfg.visualize_eef_frame)
+        self._viz_hole = bool(cfg.visualize_hole_frame)
         self._rotation_frame_scale = float(cfg.rotation_frame_axis_scale)
         self._peg_tip_frame_scale = float(cfg.peg_tip_frame_axis_scale)
         self._eef_frame_scale = float(cfg.eef_frame_axis_scale)
+        self._hole_frame_scale = float(cfg.hole_frame_axis_scale)
         self._marker_rotation = None
         self._marker_peg_tip = None
         self._marker_eef = None
+        self._marker_hole = None
         self._R_frame = None
 
         # Translational stiffness ellipsoid. Eigenvalues of the position 3x3 block of K are linearly
@@ -225,7 +231,34 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         # are set before the recorder camera renders the frame (no one-step lag).
         super()._compute_control_targets()
         self._log_rotation_frame_angle()
+        self._log_stiffness_frame_metrics()
+        self._log_commanded_orientation()
         self._update_frame_viz()
+
+    def _log_commanded_orientation(self):
+        """Log the policy's commanded orientation (deg) about roll/pitch/yaw, BOTH pre-EMA (raw
+        network output) and post-EMA (what feeds the controller this step).
+
+        The orientation action occupies pose dims 3:6 in [-1, 1]; scaling by rot_action_bounds
+        gives the commanded axis-angle rotation vector (rad) about the EEF x/y/z axes, reported
+        here in degrees. The pre-EMA slice comes from the raw action stashed by the base wrapper
+        (``_raw_action``); the post-EMA slice from ``control_actions`` (the EMA'd action actually
+        parsed into control targets). Six "(stat)" series (mean+std, no histogram). Most
+        meaningful under full_orientation_control, the only mode that consumes all three rot
+        components — it shows whether the policy is actually requesting the pitch needed to fight
+        a tilted grasp, and how much the EMA damps that request."""
+        if not hasattr(self.unwrapped, "extras"):
+            return
+        raw = getattr(self, "_raw_action", None)
+        if raw is None:
+            return
+        bounds = self._rot_action_bounds_row                            # (1,3) rad
+        raw_deg = torch.rad2deg(raw[:, 3:6] * bounds)                   # (E,3) pre-EMA command
+        ema_deg = torch.rad2deg(self.control_actions[:, 3:6] * bounds)  # (E,3) post-EMA command
+        to_log = self.unwrapped.extras["to_log"]
+        for k, axis in enumerate(("roll", "pitch", "yaw")):
+            to_log[f"RotationFrame/cmd_{axis}_raw (stat)"] = raw_deg[:, k]
+            to_log[f"RotationFrame/cmd_{axis}_ema (stat)"] = ema_deg[:, k]
 
     def _log_rotation_frame_angle(self):
         """Log the angle (deg) between the policy's rotation-frame z-axis and the peg-tip z-axis.
@@ -249,6 +282,70 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         angle_deg = torch.rad2deg(torch.acos(cos))                      # (E,)
         self.unwrapped.extras["to_log"]["RotationFrame/z_angle"] = angle_deg
 
+    def _log_stiffness_frame_metrics(self):
+        """Log gauge-invariant stiffness-vs-peg-axis metrics for the translational K_eff block.
+
+        Let ẑ be the unit peg axis (held asset local +z mapped to world via held_quat) and
+        K = K_pose[:, :3, :3] the ACTUAL applied translational stiffness — the same 3x3 block
+        the ellipsoid marker eigendecomposes. ẑ and K live in the SAME (world) frame, so every
+        quantity below is invariant to how that shared frame is oriented:
+
+          * k_axial          k∥ = ẑᵀKẑ                  stiffness presented along insertion
+          * k_lateral        k⊥ = (tr K − k∥)/2         mean of the two in-plane stiffnesses.
+                                                        Basis-free: tr K = Σ eᵢᵀKeᵢ over ANY
+                                                        orthonormal basis, so the lateral pair
+                                                        sums to tr K − k∥ regardless of how u,v
+                                                        are oriented in the plane ⊥ ẑ.
+          * anisotropy_ratio ρ = k∥/k⊥                  <1 ⇒ compliant-along / stiff-laterally
+                                                        (usual insertion compliance); >1 reverse.
+          * cross_coupling   ‖(I−ẑẑᵀ)Kẑ‖               sideways restoring force from a unit
+                                                        axial push; exactly 0 iff ẑ is a
+                                                        principal axis of K, and grows as the
+                                                        stiffness ellipsoid tilts off the peg —
+                                                        the off-diagonal expressiveness the
+                                                        peg-aligned/diagonal baselines lack.
+          * condition_number λmax/λmin                  conditioning of K (eigvalsh).
+
+        Each is published per-env under a ``(dist)`` tag, so the agent emits its mean +
+        std scalars and a histogram over each write interval (see BlockAgent). Logged for
+        ALL gain_mapping modes (baselines included) so the comparison is apples-to-apples —
+        baselines should show cross_coupling≈0 and ρ≈1. Tags carry exactly one '/'.
+        """
+        if not hasattr(self.unwrapped, "extras"):
+            return
+        env = self.unwrapped
+        K = self._K_pose[:, :3, :3]                                      # (E,3,3) world translational stiffness
+        local_z = torch.zeros((self.num_envs, 3), device=self.device)
+        local_z[:, 2] = 1.0
+        z = quat_apply(env.held_quat, local_z)                          # (E,3) unit peg axis in world
+
+        Kz = (K @ z.unsqueeze(-1)).squeeze(-1)                          # (E,3) K ẑ
+        k_axial = (z * Kz).sum(dim=1)                                   # (E,) ẑᵀKẑ
+        trace = K.diagonal(dim1=-2, dim2=-1).sum(dim=1)                 # (E,) tr K
+        k_lateral = (trace - k_axial) * 0.5                             # (E,)
+        eps = 1e-8
+        anisotropy_ratio = k_axial / k_lateral.clamp_min(eps)          # (E,) ρ
+        cross_coupling = (Kz - k_axial.unsqueeze(-1) * z).norm(dim=1)   # (E,) ‖(I−ẑẑᵀ)Kẑ‖
+        evals = torch.linalg.eigvalsh(K)                               # (E,3) ascending; K symmetric PSD
+        condition_number = evals[:, -1] / evals[:, 0].clamp_min(eps)   # (E,) λmax/λmin
+
+        to_log = self.unwrapped.extras["to_log"]
+        to_log["RotationFrame/k_axial (dist)"] = k_axial
+        to_log["RotationFrame/k_lateral (dist)"] = k_lateral
+        to_log["RotationFrame/anisotropy_ratio (dist)"] = anisotropy_ratio
+        to_log["RotationFrame/cross_coupling (dist)"] = cross_coupling
+        to_log["RotationFrame/condition_number (dist)"] = condition_number
+
+        # Angle (deg) between the peg insertion axis (held asset local +z, == ẑ above) and the
+        # socket axis (fixed asset local +z) — exactly the quantity the optional kp_z_align
+        # reward squashes toward 0, surfaced here in degrees for EVERY gain_mapping (baselines
+        # included) so orientation-alignment progress is visible even when the reward is off.
+        # The "(stat)" suffix emits mean + std scalars only (no histogram), unlike "(dist)".
+        socket_z = quat_apply(env.fixed_quat, local_z)                  # (E,3) world z of socket
+        cos_ps = (z * socket_z).sum(dim=1).clamp(-1.0, 1.0)            # ẑ, socket_z already unit-norm
+        peg_socket_angle = torch.rad2deg(torch.acos(cos_ps))           # (E,)
+        to_log["RotationFrame/peg_socket_angle (stat)"] = peg_socket_angle
+
     def _update_frame_viz(self):
         """Draw the enabled eval-recording axis frames at the peg tip / EEF.
 
@@ -256,7 +353,8 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         stiffness frame additionally requires gain_mapping="rotated" (else there's no R). All
         markers default off, so training pays nothing here.
         """
-        if not (self._viz_rotation or self._viz_peg_tip or self._viz_eef or self._viz_ellipsoid):
+        if not (self._viz_rotation or self._viz_peg_tip or self._viz_eef
+                or self._viz_hole or self._viz_ellipsoid):
             return
 
         from .frame_viz import AxisFrameMarker, EllipsoidMarker
@@ -306,6 +404,21 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
             # the actual peg-tip frame when fixed_rotation_rpy == rel_grasp_rot_init_deg).
             self._marker_eef.update(
                 env.fingertip_midpoint_pos + env_origins, env.fingertip_midpoint_quat)
+
+        if self._viz_hole:
+            if self._marker_hole is None:
+                self._marker_hole = AxisFrameMarker(
+                    "/World/Visuals/HoleFrame", self._hole_frame_scale)
+            # The socket insertion-target frame: where the held asset's geometric base must arrive for
+            # success, in the fixed asset's orientation (factory_utils.get_target_held_base_pose bakes
+            # in the task/FORGE fixed-asset offsets). fixed_pos is env-relative (like held_pos), so add
+            # env_origins; the peg-tip frame coincides with this exactly on a successful insertion.
+            from isaaclab_tasks.direct.factory import factory_utils
+            hole_pos, hole_quat = factory_utils.get_target_held_base_pose(
+                env.fixed_pos, env.fixed_quat, env.cfg_task.name,
+                env.cfg_task.fixed_asset_cfg, E, self.device,
+            )
+            self._marker_hole.update(hole_pos + env_origins, hole_quat)
 
         if self._viz_ellipsoid:
             if self._marker_ellipsoid is None:

@@ -12,6 +12,9 @@
 #   --no_eval                      Skip the post-training eval pass (still verifies checkpoints exist).
 #   --experiment_directory <dir>   Override sac_cfg.experiment.directory (the "family" subdir
 #                                  under <logdir>); lets you save runs to different places.
+#   --record                       After training (and eval), record a best-policy grid GIF for
+#                                  each agent (loads ckpt_best.pt) into <EXP_DIR>/<i>/videos/.
+#   --record_config <overlay>      Record overlay YAML. Defaults to <config_dir>/_record.yaml.
 #
 # Fail loud, fail fast: any silent miss is a bug, not an expected outcome.
 set -Eeuo pipefail
@@ -28,12 +31,18 @@ EXPERIMENT_NAME="$2"
 shift 2
 RUN_EVAL=1
 EXPERIMENT_DIRECTORY=""
+RECORD=0
+RECORD_CONFIG=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --no_eval) RUN_EVAL=0 ;;
         --experiment_directory)
             [[ $# -ge 2 ]] || { echo "[launcher] --experiment_directory requires a value" >&2; exit 2; }
             EXPERIMENT_DIRECTORY="$2"; shift ;;
+        --record) RECORD=1 ;;
+        --record_config)
+            [[ $# -ge 2 ]] || { echo "[launcher] --record_config requires a value" >&2; exit 2; }
+            RECORD_CONFIG="$2"; shift ;;
         *) echo "[launcher] unknown argument: $1" >&2; exit 2 ;;
     esac
     shift
@@ -155,4 +164,36 @@ if [[ "$RUN_EVAL" -eq 1 ]]; then
 else
     echo "[launcher] === EVAL skipped (--no_eval) ==="
     echo "[launcher] done. train=$EXP_DIR"
+fi
+
+# ===== Record (optional) =====
+# Record the BEST policy (ckpt_best.pt) of each agent to a grid GIF under
+# <EXP_DIR>/<i>/videos/. Uses learning/record.py, which merges the record overlay over the
+# per-agent snapshotted config.yaml. Recording failures are non-fatal: a missing best ckpt or a
+# camera/render issue must not fail an otherwise-good training run (the batch relies on this).
+if [[ "$RECORD" -eq 1 ]]; then
+    RECORDER="$PROJECT_ROOT/learning/record.py"
+    # Default the overlay to <config_dir>/_record.yaml when not explicitly given.
+    if [[ -z "$RECORD_CONFIG" ]]; then
+        RECORD_CONFIG="$(dirname "$CONFIG_PATH")/_record.yaml"
+    fi
+    echo "[launcher] === RECORD (best policy per agent, overlay=$RECORD_CONFIG) ==="
+    if [[ ! -f "$RECORDER" ]]; then
+        echo "[launcher] recorder not found: $RECORDER — skipping recording" >&2
+    elif [[ ! -f "$RECORD_CONFIG" ]]; then
+        echo "[launcher] record overlay not found: $RECORD_CONFIG — skipping recording" >&2
+    else
+        for i in $(seq 0 $((NUM_AGENTS - 1))); do
+            echo "[launcher]   recording agent $i (ckpt_best.pt) -> $EXP_DIR/$i/videos/"
+            rec_rc=0
+            "$PYTHON" "$RECORDER" \
+                --agent_dir "$EXP_DIR/$i" \
+                --record_config "$RECORD_CONFIG" \
+                --checkpoint_step best \
+                --headless || rec_rc=$?
+            if [[ "$rec_rc" -ne 0 ]]; then
+                echo "[launcher]   WARNING: recording agent $i failed (exit $rec_rc) — continuing" >&2
+            fi
+        done
+    fi
 fi

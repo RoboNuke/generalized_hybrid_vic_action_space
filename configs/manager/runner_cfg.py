@@ -108,6 +108,49 @@ class RunnerCfg:
     """Offset ``b`` of the ``kp_z_align`` squashing function; sets the peak height ``1/(2+b)`` at
     perfect alignment (angle = 0). Ignored when :attr:`kp_z_align_enabled` is False."""
 
+    curr_engaged_scale: float = 1.0
+    """Reward scale on the per-step ``curr_engaged`` bonus (Forge/Factory peg insertion). Stock is
+    1.0. This bonus fires every step the peg is merely NEAR the socket (``engage_threshold``, no
+    centering/rotation requirement), so for a tilted/glued grasp it can dominate the return as a
+    "hover at the mouth, jammed" local optimum. Lower it (e.g. 0.1–0.3) to stop that hovering from
+    paying. Applied by patching ``FactoryEnv`` when this or any other insertion-reward knob
+    (scales / ``*_check_yaw`` / ``*_check_z_aligned`` / ``ee_success_yaw_deg``) is off-default."""
+
+    curr_success_scale: float = 1.0
+    """Reward scale on the per-step ``curr_success`` bonus (full insertion: tight centering + near
+    full depth). Stock is 1.0, which leaves it ~200× smaller than the accumulated engaged bonus, so
+    the return is effectively blind to actual insertion. Raise it (e.g. 10–50) so inserting clearly
+    beats hovering engaged."""
+
+    engage_check_yaw: bool = False
+    """Gate the ``curr_engaged`` bonus on the EE-yaw check (``check_yaw``, formerly ``check_rot``).
+    NOTE: this only constrains END-EFFECTOR YAW (``curr_yaw < ee_success_yaw``) — NOT the peg's
+    pitch/roll tilt — and the socket is randomly yawed, so it is rarely the right lever for a
+    pitch-tilted grasp. For axis alignment use :attr:`engage_check_z_aligned`."""
+
+    engage_check_z_aligned: bool = False
+    """Gate the ``curr_engaged`` bonus on z-axis alignment: the angle between the held asset's
+    z-axis and the fixed asset's z-axis must be < :attr:`z_align_max_deg`. Makes the dominant
+    per-step engaged bonus require the peg to actually point down the socket (not just be near it),
+    so a tilted/jammed hover stops paying."""
+
+    success_check_yaw: bool = False
+    """Gate the ``curr_success`` mask (reward AND logged success rate) on the EE-yaw check. The
+    nut_thread task is always yaw-gated regardless; this adds it for peg/gear tasks."""
+
+    success_check_z_aligned: bool = False
+    """Gate the ``curr_success`` mask on z-axis alignment (< :attr:`z_align_max_deg`). Requires the
+    peg to be correctly oriented to count as a success — useful as geometries get more complex."""
+
+    z_align_max_deg: float = 15.0
+    """Max angle (DEGREES) between the held and fixed asset z-axes for the ``check_z_aligned`` gate
+    to pass. Shared by the engaged and success z-alignment gates. Only used when one is enabled."""
+
+    ee_success_yaw_deg: float | None = None
+    """Yaw threshold (DEGREES) for the ``check_yaw`` gate, written to ``env_cfg.task.ee_success_yaw``
+    (radians) before ``gym.make``. ``None`` keeps the task default (0.0). Only meaningful when a
+    ``check_yaw`` gate is active (e.g. :attr:`engage_check_yaw`, or the nut_thread success check)."""
+
     num_envs: int
     """Envs PER agent. Total Isaac envs = ``num_envs * num_agents``."""
 

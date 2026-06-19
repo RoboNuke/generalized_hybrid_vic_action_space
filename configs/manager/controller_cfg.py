@@ -118,6 +118,11 @@ class ControlCfg(ForgeCtrlCfg):
     # exactly fixed_rotation_rpy away from it.
     visualize_eef_frame: bool = False
     eef_frame_axis_scale: float = 0.06
+    # hole frame (the socket insertion-target frame), drawn at the fixed asset. This is the pose
+    # the peg-tip frame must reach for success (factory_utils.get_target_held_base_pose, which bakes
+    # in the task/FORGE fixed-asset offsets), so the peg-tip and hole frames coincide on insertion.
+    visualize_hole_frame: bool = False
+    hole_frame_axis_scale: float = 0.05
     # Translational stiffness ellipsoid (the position 3x3 block of K), drawn at the peg tip. Its
     # principal axes/magnitudes come from an eigendecomposition of the ACTUAL applied K_pos, so it
     # is correct for every gain_mapping (including cholesky coupling, which no single frame shows).

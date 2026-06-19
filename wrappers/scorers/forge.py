@@ -48,6 +48,13 @@ class ForgeWrapper(RewardDecompositionWrapper):
         # geometric engagement indicator — peg close to socket). Read from the
         # rew_dict; mirrors curr_successes for the engagement-rate metric.
         self._latest_curr_engaged: torch.Tensor | None = None
+        # Pre-reset snapshot of the env's `ep_succeeded` latch (1 if the episode
+        # reached the instantaneous success state on AT LEAST ONE step). Captured
+        # in the hook AFTER the upstream log updates the latch but BEFORE Isaac
+        # Lab's in-step `_reset_idx` zeros it for terminating envs — same reason
+        # `_latest_curr_successes` is captured pre-reset. Drives the
+        # Episode / Ever success rate metric.
+        self._latest_ep_succeeded: torch.Tensor | None = None
         # Latest per-env unscaled rew_dict (per-step). Combined across both the
         # factory and forge log hooks for per-agent logs_rew/<term> metrics.
         self._latest_rew_dict: dict[str, torch.Tensor] = {}
@@ -83,7 +90,12 @@ class ForgeWrapper(RewardDecompositionWrapper):
                 if isinstance(val, torch.Tensor) and val.dim() > 0 and val.shape[0] == num_envs:
                     self._latest_rew_dict[term] = val.clone()
             self._accumulate_per_env_term(rew_dict, self._factory_scales())
-            return original_factory_log(rew_dict, curr_successes)
+            out = original_factory_log(rew_dict, curr_successes)
+            # original_factory_log has now latched first-successes into
+            # ep_succeeded for this step (incl. the terminal step). Snapshot it
+            # before the post-_get_rewards reset clears it for done envs.
+            self._latest_ep_succeeded = self._unwrapped.ep_succeeded.bool().clone()
+            return out
 
         unwrapped._log_factory_metrics = hooked_factory_log
 
@@ -192,6 +204,10 @@ class ForgeWrapper(RewardDecompositionWrapper):
             info["per_env_curr_successes"] = self._latest_curr_successes
         if self._latest_curr_engaged is not None:
             info["per_env_curr_engaged"] = self._latest_curr_engaged
+        # Pre-reset "ever succeeded this episode" latch (see _latest_ep_succeeded).
+        # Drives Episode / Ever success rate vs. the terminal-step Success rate.
+        if self._latest_ep_succeeded is not None:
+            info["per_env_ever_success"] = self._latest_ep_succeeded
         info["per_env_ep_success_times"] = self._unwrapped.ep_success_times.clone()
         # Forge-specific: per-threshold first-prediction-success step.
         first_pred = getattr(self._unwrapped, "first_pred_success_tx", None)

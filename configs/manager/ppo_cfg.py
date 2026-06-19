@@ -110,6 +110,19 @@ class PPO_CFG(AgentCfg):
     gripper_action_idx: int | None = None
     """Index of a binary gripper action dim, if any. Parity with SAC's Gripper/ tab."""
 
+    phase_split_families: list[str] = dataclasses.field(default_factory=list)
+    """Per-env metric families to split by insertion phase (free_space / search /
+    insertion) in the per-agent TensorBoard logs. Each entry is a ``{family}`` — the
+    text before the single ``/`` in a per-env ``to_log`` tag (e.g. ``"energy_metrics"``
+    for ``energy_metrics/avg_force``). For every listed family, each of its tags is
+    re-emitted as ``{family}_{phase}/{metric_name}`` (e.g. ``energy_metrics_search/
+    avg_force``), reduced over only the envs in that phase each step (same
+    max/min/mean/dist convention as the un-split tag), and the un-split tag is NOT
+    logged. Phase per env: free_space = no contact and not engaged, search = in contact
+    but not engaged, insertion = engaged (contact irrelevant). Requires the
+    contact-sensor and Forge/Factory scorer wrappers (they publish the contact +
+    engagement signals); listing a family without them raises. Empty list disables it."""
+
     # ---- Reward shaping (YAML can't carry callables) ----
     rewards_shaper: Callable | None = None
     """Reward shaping function. Set ``rewards_shaper_scale`` instead from YAML; the
@@ -122,6 +135,12 @@ class PPO_CFG(AgentCfg):
     # ---- Performance / recording ----
     mixed_precision: bool = False
     """Enable automatic mixed precision."""
+
+    log_histograms: bool = True
+    """Whether to write TensorBoard histograms for ``(dist)`` metrics. When False, ``(dist)``
+    tags still emit their mean + std scalars — only the (memory-heavy) per-interval histogram is
+    skipped, and the separate per-agent image SummaryWriters stay idle. Set False to cut host-RAM
+    / disk pressure from histogram event buffering on long runs."""
 
     recorder: RecorderCfg = dataclasses.field(default_factory=RecorderCfg)
     """Optional rollout recorder (shared with SAC). NOTE: the RecordingWrapper

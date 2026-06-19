@@ -18,10 +18,11 @@ runner_cfg:
   agent_type: sac                   # "sac" (default) or "ppo"; selects sac_cfg vs ppo_cfg
   num_envs: 256
   num_agents: 3
-  total_timesteps: 15_000
+  total_timesteps: 10_000
   eval_timesteps: 150
   memory_size: 2_000_000
   seed: -1
+  glue_peg_to_gripper: true              # rigidly weld peg to gripper (constant fixed grasp)
   grasp_rot_mode: fixed                 # none | random | fixed. how the peg is grasped relative
                                           # to the gripper: none => perfectly aligned (upstream);
                                           # random => RANDOM roll/pitch/yaw tilt re-sampled each
@@ -53,13 +54,14 @@ sac_cfg:
   learning_starts: 300
   learn_entropy: true
   initial_entropy_value: 1.0e-2
-  target_entropy: -10.0            # PLACEHOLDER (action dim varies with gain_mapping); re-tune later
+  target_entropy: -6.5            # = -|continuous|/2 = -13/2 (7 base + 6 cholesky gains (3-DOF pos block))
   grad_norm_clip: 0.0
   mixed_precision: false
   observation_preprocessor: RunningStandardScaler
   observation_preprocessor_kwargs: {}
   rewards_shaper_scale: null
   gripper_action_idx: null
+  phase_split_families: [RotationFrame, Impedance_Stiffness]
   recorder:
     enabled: false
   experiment:
@@ -83,6 +85,7 @@ model_cfg:
     use_state_dependent_std: false
     bernoulli_action_dims: null
     force_zero_action_dims: null #[3, 4]   # Forge zeros pose Rx,Ry; sel/force/gain dims appended after
+    scale_down_action_dims: [0, 1, 2, 3, 4, 5]   # apply last_layer_scale to ONLY the 6 pose deltas (3 pos + 3 orient); gain/selection dims stay unshrunk so they explore
   critic:
     critic_output_init_mean: 0.0 #50 before
     critic_n: 4
@@ -107,6 +110,7 @@ controller_cfg:
   # "rotated"           : diagonal K (6) + 6-D rotation vector (6) = 12 dims; R applied as
   #                       blkdiag(R,R) to the full 6x6.
   gain_mapping: cholesky #"constant" #
+  #fixed_rotation_rpy: [0.0, 30.0, 0.0]   # stiffness-frame R; aligned to the 30deg grasp tilt (used only when gain_mapping=rotated)
 
   # Toggle force control. When false: NO selection/force-target dims, K_f = zeros, and
   # force_axes MUST be all-zero. When true: force_axes selects eligible axes (adds 2*N dims)

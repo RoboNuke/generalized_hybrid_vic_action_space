@@ -5,9 +5,14 @@
 #   exp_file_launcher.bash <config_folder> [extra args passed through to sac_block_e2e.sh ...]
 #
 # For each *.yaml file directly inside <config_folder> it calls:
-#   bash launchers/sac_block_e2e.sh <config_path> <exp_name> [extra args...]
+#   bash launchers/sac_block_e2e.sh <config_path> <exp_name> --record [extra args...]
 # where <exp_name> is the config filename with the .yaml suffix and the folder
 # path stripped (e.g. configs/exp_cfgs/sac_PiH/VIC.yaml -> VIC).
+#
+# --record is passed so each run, after training (and eval), records a best-policy
+# (ckpt_best.pt) grid GIF per agent into <EXP_DIR>/<i>/videos/, using <config_folder>/_record.yaml
+# as the recorder overlay. Underscore-prefixed configs (e.g. _record.yaml) are NOT trained —
+# they are overlays, so they are skipped when collecting configs.
 #
 # Runs sequentially, one at a time. If any single run errors out, it is logged
 # and the launcher continues to the next config rather than aborting the batch.
@@ -38,8 +43,20 @@ PER_RUN_LAUNCHER="$SCRIPT_DIR/sac_block_e2e.sh"
 shopt -s nullglob
 CONFIGS=("$CONFIG_FOLDER"/*.yaml)
 shopt -u nullglob
+# Drop overlay/helper configs (underscore-prefixed, e.g. _record.yaml): they are recorder/eval
+# overlays merged onto a base config, not standalone training configs.
+FILTERED=()
+for c in "${CONFIGS[@]}"; do
+    b="$(basename -- "$c")"
+    if [[ "$b" == _* ]]; then
+        echo "[batch] skipping overlay config (underscore-prefixed): $b"
+        continue
+    fi
+    FILTERED+=("$c")
+done
+CONFIGS=("${FILTERED[@]}")
 if [[ ${#CONFIGS[@]} -eq 0 ]]; then
-    echo "[batch] no *.yaml files found in $CONFIG_FOLDER" >&2
+    echo "[batch] no trainable *.yaml files found in $CONFIG_FOLDER" >&2
     exit 1
 fi
 IFS=$'\n' CONFIGS=($(sort <<<"${CONFIGS[*]}")); unset IFS
@@ -59,7 +76,9 @@ for config_path in "${CONFIGS[@]}"; do
     echo "[batch] ===================================================================="
 
     rc=0
-    bash "$PER_RUN_LAUNCHER" "$config_path" "$exp_name" "${EXTRA_ARGS[@]}" || rc=$?
+    # --record: after training+eval, record each agent's best policy (ckpt_best.pt) to a GIF.
+    # The per-run launcher defaults the record overlay to <config_dir>/_record.yaml.
+    bash "$PER_RUN_LAUNCHER" "$config_path" "$exp_name" --record "${EXTRA_ARGS[@]}" || rc=$?
 
     if [[ "$rc" -eq 0 ]]; then
         echo "[batch] OK: $exp_name"
