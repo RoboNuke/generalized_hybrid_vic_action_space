@@ -151,6 +151,26 @@ class RunnerCfg:
     (radians) before ``gym.make``. ``None`` keeps the task default (0.0). Only meaningful when a
     ``check_yaw`` gate is active (e.g. :attr:`engage_check_yaw`, or the nut_thread success check)."""
 
+    disable_success_pred: bool = False
+    """Turn off the base Forge env's success-prediction head end to end (Isaac-Forge- tasks only).
+    Forge's 7th action (``actions[:, 6]``) is a learned success predictor: it feeds the
+    ``success_pred_error`` reward term and the ``early_term_*`` prediction-quality metrics, but never
+    drives the controller. When ``True`` this single switch disables the whole mechanism:
+
+    - **Reward off** — ``env_cfg.task.delay_until_ratio`` is forced to ``1.1`` (build_env), which
+      ``true_successes.mean()`` can never reach, so the env's ``success_pred_scale`` stays ``0`` and
+      ``success_pred_error`` contributes nothing to the return.
+    - **Action force-zeroed** — index 6 is appended to the actor's ``force_zero_action_dims`` (runner),
+      so the policy allocates no parameters to the inert head (output pinned to ``0`` ->
+      ``policy_success_pred = 0.5``). NOTE: this changes the continuous action count, so re-tune
+      ``target_entropy`` (it is a placeholder anyway).
+    - **Metrics withheld** — :class:`~wrappers.scorers.forge.ForgeWrapper` stops publishing
+      ``logs_rew/success_pred_error``, ``Episode_Reward/success_pred_error`` and the per-threshold
+      ``early_term_*`` series.
+
+    ``False`` (default) keeps the upstream Forge behavior. Requires an ``Isaac-Forge-`` task (the head
+    is Forge-specific); a hard error otherwise."""
+
     num_envs: int
     """Envs PER agent. Total Isaac envs = ``num_envs * num_agents``."""
 

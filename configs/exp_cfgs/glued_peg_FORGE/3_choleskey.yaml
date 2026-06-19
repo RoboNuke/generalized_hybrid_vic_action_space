@@ -15,6 +15,10 @@
 
 runner_cfg:
   task: Isaac-Forge-PegInsert-Direct-v0
+  disable_success_pred: true              # turn OFF Forge's success-prediction head: forces
+                                          # task.delay_until_ratio=1.1 (success_pred reward off),
+                                          # force-zeros action dim 6, and withholds the
+                                          # success_pred_error / early_term_* metrics. false = restore.
   kp_z_align_enabled: false               # add the kp_z_align orientation reward (aligns peg z-axis
                                           # with socket z-axis; rewards the DOF the 30deg tilted grasp fights)
   kp_z_align_a: 4.0                     # squashing steepness a (default)
@@ -65,7 +69,6 @@ runner_cfg:
   env_cfg_overrides:
     task.num_keypoints: 4        # default 4
     task.keypoint_scale: 0.32   # default 0.15 m (0.05 for nut thread) 0.32
-    task.delay_until_ratio: 1.1
 
 loss_cfg:
   supervised_selection_enabled: false
@@ -84,7 +87,7 @@ sac_cfg:
   random_timesteps: 0
   learning_starts: 300
   learn_entropy: true
-  initial_entropy_value: 0.2
+  initial_entropy_value: 1.0e-2
   target_entropy: -14            # = -|continuous|/2 = -28/2 (7 base + 21 cholesky gains (full 6-DOF))
   grad_norm_clip: 0.0
   mixed_precision: false
@@ -116,7 +119,7 @@ model_cfg:
     reduction: sum
     use_state_dependent_std: false
     bernoulli_action_dims: null
-    force_zero_action_dims: [6] #[3, 4]   # Forge zeros pose Rx,Ry; sel/force/gain dims appended after
+    force_zero_action_dims: null   # dim 6 (success-pred) force-zeroed by runner_cfg.disable_success_pred; full_orientation_control keeps Rx/Ry learnable
     scale_down_action_dims: [0, 1, 2, 3, 4, 5]   # apply last_layer_scale to ONLY the 6 pose deltas (3 pos + 3 orient); gain/selection dims stay unshrunk so they explore
   critic:
     critic_output_init_mean: 0.0 #50 before

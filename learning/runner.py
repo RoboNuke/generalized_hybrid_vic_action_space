@@ -324,6 +324,21 @@ def main(argv: list[str] | None = None) -> None:
     actor_kwargs = dataclasses.asdict(model_cfg.actor)
     critic_kwargs = dataclasses.asdict(model_cfg.critic)
 
+    # disable_success_pred force-zeros the Forge success-prediction action (dim 6) so the actor
+    # allocates no parameters to the inert head. build_env() has already validated the flag is
+    # Forge-only (7-dim base action, index 6 = success prediction; survives the control-wrapper
+    # action-space expansion since the base slice [:7] is passed through unchanged). Merge with
+    # any user-specified force-zero list.
+    if runner_cfg.disable_success_pred:
+        _fz = list(actor_kwargs.get("force_zero_action_dims") or [])
+        if 6 not in _fz:
+            _fz.append(6)
+        actor_kwargs["force_zero_action_dims"] = sorted(set(_fz))
+        print(
+            f"[runner] disable_success_pred: force_zero_action_dims -> "
+            f"{actor_kwargs['force_zero_action_dims']} (index 6 = success prediction)"
+        )
+
     # selection_distribution / selection_init_bias apply only to the hybrid actor;
     # pop them so they never reach the plain BlockSimBaActor (which doesn't accept them).
     selection_distribution = actor_kwargs.pop("selection_distribution", "product")

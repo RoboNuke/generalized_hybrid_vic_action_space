@@ -118,6 +118,26 @@ def build_env(
     # while env_cfg_overrides owns everything else.
     _apply_env_cfg_overrides(env_cfg, runner_cfg.env_cfg_overrides)
 
+    # Success-prediction disable switch (Isaac-Forge- only). One flag turns the base Forge
+    # env's success-prediction head fully inert: here we push delay_until_ratio above 1.0 so
+    # the env's success_pred_scale never ramps off zero (the success_pred_error reward stays
+    # 0). The runner force-zeros the actor's success-pred action (dim 6) and ForgeWrapper
+    # withholds the success_pred_error / early_term_* metrics. Applied AFTER user overrides so
+    # the switch is authoritative over any conflicting task.delay_until_ratio override.
+    if runner_cfg.disable_success_pred:
+        if not runner_cfg.task.startswith("Isaac-Forge-"):
+            raise ValueError(
+                "runner_cfg.disable_success_pred=True requires an Isaac-Forge- task (the "
+                "success-prediction head is Forge-specific), but task is "
+                f"{runner_cfg.task!r}."
+            )
+        _old_ratio = getattr(env_cfg.task, "delay_until_ratio", None)
+        env_cfg.task.delay_until_ratio = 1.1
+        print(
+            f"[runner] disable_success_pred: env_cfg.task.delay_until_ratio "
+            f"{_old_ratio} -> 1.1 (success_pred_scale stays 0; success_pred reward off)."
+        )
+
     # Fragile peg / efficient reset (Forge/Factory/AutoMate peg insertion only). The
     # threshold-force cap runs AFTER user overrides so break_force is the hard ceiling on the
     # FORGE contact-penalty threshold range, regardless of any user-set range.
@@ -519,7 +539,12 @@ def build_env(
     # of `Reward / Total reward (mean)`). Direct-API envs without a reward_manager
     # fall through gracefully — the hook is a no-op.
     selected_wrapper = default_wrapper_for_task(runner_cfg.task) or fallback_wrapper_name()
-    env = make_wrapper(selected_wrapper, env)
+    # disable_success_pred (validated Forge-only above) tells the Forge scorer to withhold the
+    # success_pred_error / early_term_* metrics. Only the "forge" wrapper accepts this kwarg.
+    _wrap_kwargs = {}
+    if selected_wrapper == "forge" and runner_cfg.disable_success_pred:
+        _wrap_kwargs["suppress_success_pred"] = True
+    env = make_wrapper(selected_wrapper, env, **_wrap_kwargs)
 
     # Contact-state input append (optional): grow obs/state spaces with the per-axis
     # contact bool so the policy/critic can condition on it. MUST wrap before the spaces

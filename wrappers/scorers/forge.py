@@ -36,8 +36,18 @@ from wrappers.scorers.reward_decomposition import RewardDecompositionWrapper
 class ForgeWrapper(RewardDecompositionWrapper):
     """Per-env reward decomposition + per-step success flag for Forge tasks."""
 
-    def __init__(self, env: Any) -> None:
+    def __init__(self, env: Any, suppress_success_pred: bool = False) -> None:
         super().__init__(env)
+        # When True (driven by the runner's `disable_success_pred` switch), withhold the
+        # Forge success-prediction metrics: the `success_pred_error` reward term is dropped
+        # from per-agent `logs_rew/` and `Episode_Reward/` logging, and the per-threshold
+        # `early_term_*` quality series are not published. Pairs with delay_until_ratio=1.1
+        # (reward off) and force-zeroed action dim 6, both set by the runner.
+        self._suppress_success_pred = bool(suppress_success_pred)
+        # Reward terms withheld from every per-agent reward-logging path when suppressed.
+        self._suppressed_terms: set[str] = (
+            {"success_pred_error"} if self._suppress_success_pred else set()
+        )
         # Per-env per-term running episode sums (in scaled units, same as the
         # env-returned reward). Lazily populated when the first reward log fires.
         self._episode_sums: dict[str, torch.Tensor] = {}
@@ -108,6 +118,8 @@ class ForgeWrapper(RewardDecompositionWrapper):
             # sees splittable values.
             num_envs = self._unwrapped.num_envs
             for term, val in rew_dict.items():
+                if term in self._suppressed_terms:
+                    continue
                 if isinstance(val, torch.Tensor) and val.dim() > 0 and val.shape[0] == num_envs:
                     self._latest_rew_dict[term] = val.clone()
             self._accumulate_per_env_term(rew_dict, self._forge_scales())
@@ -163,6 +175,10 @@ class ForgeWrapper(RewardDecompositionWrapper):
         device = self._unwrapped.device
         num_envs = self._unwrapped.num_envs
         for term, val in rew_dict.items():
+            # Suppressed terms (e.g. success_pred_error) get no episode sum, so they never
+            # surface in per_env_rew -> Episode_Reward/<term>.
+            if term in self._suppressed_terms:
+                continue
             if not isinstance(val, torch.Tensor):
                 continue
             # rew_dict values can be (num_envs,) or (num_envs, ...) — collapse to (num_envs,)
@@ -209,9 +225,10 @@ class ForgeWrapper(RewardDecompositionWrapper):
         if self._latest_ep_succeeded is not None:
             info["per_env_ever_success"] = self._latest_ep_succeeded
         info["per_env_ep_success_times"] = self._unwrapped.ep_success_times.clone()
-        # Forge-specific: per-threshold first-prediction-success step.
+        # Forge-specific: per-threshold first-prediction-success step. Withheld when
+        # success-prediction is disabled, so block_agent emits no early_term_* series.
         first_pred = getattr(self._unwrapped, "first_pred_success_tx", None)
-        if first_pred is not None:
+        if first_pred is not None and not self._suppress_success_pred:
             info["per_env_first_pred_success_tx"] = {
                 thresh: tx.clone() for thresh, tx in first_pred.items()
             }
