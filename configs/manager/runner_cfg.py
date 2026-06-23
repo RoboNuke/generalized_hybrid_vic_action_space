@@ -122,6 +122,22 @@ class RunnerCfg:
     the return is effectively blind to actual insertion. Raise it (e.g. 10–50) so inserting clearly
     beats hovering engaged."""
 
+    kp_baseline_scale: float = 1.0
+    """Multiplicative weight on the ``kp_baseline`` keypoint reward (stock 1.0). ``kp_baseline`` uses
+    a broad squashing (``keypoint_coef_baseline`` ``a=5``), so it is nearly insensitive to widening
+    ``keypoint_scale`` — when the keypoint spacing was increased, baseline kept its magnitude while
+    coarse/fine shrank, so baseline now dominates the return ("near the hole" pays almost as well as
+    inserting). Lower this (e.g. 0.2–0.5) to restore the baseline:coarse:fine balance. Applied by the
+    insertion-reward patch (off-default value triggers it)."""
+
+    kp_coarse_scale: float = 1.0
+    """Multiplicative weight on the ``kp_coarse`` keypoint reward (stock 1.0; ``a=50``)."""
+
+    kp_fine_scale: float = 1.0
+    """Multiplicative weight on the ``kp_fine`` keypoint reward (stock 1.0; ``a=100``). The
+    last-inch/insertion term — most suppressed by a wide ``keypoint_scale``; raise to re-emphasize
+    final insertion."""
+
     engage_check_yaw: bool = False
     """Gate the ``curr_engaged`` bonus on the EE-yaw check (``check_yaw``, formerly ``check_rot``).
     NOTE: this only constrains END-EFFECTOR YAW (``curr_yaw < ee_success_yaw``) — NOT the peg's

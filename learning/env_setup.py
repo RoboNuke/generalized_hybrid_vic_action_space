@@ -366,6 +366,9 @@ def build_env(
     _rew_rebalanced = (
         runner_cfg.curr_engaged_scale != 1.0
         or runner_cfg.curr_success_scale != 1.0
+        or runner_cfg.kp_baseline_scale != 1.0
+        or runner_cfg.kp_coarse_scale != 1.0
+        or runner_cfg.kp_fine_scale != 1.0
         or runner_cfg.engage_check_yaw
         or runner_cfg.engage_check_z_aligned
         or runner_cfg.success_check_yaw
@@ -377,6 +380,7 @@ def build_env(
                 or runner_cfg.task.startswith("Isaac-Factory-")):
             raise ValueError(
                 "runner_cfg insertion-reward knobs (curr_engaged_scale / curr_success_scale / "
+                "kp_baseline_scale / kp_coarse_scale / kp_fine_scale / "
                 "engage_check_yaw / engage_check_z_aligned / success_check_yaw / "
                 "success_check_z_aligned / ee_success_yaw_deg) require a Forge/Factory "
                 f"peg-insertion task (they patch FactoryEnv), but task is {runner_cfg.task!r}."
@@ -391,6 +395,9 @@ def build_env(
         install_insertion_reward(
             curr_engaged_scale=runner_cfg.curr_engaged_scale,
             curr_success_scale=runner_cfg.curr_success_scale,
+            kp_baseline_scale=runner_cfg.kp_baseline_scale,
+            kp_coarse_scale=runner_cfg.kp_coarse_scale,
+            kp_fine_scale=runner_cfg.kp_fine_scale,
             engage_check_yaw=runner_cfg.engage_check_yaw,
             engage_check_z_aligned=runner_cfg.engage_check_z_aligned,
             success_check_yaw=runner_cfg.success_check_yaw,

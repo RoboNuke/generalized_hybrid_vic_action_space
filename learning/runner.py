@@ -9,6 +9,18 @@ import argparse
 import os
 import sys
 
+# Pre-initialize torch._dynamo single-threaded, BEFORE isaaclab/Omniverse boot any worker
+# threads. torch 2.8 wraps Optimizer.add_param_group with a dynamo-disable decorator that does a
+# LAZY `import torch._dynamo` on the first optimizer construction (our entropy_optimizer in
+# SAC.__init__). If that lazy import races a concurrent torch touch from an Omniverse thread, it
+# returns a half-initialized module and crashes with "partially initialized module 'torch._dynamo'
+# has no attribute 'external_utils' (circular import)". Importing it here completes its __init__
+# cleanly up front so the later lazy import just returns the finished module. We never use
+# torch.compile, so this is purely defensive. (Belt-and-suspenders: sac_block_e2e.sh also exports
+# TORCHDYNAMO_DISABLE=1.)
+import torch  # noqa: F401
+import torch._dynamo  # noqa: F401
+
 from isaaclab.app import AppLauncher
 
 # Project root (parent of learning/) — used to anchor the default --config path so
@@ -263,6 +275,14 @@ def main(argv: list[str] | None = None) -> None:
     # YAML-friendly reward shaping: rewards_shaper_scale (float) -> multiplicative lambda.
     # Mirrors skrl runner's convention. Direct assignment of rewards_shaper still wins
     # if a programmatic caller set it before this point.
+    #
+    # A config reloaded from a dumped config.yaml (e.g. record mode loading
+    # <agent_dir>/config.yaml) carries rewards_shaper back as a lossy repr string
+    # (e.g. "__main__.main.<locals>.<lambda>") rather than a real callable, alongside
+    # the original rewards_shaper_scale. Treat that string as unset so it gets rebuilt
+    # from the scale below instead of tripping the mutual-exclusion check.
+    if isinstance(active_cfg.rewards_shaper, str):
+        active_cfg.rewards_shaper = None
     if active_cfg.rewards_shaper is None and active_cfg.rewards_shaper_scale is not None:
         scale = float(active_cfg.rewards_shaper_scale)
         active_cfg.rewards_shaper = lambda rewards, *args, **kwargs: rewards * scale
@@ -613,6 +633,16 @@ def main(argv: list[str] | None = None) -> None:
                 num_trajectories=int(n_traj),
                 output_dir=out_dir,
             )
+            # Validate the soft contract: a non-raising return must have actually
+            # written a non-empty video file. collect_and_record can return a path
+            # without a usable file on disk (silent write failure, degenerate
+            # collection). Raise here so the except below sets rc=1 -> os._exit(1)
+            # and the batch launcher marks this agent FAIL instead of OK.
+            if not gif_path or not os.path.isfile(gif_path) or os.path.getsize(gif_path) == 0:
+                raise RuntimeError(
+                    f"recording produced no valid output file (got {gif_path!r}); "
+                    "treating as failure"
+                )
             print(f"[record] DONE -> {gif_path}", flush=True)
         except BaseException as e:  # noqa: BLE001 - flush before Isaac teardown
             import traceback

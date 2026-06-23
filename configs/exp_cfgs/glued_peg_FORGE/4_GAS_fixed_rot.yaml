@@ -40,10 +40,10 @@ runner_cfg:
   agent_type: sac                   # "sac" (default) or "ppo"; selects sac_cfg vs ppo_cfg
   num_envs: 256
   num_agents: 3
-  total_timesteps: 10_051
+  total_timesteps: 20_100
   eval_timesteps: 150
   glue_peg_to_gripper: true
-  memory_size: 2_000_000
+  memory_size: 1_000_000
   seed: -1
   grasp_rot_mode: fixed                 # none | random | fixed. how the peg is grasped relative
                                           # to the gripper: none => perfectly aligned (upstream);
@@ -69,6 +69,11 @@ runner_cfg:
   env_cfg_overrides:
     task.num_keypoints: 4        # default 4
     task.keypoint_scale: 0.32   # default 0.15 m (0.05 for nut thread) 0.32
+    task.contact_penalty_scale: 0.0       # was 0.2 (peg-insert default): zero the contact penalty
+                                          #   so early training isn't pushed into a hover-above-the-hole optimum
+    task.action_penalty_ee_scale: 0.0     # Forge default (EE action penalty)
+    task.action_penalty_asset_scale: 0.001  # Forge default (asset action penalty)
+    task.action_grad_penalty_scale: 0.1   # Forge default (action-grad penalty)
 
 loss_cfg:
   supervised_selection_enabled: false
@@ -82,19 +87,18 @@ sac_cfg:
   polyak: 0.005
   actor_lr: 1.0e-4
   critic_lr: 1.0e-4
-  entropy_lr: 1.0e-4
+  entropy_lr: 1.0e-5
   weight_decay: 1.0e-2
   random_timesteps: 0
   learning_starts: 300
   learn_entropy: true
-  initial_entropy_value: 1.0e-2
+  initial_entropy_value: 0.05
   target_entropy: -5            # = -|continuous|/2 = -10/2 (7 base + 3 rotated diag gains (fixed R, 3-DOF))
-  grad_norm_clip: 0.0
+  grad_norm_clip: 1.0
   mixed_precision: false
-  log_histograms: false          # disable TB histograms (host-RAM leak mitigation; mean/std still logged)
   observation_preprocessor: RunningStandardScaler
   observation_preprocessor_kwargs: {}
-  rewards_shaper_scale: null
+  rewards_shaper_scale: 0.1
   gripper_action_idx: null
   phase_split_families: [RotationFrame, Impedance_Stiffness]
   recorder:
@@ -120,7 +124,7 @@ model_cfg:
     use_state_dependent_std: false
     bernoulli_action_dims: null
     force_zero_action_dims: null   # dim 6 (success-pred) force-zeroed by runner_cfg.disable_success_pred; full_orientation_control keeps Rx/Ry learnable
-    scale_down_action_dims: [0, 1, 2, 3, 4, 5]   # apply last_layer_scale to ONLY the 6 pose deltas (3 pos + 3 orient); gain/selection dims stay unshrunk so they explore
+    scale_down_action_dims: [0, 1, 2]   # apply last_layer_scale to ONLY the 6 pose deltas (3 pos + 3 orient); gain/selection dims stay unshrunk so they explore
   critic:
     critic_output_init_mean: 0.0 #50 before
     critic_n: 4

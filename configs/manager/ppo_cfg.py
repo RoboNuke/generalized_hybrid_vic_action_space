@@ -136,12 +136,6 @@ class PPO_CFG(AgentCfg):
     mixed_precision: bool = False
     """Enable automatic mixed precision."""
 
-    log_histograms: bool = True
-    """Whether to write TensorBoard histograms for ``(dist)`` metrics. When False, ``(dist)``
-    tags still emit their mean + std scalars — only the (memory-heavy) per-interval histogram is
-    skipped, and the separate per-agent image SummaryWriters stay idle. Set False to cut host-RAM
-    / disk pressure from histogram event buffering on long runs."""
-
     recorder: RecorderCfg = dataclasses.field(default_factory=RecorderCfg)
     """Optional rollout recorder (shared with SAC). NOTE: the RecordingWrapper
     overlays Q-values from SAC's twin critics, which PPO lacks; the runner raises

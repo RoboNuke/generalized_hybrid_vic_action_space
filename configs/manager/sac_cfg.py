@@ -207,12 +207,6 @@ class SAC_CFG(AgentCfg):
     mixed_precision: bool = False
     """Whether to enable automatic mixed precision for higher performance."""
 
-    log_histograms: bool = True
-    """Whether to write TensorBoard histograms for ``(dist)`` metrics. When False, ``(dist)``
-    tags still emit their mean + std scalars — only the (memory-heavy) per-interval histogram is
-    skipped, and the separate per-agent image SummaryWriters stay idle. Set False to cut host-RAM
-    / disk pressure from histogram event buffering on long runs."""
-
     recorder: RecorderCfg = dataclasses.field(default_factory=RecorderCfg)
     """Configures the optional ``RecordingWrapper`` (3x4-grid GIFs + TB videos).
     Default is disabled. See :class:`RecorderCfg` and ``wrappers/recording.py``."""

@@ -94,14 +94,26 @@ class BlockAgent(Agent):
         # image events. skrl's SummaryWriter (used for scalars) doesn't
         # implement add_image; both writers point at the same log dir so TB
         # picks up both event streams together.
+        # Kept as an (always-empty) list: the record path defensively reads
+        # ``per_agent_image_writers[0] if ... else None``. We no longer create image
+        # SummaryWriters (histograms were removed), so the recorder gets None and writes
+        # its GIF to disk only — exactly the record-mode behavior (write_interval=0).
         self.per_agent_image_writers: list = []
         self.per_agent_tracking: list[collections.defaultdict] = []
-        # Per-agent RAW per-env sample buffers for "(dist)" metrics, accumulated over the
-        # write interval and emitted as mean+std scalars plus a histogram (see
-        # write_tracking_data). Kept separate from per_agent_tracking because these retain raw
-        # per-env values (not the env-mean), so the std/histogram reflect the true spatial
-        # + temporal distribution over the interval rather than a distribution of env-means.
-        self.per_agent_dist_tracking: list[collections.defaultdict] = []
+        # Per-agent GPU running sufficient statistics for "(dist)"/"(stat)" metrics: one
+        # {count, sum, sumsq} accumulator (float64 device scalars) per tag, created once and
+        # reused (zeroed in write_tracking_data). The per-env samples are reduced on-device each
+        # step — NO per-step GPU->CPU copy and NO Python-object churn (the old per-step
+        # ``.tolist()`` into Python lists fragmented host RAM). Flush emits mean + std.
+        self.per_agent_dist_stats: list[dict] = []
+        # Per-agent GPU running (count, sum, min, max) for the per-step / per-grad-step
+        # SCALAR metrics that used to be appended to ``per_agent_tracking`` as Python floats
+        # via ``float(x.item())`` (track_per_agent, logs_rew, per_env_to_log scalar reductions,
+        # phase-split). Each ``.item()`` was a GPU->CPU sync barrier fired dozens of times per
+        # step; folding the already-reduced scalar on-device removes ALL per-step syncs and the
+        # Python-list churn. write_tracking_data emits by tag suffix ("(max)"->max, "(min)"->min,
+        # else mean) — identical to the old np.max/np.min/np.mean over the interval's list.
+        self.per_agent_scalar_stats: list[dict] = []
         # Episode totals / lengths accumulated since the last write_interval flush.
         # write_tracking_data computes max/min/mean over the interval and then clears,
         # so the published values reflect ONLY the episodes that finished in the
@@ -154,12 +166,65 @@ class BlockAgent(Agent):
         return x_n1.repeat_interleave(batch_per_agent, dim=0)
 
     def track_per_agent(self, tag: str, values_per_agent) -> None:
-        """Buffer a scalar per agent under ``tag``; ``values_per_agent`` is iterable of length N."""
-        if not self.per_agent_tracking:
+        """Fold one already-reduced scalar per agent under ``tag`` into the on-device running
+        (count, sum, min, max). ``values_per_agent`` is an iterable of length N (one scalar per
+        agent — tensor or float). No GPU->CPU sync per call: the prior ``float(v.item())`` here
+        was the single biggest per-step sync source (called ~dozens of times per gradient step
+        from sac.py/ppo.py). write_tracking_data reduces by tag suffix at the interval boundary."""
+        if not self.per_agent_scalar_stats:
             return
         for i in range(self.num_agents):
-            v = values_per_agent[i]
-            self.per_agent_tracking[i][tag].append(v.item() if torch.is_tensor(v) else float(v))
+            self._accum_scalar(i, tag, values_per_agent[i])
+
+    def _accum_scalar(self, i: int, tag: str, value) -> None:
+        """Fold one already-reduced scalar ``value`` (0-dim tensor or python number) into agent
+        ``i``'s on-device running (n, sum, min, max) for ``tag``. Allocation-free after the first
+        call (accumulators zeroed/reset in write_tracking_data, never reallocated) and sync-free
+        (no ``.item()``). Mirrors the old per-step ``per_agent_tracking[i][tag].append(...)``:
+        folding the per-step reduced scalar with n+=1 makes the interval mean (sum/n) equal the
+        old np.mean over the per-step list, and running min/max equal np.min/np.max over it."""
+        if not self.per_agent_scalar_stats:
+            return
+        if torch.is_tensor(value):
+            v = value.detach().to(torch.float64).reshape(())
+        else:
+            v = torch.as_tensor(float(value), dtype=torch.float64, device=self.device)
+        acc = self.per_agent_scalar_stats[i].get(tag)
+        if acc is None:
+            acc = {
+                "n":   torch.zeros((), dtype=torch.float64, device=self.device),
+                "sum": torch.zeros((), dtype=torch.float64, device=self.device),
+                "min": torch.full((), float("inf"), dtype=torch.float64, device=self.device),
+                "max": torch.full((), float("-inf"), dtype=torch.float64, device=self.device),
+            }
+            self.per_agent_scalar_stats[i][tag] = acc
+        acc["n"] += 1.0
+        acc["sum"] += v
+        torch.minimum(acc["min"], v, out=acc["min"])
+        torch.maximum(acc["max"], v, out=acc["max"])
+
+    def _accum_dist_stat(self, i: int, tag: str, vals: torch.Tensor) -> None:
+        """Fold per-env samples ``vals`` into agent ``i``'s running (count, sum, sumsq) for
+        ``tag`` — entirely on-device. The accumulator (three float64 device scalars) is created
+        once per tag and reused (zeroed at flush), so there is NO per-step host allocation and NO
+        GPU->CPU copy (the cause of the prior host-RAM leak). ``write_tracking_data`` turns these
+        into the metric's mean + std."""
+        if not self.per_agent_dist_stats:
+            return
+        v = vals.reshape(-1).to(torch.float64)
+        if v.numel() == 0:
+            return
+        acc = self.per_agent_dist_stats[i].get(tag)
+        if acc is None:
+            acc = {
+                "n":  torch.zeros((), dtype=torch.float64, device=self.device),
+                "s":  torch.zeros((), dtype=torch.float64, device=self.device),
+                "s2": torch.zeros((), dtype=torch.float64, device=self.device),
+            }
+            self.per_agent_dist_stats[i][tag] = acc
+        acc["n"] += v.numel()
+        acc["s"] += v.sum()
+        acc["s2"] += torch.dot(v, v)
 
     def _compute_actor_head_grad_norm(self):
         """Return the per-agent action-head gradient norm tensor (or None).
@@ -240,19 +305,14 @@ class BlockAgent(Agent):
         # Layout: <experiment_dir>/<i>/ holds tensorboard events AND checkpoints for agent i,
         # so each agent's folder is fully self-contained.
         if self.write_interval > 0:
-            from torch.utils.tensorboard import SummaryWriter as TorchSummaryWriter
             for i in range(self.num_agents):
                 agent_log_dir = os.path.join(self.experiment_dir, str(i))
                 self.per_agent_writers.append(
                     SummaryWriter(log_dir=agent_log_dir)
                 )
-                # Image writer (torch SummaryWriter) — same log dir so TB
-                # aggregates scalar + image events under the same agent run.
-                self.per_agent_image_writers.append(
-                    TorchSummaryWriter(log_dir=agent_log_dir)
-                )
                 self.per_agent_tracking.append(collections.defaultdict(list))
-                self.per_agent_dist_tracking.append(collections.defaultdict(list))
+                self.per_agent_dist_stats.append({})
+                self.per_agent_scalar_stats.append({})
                 self._per_agent_track_rewards.append([])
                 self._per_agent_track_timesteps.append([])
                 self._per_agent_episodes_this_interval.append([])
@@ -299,6 +359,24 @@ class BlockAgent(Agent):
                     writer.add_scalar(tag=tag, value=float(np.max(values)), timestep=timestep)
                 else:
                     writer.add_scalar(tag=tag, value=float(np.mean(values)), timestep=timestep)
+
+            # On-device per-step/per-grad-step scalar accumulators (track_per_agent,
+            # logs_rew, per_env_to_log scalars, phase-split). Reduce by tag suffix to match
+            # the old per-interval np.max/np.min/np.mean over the Python list, with a single
+            # GPU->CPU sync per tag HERE (at the flush) instead of one per step. Accumulators
+            # are zeroed/reset in place for reuse — no reallocation.
+            for tag, acc in self.per_agent_scalar_stats[i].items():
+                if float(acc["n"].item()) == 0.0:
+                    continue
+                if tag.endswith("(max)"):
+                    val = acc["max"]
+                elif tag.endswith("(min)"):
+                    val = acc["min"]
+                else:
+                    val = acc["sum"] / acc["n"]
+                writer.add_scalar(tag=tag, value=float(val.item()), timestep=timestep)
+                acc["n"].zero_(); acc["sum"].zero_()
+                acc["min"].fill_(float("inf")); acc["max"].fill_(float("-inf"))
 
             # Episode totals + lengths over episodes that finished since the last
             # flush. Cleared here so the next interval starts fresh — no rolling-
@@ -393,42 +471,28 @@ class BlockAgent(Agent):
                 writer.add_scalar(tag="Episode / Velocity (mean)", value=float(arr.mean()), timestep=timestep)
                 vel_list.clear()
 
-            # "(dist)" metrics: emit mean + std scalars (skrl writer) and a histogram
-            # (torch image writer — skrl's writer has no add_histogram) over the raw per-env
-            # values accumulated this interval. Std (sqrt of variance) is published rather than
-            # variance because it shares the metric's units and is the more intuitive spread
-            # measure. The base tag drops the " (dist)" suffix; the two scalars keep exactly one
-            # '/'. Cleared after emit so each interval is fresh.
-            dist_tracking = self.per_agent_dist_tracking[i]
-            if dist_tracking:
-                img_writer = (
-                    self.per_agent_image_writers[i]
-                    if i < len(self.per_agent_image_writers) else None
-                )
-                wrote_hist = False
-                # cfg.log_histograms gates ONLY the histogram; the mean/std scalars below always
-                # fire for both "(dist)" and "(stat)". Disable to cut histogram host-RAM/disk cost.
-                log_histograms = bool(getattr(self.cfg, "log_histograms", True))
-                for tag, values in dist_tracking.items():
-                    if not values:
-                        continue
-                    # is_dist selects the suffix to strip ("(stat)" tags never get a histogram);
-                    # "(dist)" tags additionally get a histogram unless log_histograms is False.
-                    is_dist = tag.endswith(" (dist)")
-                    suffix = " (dist)" if is_dist else " (stat)"
-                    base = tag[: -len(suffix)]
-                    arr = np.asarray(values, dtype=np.float64)
-                    writer.add_scalar(tag=f"{base}_mean", value=float(arr.mean()), timestep=timestep)
-                    writer.add_scalar(tag=f"{base}_std",  value=float(arr.std()),  timestep=timestep)
-                    # add_histogram raises on a degenerate (all-equal) array; skip it then —
-                    # the mean/std scalars already capture a constant-stiffness baseline (std=0).
-                    if (is_dist and log_histograms and img_writer is not None
-                            and float(arr.max()) > float(arr.min())):
-                        img_writer.add_histogram(base, arr, timestep)
-                        wrote_hist = True
-                dist_tracking.clear()
-                if wrote_hist:
-                    img_writer.flush()
+            # "(dist)"/"(stat)" metrics: emit mean + std from the on-device running sufficient
+            # statistics (count, sum, sumsq) accumulated this interval — no per-env samples are
+            # retained, so there is no host-RAM churn. std = sqrt(max(sumsq/n - mean^2, 0)).
+            # Both suffixes behave identically (histograms were removed); the suffix is only
+            # stripped for the base tag, and the two scalars keep exactly one '/'. Accumulators
+            # are zeroed IN PLACE (reused next interval) rather than reallocated.
+            for tag, acc in self.per_agent_dist_stats[i].items():
+                n = acc["n"]
+                if n.item() == 0.0:
+                    continue
+                if tag.endswith(" (dist)"):
+                    base = tag[: -len(" (dist)")]
+                elif tag.endswith(" (stat)"):
+                    base = tag[: -len(" (stat)")]
+                else:
+                    base = tag
+                mean = acc["s"] / n
+                var = (acc["s2"] / n) - mean * mean
+                writer.add_scalar(tag=f"{base}_mean", value=float(mean.item()), timestep=timestep)
+                writer.add_scalar(tag=f"{base}_std",
+                                  value=float(var.clamp_min(0.0).sqrt().item()), timestep=timestep)
+                acc["n"].zero_(); acc["s"].zero_(); acc["s2"].zero_()
 
             self.per_agent_tracking[i].clear()
             # Persist synchronously: skrl's SummaryWriter flushes on a background
@@ -513,9 +577,7 @@ class BlockAgent(Agent):
                             if not agent_mask.any():
                                 continue
                             vals = per_env_vals[env_lo:env_hi][agent_mask]
-                            self.per_agent_tracking[i][f"Episode_Reward/{term}"].append(
-                                float(vals.mean().item())
-                            )
+                            self._accum_scalar(i, f"Episode_Reward/{term}", vals.mean())
 
             # Per-trajectory forward-distance ingestion (task-specific wrapper).
             # Wrappers like AntSuccessWrapper publish `info["per_env_episode_distance"]`
@@ -594,9 +656,7 @@ class BlockAgent(Agent):
                         for i in range(self.num_agents):
                             env_lo, env_hi = i * epa, (i + 1) * epa
                             agent_vals = vals[env_lo:env_hi].float()
-                            self.per_agent_tracking[i][f"logs_rew/{term}"].append(
-                                float(agent_vals.mean().item())
-                            )
+                            self._accum_scalar(i, f"logs_rew/{term}", agent_vals.mean())
 
                 # Per-step control-wrapper diagnostics (e.g. "Contact / In-Contact *").
                 # Wrappers stash per-env tensors in extras["to_log"]; the reward-
@@ -636,17 +696,14 @@ class BlockAgent(Agent):
                                 phase_ids = self._compute_phase_ids(infos, total_envs)
                             self._track_phase_split(tag, vals, phase_ids, epa)
                             continue
-                        # A "(dist)" or "(stat)" tag wants its full per-env distribution kept:
-                        # stash the RAW per-env slice (not the env-mean) so write_tracking_data can
-                        # emit mean + std over the interval (plus a histogram for "(dist)" only).
-                        # Handled here, before the scalar-reduction path below, so it never lands in
-                        # per_agent_tracking.
+                        # A "(dist)"/"(stat)" tag wants mean + std over the interval's full per-env
+                        # distribution: fold each agent's per-env slice into its on-device running
+                        # stats (no per-step copy / no Python lists). Handled here, before the
+                        # scalar-reduction path below, so it never lands in per_agent_tracking.
                         if tag.endswith("(dist)") or tag.endswith("(stat)"):
                             for i in range(self.num_agents):
                                 env_lo, env_hi = i * epa, (i + 1) * epa
-                                self.per_agent_dist_tracking[i][tag].extend(
-                                    vals[env_lo:env_hi].float().tolist()
-                                )
+                                self._accum_dist_stat(i, tag, vals[env_lo:env_hi])
                             continue
                         # Reduce each agent's env partition by the SAME convention
                         # write_tracking_data uses for the interval: a "(max)"/"(min)"
@@ -662,7 +719,7 @@ class BlockAgent(Agent):
                                 red = sl.min()
                             else:
                                 red = sl.mean()
-                            self.per_agent_tracking[i][tag].append(float(red.item()))
+                            self._accum_scalar(i, tag, red)
 
                 # Per-agent `successes` and `success_times` mirror upstream
                 # Factory's `_log_factory_metrics` semantics, just sliced to each
@@ -861,7 +918,7 @@ class BlockAgent(Agent):
                         if torch.is_tensor(v):
                             if v.numel() != 1:
                                 continue
-                            scalar = float(v.item())
+                            scalar = v.reshape(())  # keep on-device; no per-step .item()
                         elif isinstance(v, (int, float, np.integer, np.floating)):
                             scalar = float(v)
                         else:
@@ -874,8 +931,12 @@ class BlockAgent(Agent):
                             if k.startswith("logs_rew_")
                             else k
                         )
+                        # On-device fold (same destination as the per-agent decomposition
+                        # so a tag like Episode_Reward/<term> never lands in BOTH the list
+                        # and the scalar accumulator -> no double-emit). Mean-of-per-step,
+                        # matching the old np.mean over the appended list.
                         for i in range(self.num_agents):
-                            self.per_agent_tracking[i][tag].append(scalar)
+                            self._accum_scalar(i, tag, scalar)
 
     # --------------------------------------------------------------
     # Per-phase metric splitting (cfg.phase_split_families)
@@ -921,14 +982,14 @@ class BlockAgent(Agent):
         """Emit a ``{family}/{name}`` per-env metric as three ``{family}_{phase}/{name}``
         tags, each reduced over only this step's in-phase envs in the agent's partition.
 
-        Reduction matches the un-split convention picked from the tag suffix: ``(dist)``
-        keeps the raw per-env samples (mean+std+histogram at flush), ``(stat)`` likewise keeps
-        the raw samples but flushes mean+std only (no histogram), ``(max)``/``(min)`` take the
-        per-phase peak/trough, everything else env-means. A phase with no envs this step
-        contributes nothing, so its interval value reflects only the steps in which it was
-        active. New tags keep exactly one '/' (family carries none, and the single-slash tag
-        convention guarantees ``name`` carries none either). The ``(dist)``/``(stat)`` suffix
-        is preserved on ``new_tag`` so write_tracking_data can tell them apart at flush."""
+        Reduction matches the un-split convention picked from the tag suffix: ``(dist)``/``(stat)``
+        fold the per-phase per-env samples into on-device running stats (mean+std at flush),
+        ``(max)``/``(min)`` take the per-phase peak/trough, everything else env-means. A phase with
+        no envs this step contributes nothing, so its interval value reflects only the steps in
+        which it was active. New tags keep exactly one '/' (family carries none, and the
+        single-slash tag convention guarantees ``name`` carries none either). The ``(dist)``/
+        ``(stat)`` suffix is preserved on ``new_tag`` so write_tracking_data strips it for the
+        base name."""
         family, _, name = tag.partition("/")
         family = family.strip()
         name = name.strip()
@@ -947,13 +1008,13 @@ class BlockAgent(Agent):
                 phase_vals = sl[mask]
                 new_tag = f"{family}_{pname}/{name}"
                 if is_dist or is_stat:
-                    self.per_agent_dist_tracking[i][new_tag].extend(phase_vals.tolist())
+                    self._accum_dist_stat(i, new_tag, phase_vals)
                 elif is_max:
-                    self.per_agent_tracking[i][new_tag].append(float(phase_vals.max().item()))
+                    self._accum_scalar(i, new_tag, phase_vals.max())
                 elif is_min:
-                    self.per_agent_tracking[i][new_tag].append(float(phase_vals.min().item()))
+                    self._accum_scalar(i, new_tag, phase_vals.min())
                 else:
-                    self.per_agent_tracking[i][new_tag].append(float(phase_vals.mean().item()))
+                    self._accum_scalar(i, new_tag, phase_vals.mean())
 
     # --------------------------------------------------------------
     # Memory-tensor hook (subclass-specific)

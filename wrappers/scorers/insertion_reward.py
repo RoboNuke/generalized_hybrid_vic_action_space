@@ -45,6 +45,9 @@ def _quat_z_axis(quat):
 def install_insertion_reward(
     curr_engaged_scale: float = 1.0,
     curr_success_scale: float = 1.0,
+    kp_baseline_scale: float = 1.0,
+    kp_coarse_scale: float = 1.0,
+    kp_fine_scale: float = 1.0,
     engage_check_yaw: bool = False,
     engage_check_z_aligned: bool = False,
     success_check_yaw: bool = False,
@@ -69,6 +72,9 @@ def install_insertion_reward(
 
     ce = float(curr_engaged_scale)
     cs = float(curr_success_scale)
+    kb = float(kp_baseline_scale)
+    kc = float(kp_coarse_scale)
+    kf = float(kp_fine_scale)
     z_max = float(z_align_max_deg)
 
     # ---- 1) replacement _get_curr_successes with check_yaw / check_z_aligned ----
@@ -131,6 +137,12 @@ def install_insertion_reward(
             ).float()
         rew_scales["curr_engaged"] = ce
         rew_scales["curr_success"] = cs
+        # Keypoint-term weights (stock 1.0 each). Multiply so this composes with any upstream
+        # change to the base scales. Lets a config rebalance baseline vs coarse vs fine after a
+        # keypoint_scale (spacing) change that shifted their relative magnitudes.
+        rew_scales["kp_baseline"] = rew_scales.get("kp_baseline", 1.0) * kb
+        rew_scales["kp_coarse"] = rew_scales.get("kp_coarse", 1.0) * kc
+        rew_scales["kp_fine"] = rew_scales.get("kp_fine", 1.0) * kf
         return rew_dict, rew_scales
 
     FactoryEnv._get_factory_rew_dict = _patched_rew_dict
@@ -156,6 +168,7 @@ def install_insertion_reward(
 
     print(
         f"[insertion-reward] patched FactoryEnv: curr_engaged_scale={ce}, curr_success_scale={cs}, "
+        f"kp_scales(baseline={kb}, coarse={kc}, fine={kf}), "
         f"engage(check_yaw={engage_check_yaw}, check_z_aligned={engage_check_z_aligned}), "
         f"success(check_yaw={success_check_yaw}, check_z_aligned={success_check_z_aligned}), "
         f"z_align_max_deg={z_max}.",

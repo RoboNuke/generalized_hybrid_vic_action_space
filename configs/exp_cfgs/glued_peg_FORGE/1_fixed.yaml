@@ -21,8 +21,8 @@ runner_cfg:
                                           # success_pred_error / early_term_* metrics. false = restore.
   kp_z_align_enabled: false               # add the kp_z_align orientation reward (aligns peg z-axis
                                           # with socket z-axis; rewards the DOF the 30deg tilted grasp fights)
-  kp_z_align_a: 4.0                     # squashing steepness a (default)
-  kp_z_align_b: 0                     # squashing offset b, peak height 1/(2+b) (default)
+  kp_z_align_a: 8.0                     # squashing steepness a (default)
+  kp_z_align_b: 2                     # squashing offset b, peak height 1/(2+b) (default)
 
   # ---- insertion-reward scales + alignment gates (stock scales 1.0/1.0, gates off) ----
   # curr_engaged/curr_success are per-step bonuses. The alignment gates AND extra conditions into
@@ -30,8 +30,19 @@ runner_cfg:
   # angle between the held (peg) and fixed (socket) z-axes to be < z_align_max_deg. Gating the
   # dominant engaged bonus on z-alignment makes "near the socket" only pay when actually oriented to
   # insert — useful for tilted/complex geometries. Success is NOT terminal, so gating it is safe.
-  curr_engaged_scale: 1.0               # stock 1.0
-  curr_success_scale: 1.0               # stock 1.0
+  curr_engaged_scale: 1.0               # stock 1.0 — per-step "near the socket" bonus
+  curr_success_scale: 1.0               # stock 1.0 — per-step "fully inserted" bonus
+  # Keypoint-term weights (stock 1.0 each). Multiply the kp reward components so you can rebalance
+  # baseline vs coarse vs fine. NOTE: keypoint_scale below is 0.32 (default 0.15) — the wide spacing
+  # shrinks coarse/fine (sharp a=50/100) far more than baseline (broad a=5), so baseline currently
+  # dominates the return. Lower kp_baseline_scale and/or raise kp_fine_scale to compensate.
+  kp_baseline_scale: 0.0                
+  kp_coarse_scale: 1.0                  # stock 1.0 — "align the assets" term (a=50)
+  kp_fine_scale: 1.0                    # stock 1.0 — "last-inch insertion" term (a=100)
+  
+  
+  
+  
   engage_check_yaw: false               # gate engaged bonus on EE yaw (yaw only; rarely useful here)
   engage_check_z_aligned: true         # gate engaged bonus on peg-vs-socket z alignment
   success_check_yaw: false              # gate success on EE yaw (nut_thread is always yaw-gated)
@@ -41,9 +52,9 @@ runner_cfg:
   agent_type: sac                   # "sac" (default) or "ppo"; selects sac_cfg vs ppo_cfg
   num_envs: 256
   num_agents: 3
-  total_timesteps: 10_051
+  total_timesteps: 20_100
   eval_timesteps: 150
-  memory_size: 2_000_000
+  memory_size: 1_000_000
   seed: -1
   glue_peg_to_gripper: true              # rigidly weld peg to gripper (constant fixed grasp)
   grasp_rot_mode: fixed                 # none | random | fixed. how the peg is grasped relative
@@ -69,6 +80,17 @@ runner_cfg:
   env_cfg_overrides:
     task.num_keypoints: 4        # default 4
     task.keypoint_scale: 0.32   # default 0.15 m (0.05 for nut thread) 0.32
+    # Keypoint squashing coefs [a, b]: reward = 1/(e^{a*x} + b + e^{-a*x}), x = mean keypoint dist.
+    # Peak at x=0 is 1/(2+b); larger a => sharper/narrower (decays to 0 faster as x grows). These set
+    # the SHAPE of each kp term (the kp_*_scale knobs above set the linear weight). Defaults below.
+    task.keypoint_coef_baseline: [5, 4]    # default [5, 4]   (broad: peak 1/6, tolerant of distance)
+    task.keypoint_coef_coarse: [50, 2]     # default [50, 2]  (peak 1/4)
+    task.keypoint_coef_fine: [100, 0]      # default [100, 0] (sharp: peak 1/2, near-zero unless inserted)
+    task.contact_penalty_scale: 0.0       # was 0.2 (peg-insert default): zero the contact penalty
+                                          #   so early training isn't pushed into a hover-above-the-hole optimum
+    task.action_penalty_ee_scale: 0.0     # Forge default (EE action penalty)
+    task.action_penalty_asset_scale: 0.001  # Forge default (asset action penalty)
+    task.action_grad_penalty_scale: 0.1   # Forge default (action-grad penalty)
 
 loss_cfg:
   supervised_selection_enabled: false
@@ -82,19 +104,18 @@ sac_cfg:
   polyak: 0.005
   actor_lr: 1.0e-4
   critic_lr: 1.0e-4
-  entropy_lr: 1.0e-4
+  entropy_lr: 1.0e-5
   weight_decay: 1.0e-2
   random_timesteps: 0
   learning_starts: 300
   learn_entropy: true
-  initial_entropy_value: 1.0e-2
-  target_entropy: -3.5            # = -|continuous|/2 = -7/2 (constant: 6 pose + 1 success-pred)
-  grad_norm_clip: 0.0
+  initial_entropy_value: 0.05 #0.05
+  target_entropy: -3.5            # -|continuous|/2 then +1 (raised for exploration)
+  grad_norm_clip: 1.0
   mixed_precision: false
-  log_histograms: false          # disable TB histograms (host-RAM leak mitigation; mean/std still logged)
   observation_preprocessor: RunningStandardScaler
   observation_preprocessor_kwargs: {}
-  rewards_shaper_scale: null
+  rewards_shaper_scale: 0.1
   gripper_action_idx: null
   phase_split_families: [RotationFrame, Impedance_Stiffness]
   recorder:
@@ -119,9 +140,9 @@ model_cfg:
     use_state_dependent_std: false
     bernoulli_action_dims: null
     force_zero_action_dims: null   # dim 6 (success-pred) force-zeroed by runner_cfg.disable_success_pred; full_orientation_control keeps Rx/Ry learnable
-    scale_down_action_dims: [0, 1, 2, 3, 4, 5]   # apply last_layer_scale to ONLY the 6 pose deltas (3 pos + 3 orient); gain/selection dims stay unshrunk so they explore
+    scale_down_action_dims: [0, 1, 2]   # apply last_layer_scale to ONLY the 6 pose deltas (3 pos + 3 orient); gain/selection dims stay unshrunk so they explore
   critic:
-    critic_output_init_mean: 0.0 #50 before
+    critic_output_init_mean: 0.0 #8.6 #50 before
     critic_n: 4
     critic_latent: 1024
     clip_actions: false

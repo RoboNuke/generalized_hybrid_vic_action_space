@@ -108,7 +108,23 @@ def main() -> None:
         argv += ["--enable_cameras"]
 
     from learning import runner
-    runner.main(argv)
+    try:
+        runner.main(argv)
+    except BaseException as e:  # noqa: BLE001
+        # In record mode runner.main() exits the process itself (os._exit) on BOTH
+        # success and in-recording failure, so reaching here means the failure happened
+        # BEFORE the recording guard's try block (config reload, env build, the SAC-only
+        # / recorder-enabled checks). Once simulation_app is launched, Isaac's teardown
+        # during normal interpreter shutdown frequently forces exit code 0, which would
+        # mask this exception and make the batch launcher (record_group/record_experiment)
+        # mark a failed record as OK. os._exit(1) now — before any atexit/Isaac teardown —
+        # so the launcher correctly sees a nonzero exit and prints FAIL.
+        import traceback
+        print(f"[record] FAILED before recording started: {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
 
 
 if __name__ == "__main__":

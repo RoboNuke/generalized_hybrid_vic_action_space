@@ -20,6 +20,12 @@
 set -Eeuo pipefail
 trap 'echo "[launcher] FAILED at ${BASH_SOURCE[0]}:${LINENO} (exit $?)" >&2' ERR
 
+# We never use torch.compile. Disabling TorchDynamo sidesteps the lazy `import torch._dynamo`
+# (triggered by the first optimizer construction in torch 2.8) that can hit a re-entrant/concurrent
+# circular-import crash under Omniverse threads. runner.py also pre-imports torch._dynamo as a
+# second layer of defense.
+export TORCHDYNAMO_DISABLE=1
+
 # ===== Args =====
 if [[ $# -lt 2 ]]; then
     echo "Usage: $0 <config_path> <experiment_name> [--no_eval] [--experiment_directory <dir>]" >&2
@@ -104,10 +110,11 @@ if [[ -n "$EXPERIMENT_DIRECTORY" ]]; then
 fi
 
 # ===== Train =====
-# Ctrl-C (SIGINT, exit 130) is treated as "interrupted, proceed to eval with whatever
-# was last flushed to disk". Any other nonzero exit (OOM=137, segfault=139, ValueError
-# from runner, etc.) is still a hard failure. The `|| TRAIN_RC=$?` form neutralizes
-# `set -e` and the ERR trap for this one command so we can branch on the code.
+# Ctrl-C (SIGINT, exit 130) is treated as "interrupted, proceed with whatever was last flushed
+# to disk". Any other nonzero exit (OOM=137, segfault=139, ValueError from runner, etc.) is a
+# hard failure: we SKIP eval but still fall through to RECORD (so videos of any best checkpoint
+# are produced), then re-surface the failure code at the very end. The `|| TRAIN_RC=$?` form
+# neutralizes `set -e` and the ERR trap for this one command so we can branch on the code.
 echo "[launcher] === TRAIN (config=$CONFIG_PATH) ==="
 TRAIN_RC=0
 "$PYTHON" "$RUNNER" \
@@ -118,59 +125,61 @@ TRAIN_RC=0
     --mode train \
     --headless || TRAIN_RC=$?
 
+TRAIN_HARD_FAIL=0
 case "$TRAIN_RC" in
     0)   echo "[launcher] training completed normally" ;;
-    130) echo "[launcher] training interrupted by Ctrl-C (exit 130); proceeding to eval with last saved checkpoints" ;;
-    *)   echo "[launcher] training failed with exit $TRAIN_RC (not Ctrl-C); aborting" >&2; exit "$TRAIN_RC" ;;
+    130) echo "[launcher] training interrupted by Ctrl-C (exit 130); proceeding with last saved checkpoints" ;;
+    *)   echo "[launcher] training failed with exit $TRAIN_RC (not Ctrl-C) — skipping eval, but STILL recording any best checkpoints below" >&2
+         TRAIN_HARD_FAIL=1 ;;
 esac
 
-# ===== Verify checkpoints exist before attempting eval =====
-# sac.write_checkpoint writes one file per agent at:
-#   $EXP_DIR/<i>/checkpoints/ckpt_<step>.pt   for i in 0..N-1
-# If skrl's auto checkpoint_interval ever resolves to "never", training would exit
-# 0 with no .pt files written — that's exactly the silent failure we need to catch.
-echo "[launcher] verifying per-agent checkpoints under $EXP_DIR"
-[[ -d "$EXP_DIR" ]] || { echo "[launcher] experiment dir was not created: $EXP_DIR" >&2; exit 1; }
-for i in $(seq 0 $((NUM_AGENTS - 1))); do
-    agent_ckpt_dir="$EXP_DIR/$i/checkpoints"
-    [[ -d "$agent_ckpt_dir" ]] \
-        || { echo "[launcher] missing checkpoint dir for agent $i: $agent_ckpt_dir" >&2; exit 1; }
-    if ! compgen -G "$agent_ckpt_dir/ckpt_*.pt" >/dev/null; then
-        echo "[launcher] no ckpt_*.pt files for agent $i in $agent_ckpt_dir" >&2
-        exit 1
+# ===== Verify checkpoints + Eval (only when training did NOT hard-fail) =====
+# On a hard failure (OOM/segfault/runner error) we skip the checkpoint-existence guard and eval
+# — the env may be in a bad state and eval would likely fail too — but we deliberately drop
+# through to RECORD below so videos of any best checkpoint are still produced. The guard only
+# aborts on a CLEAN run that silently wrote no checkpoints (the real bug it exists to catch).
+if [[ "$TRAIN_HARD_FAIL" -eq 0 ]]; then
+    # sac.write_checkpoint writes one file per agent at $EXP_DIR/<i>/checkpoints/ckpt_<step>.pt.
+    echo "[launcher] verifying per-agent checkpoints under $EXP_DIR"
+    [[ -d "$EXP_DIR" ]] || { echo "[launcher] experiment dir was not created: $EXP_DIR" >&2; exit 1; }
+    for i in $(seq 0 $((NUM_AGENTS - 1))); do
+        agent_ckpt_dir="$EXP_DIR/$i/checkpoints"
+        [[ -d "$agent_ckpt_dir" ]] \
+            || { echo "[launcher] missing checkpoint dir for agent $i: $agent_ckpt_dir" >&2; exit 1; }
+        if ! compgen -G "$agent_ckpt_dir/ckpt_*.pt" >/dev/null; then
+            echo "[launcher] no ckpt_*.pt files for agent $i in $agent_ckpt_dir" >&2
+            exit 1
+        fi
+        latest_for_agent="$(ls -1 "$agent_ckpt_dir"/ckpt_*.pt | tail -1)"
+        echo "[launcher]   agent $i: $latest_for_agent"
+    done
+
+    # Pass the experiment dir as --checkpoint; the runner walks 0/, 1/, ... and resolves the
+    # latest ckpt per agent. A fresh experiment name keeps eval's tensorboard events out of the
+    # training agent dirs. `--mode eval` uses runner_cfg.eval_timesteps.
+    if [[ "$RUN_EVAL" -eq 1 ]]; then
+        echo "[launcher] === EVAL (config=$CONFIG_PATH, checkpoint=$EXP_DIR) ==="
+        "$PYTHON" "$RUNNER" \
+            --config "$CONFIG_PATH" \
+            --experiment_name "$EVAL_EXP_NAME" \
+            --logdir "$LOGDIR" \
+            "${EXP_DIR_FLAG[@]}" \
+            --checkpoint "$EXP_DIR" \
+            --mode eval \
+            --headless
+        echo "[launcher] done. train=$EXP_DIR  eval=$EXP_FAMILY_DIR/$EVAL_EXP_NAME"
+    else
+        echo "[launcher] === EVAL skipped (--no_eval) ==="
+        echo "[launcher] done. train=$EXP_DIR"
     fi
-    latest_for_agent="$(ls -1 "$agent_ckpt_dir"/ckpt_*.pt | tail -1)"
-    echo "[launcher]   agent $i: $latest_for_agent"
-done
-
-# ===== Eval =====
-# Pass the experiment dir as --checkpoint; the runner walks 0/, 1/, ... internally
-# and resolves the latest ckpt_<step>.pt per agent (omit --checkpoint_step => latest).
-# Use a fresh experiment name for eval so its tensorboard events don't land in the
-# training agent dirs (which would mix train + eval scalars on the same plots).
-# `--mode eval` makes the runner use runner_cfg.eval_timesteps instead of total_timesteps.
-if [[ "$RUN_EVAL" -eq 1 ]]; then
-    echo "[launcher] === EVAL (config=$CONFIG_PATH, checkpoint=$EXP_DIR) ==="
-    "$PYTHON" "$RUNNER" \
-        --config "$CONFIG_PATH" \
-        --experiment_name "$EVAL_EXP_NAME" \
-        --logdir "$LOGDIR" \
-        "${EXP_DIR_FLAG[@]}" \
-        --checkpoint "$EXP_DIR" \
-        --mode eval \
-        --headless
-
-    echo "[launcher] done. train=$EXP_DIR  eval=$EXP_FAMILY_DIR/$EVAL_EXP_NAME"
-else
-    echo "[launcher] === EVAL skipped (--no_eval) ==="
-    echo "[launcher] done. train=$EXP_DIR"
 fi
 
-# ===== Record (optional) =====
-# Record the BEST policy (ckpt_best.pt) of each agent to a grid GIF under
-# <EXP_DIR>/<i>/videos/. Uses learning/record.py, which merges the record overlay over the
-# per-agent snapshotted config.yaml. Recording failures are non-fatal: a missing best ckpt or a
-# camera/render issue must not fail an otherwise-good training run (the batch relies on this).
+# ===== Record (optional) — runs even after a hard training failure =====
+# Records the BEST policy (ckpt_best.pt) of each agent to a grid GIF under <EXP_DIR>/<i>/videos/.
+# A fresh recorder process reloads ckpt_best.pt, so as long as a best checkpoint exists the video
+# is produced regardless of how training ended (OOM, crash, Ctrl-C, or clean). Per-agent and
+# non-fatal: agents with no ckpt_best.pt are skipped; render failures warn. Recording NEVER
+# changes the script's exit code (the training outcome below owns that).
 if [[ "$RECORD" -eq 1 ]]; then
     RECORDER="$PROJECT_ROOT/learning/record.py"
     # Default the overlay to <config_dir>/_record.yaml when not explicitly given.
@@ -184,6 +193,11 @@ if [[ "$RECORD" -eq 1 ]]; then
         echo "[launcher] record overlay not found: $RECORD_CONFIG — skipping recording" >&2
     else
         for i in $(seq 0 $((NUM_AGENTS - 1))); do
+            best_ckpt="$EXP_DIR/$i/checkpoints/ckpt_best.pt"
+            if [[ ! -f "$best_ckpt" ]]; then
+                echo "[launcher]   agent $i: no ckpt_best.pt — nothing to record, skipping" >&2
+                continue
+            fi
             echo "[launcher]   recording agent $i (ckpt_best.pt) -> $EXP_DIR/$i/videos/"
             rec_rc=0
             "$PYTHON" "$RECORDER" \
@@ -196,4 +210,12 @@ if [[ "$RECORD" -eq 1 ]]; then
             fi
         done
     fi
+fi
+
+# ===== Final exit code =====
+# Surface a hard training failure to the caller (the batch marks it FAILED) — but only AFTER
+# recording above has had its chance to produce videos of the best checkpoints.
+if [[ "$TRAIN_HARD_FAIL" -eq 1 ]]; then
+    echo "[launcher] exiting with training failure code $TRAIN_RC (recording, if any, ran first)" >&2
+    exit "$TRAIN_RC"
 fi
