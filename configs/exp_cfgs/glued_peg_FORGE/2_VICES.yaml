@@ -21,8 +21,8 @@ runner_cfg:
                                           # success_pred_error / early_term_* metrics. false = restore.
   kp_z_align_enabled: false               # add the kp_z_align orientation reward (aligns peg z-axis
                                           # with socket z-axis; rewards the DOF the 30deg tilted grasp fights)
-  kp_z_align_a: 4.0                     # squashing steepness a (default)
-  kp_z_align_b: 0                     # squashing offset b, peak height 1/(2+b) (default)
+  kp_z_align_a: 8.0                     # squashing steepness a (default)
+  kp_z_align_b: 2                     # squashing offset b, peak height 1/(2+b) (default)
   # ---- insertion-reward scales + alignment gates (stock scales 1.0/1.0, gates off) ----
   # curr_engaged/curr_success are per-step bonuses. The alignment gates AND extra conditions into
   # those masks: check_yaw requires EE yaw < ee_success_yaw (yaw only); check_z_aligned requires the
@@ -31,6 +31,9 @@ runner_cfg:
   # insert — useful for tilted/complex geometries. Success is NOT terminal, so gating it is safe.
   curr_engaged_scale: 1.0               # stock 1.0
   curr_success_scale: 1.0               # stock 1.0
+  kp_baseline_scale: 0.0                # synced from 1_fixed (ELIMINATED baseline: a=5 term ~constant in regime)
+  kp_coarse_scale: 1.0                  # synced from 1_fixed
+  kp_fine_scale: 1.0                    # synced from 1_fixed
   engage_check_yaw: false               # gate engaged bonus on EE yaw (yaw only; rarely useful here)
   engage_check_z_aligned: true         # gate engaged bonus on peg-vs-socket z alignment
   success_check_yaw: false              # gate success on EE yaw (nut_thread is always yaw-gated)
@@ -68,6 +71,9 @@ runner_cfg:
   env_cfg_overrides:
     task.num_keypoints: 4        # default 4
     task.keypoint_scale: 0.32   # default 0.15 m (0.05 for nut thread) 0.32
+    task.keypoint_coef_baseline: [5, 4]    # synced from 1_fixed (squashing [a,b]; default)
+    task.keypoint_coef_coarse: [50, 2]     # synced from 1_fixed
+    task.keypoint_coef_fine: [100, 0]      # synced from 1_fixed
     task.contact_penalty_scale: 0.0       # was 0.2 (peg-insert default): zero the contact penalty
                                           #   so early training isn't pushed into a hover-above-the-hole optimum
     task.action_penalty_ee_scale: 0.0     # Forge default (EE action penalty)

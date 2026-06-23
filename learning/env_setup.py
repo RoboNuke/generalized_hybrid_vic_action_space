@@ -240,6 +240,15 @@ def build_env(
     # instance-level shim: (1) spawn TiledCamera on env_0, (2) call the original clone, (3)
     # register the sensor. ``force_camera`` (init_calib) injects regardless of recorder.enabled.
     if camera_on:
+        # The recorder TiledCamera is a RENDERING sensor: replicate_physics does NOT propagate it,
+        # and under clone_in_fabric=True the cloned per-env cameras are Fabric-only, so the camera's
+        # view resolves just env_0 and scene.reset(env_ids) indexes its env_0-sized buffer out of
+        # bounds (CUDA device-side assert). Force real per-env prims. Recording is short, so the
+        # (now-fixed) weld leak is moot, and the peg-link weld replicates fine under non-fabric too.
+        if getattr(env_cfg.scene, "clone_in_fabric", False):
+            env_cfg.scene.clone_in_fabric = False
+            print("[runner] recorder camera enabled: forcing scene.clone_in_fabric=False "
+                  "(the TiledCamera needs real per-env prims; rendering is not Fabric-replicated).")
         from isaaclab.sensors import TiledCamera, TiledCameraCfg
         from isaaclab.sim.spawners.sensors import PinholeCameraCfg
         from wrappers.recording import CAMERA_KEY as _RECORDER_CAMERA_KEY
@@ -301,10 +310,11 @@ def build_env(
             f"pre-clone; record_every_k_resets={rec.record_every_k_resets}"
         )
 
-    # Contact sensor: must be registered with the scene DURING env construction (before
-    # InteractiveScene.clone_environments), so patch the env class's _setup_scene here, before
-    # gym.make. Forge/Factory/AutoMate only — the sensor mounts on the held/fixed peg-insertion
-    # assets. The runtime ContactSensorWrapper (added below) reads it.
+    # Contact sensor: the runtime ContactSensorWrapper (added below) creates its OWN Fabric-
+    # compatible PhysX rigid-contact view (clean ``env_*`` glob, resolved lazily once the sim is
+    # live), so nothing is registered pre-clone and ``clone_in_fabric`` can stay True — avoiding the
+    # per-step USD-on-real-prims host-RAM leak the old (USD-path) ContactSensor forced. Forge/
+    # Factory/AutoMate only — the sensor mounts on the held/fixed peg-insertion assets.
     if contact_enabled:
         if not (runner_cfg.task.startswith("Isaac-Forge-")
                 or runner_cfg.task.startswith("Isaac-Factory-")
@@ -313,21 +323,6 @@ def build_env(
                 f"sensor_cfg.contact.enabled=True requires a Forge/Factory/AutoMate-Assembly "
                 f"task (held/fixed peg-insertion assets), but task is {runner_cfg.task!r}."
             )
-        # ContactSensor reads per-env bodies via the USD stage (create_rigid_body_view),
-        # but Factory/Forge default to clone_in_fabric=True, which keeps the cloned
-        # env_1..N bodies in Fabric only — so the sensor finds just env_0 and fails its
-        # body-count check. Fabric cloning is incompatible with contact sensors, so turn
-        # it off here (a no-op for the camera recorder above).
-        if getattr(env_cfg.scene, "clone_in_fabric", False):
-            env_cfg.scene.clone_in_fabric = False
-            print("[runner] contact sensor enabled: forcing scene.clone_in_fabric=False "
-                  "(fabric clones are invisible to the contact sensor's body view).")
-        # Patch the SAME concrete env class the camera injection used (resolved above) so the
-        # two _setup_scene shims compose. Patching a base class (e.g. FactoryEnv) while the
-        # camera patched the concrete subclass (ForgeEnv) would let the subclass shim bypass
-        # this one, and the contact sensor would never register.
-        from wrappers.sensors.contact_sensor_wrapper import install_contact_sensor
-        install_contact_sensor(sensor_cfg.contact, env_class=_env_cls)
 
     # Optional in-gripper grasp-rotation offset (Forge/Factory peg insertion only): patch
     # get_handheld_asset_relative_pose so the peg is grasped at a roll/pitch/yaw tilt relative to
@@ -423,19 +418,27 @@ def build_env(
                 f"transform mirrors the peg_insert grasp), but env_cfg.task.name="
                 f"{getattr(env_cfg.task, 'name', None)!r}."
             )
-        # Author the joints on real USD prims (fabric clones are USD-invisible), matching the
-        # contact-sensor path.
-        if getattr(env_cfg.scene, "clone_in_fabric", False):
-            env_cfg.scene.clone_in_fabric = False
-            print("[runner] glue_peg_to_gripper enabled: forcing scene.clone_in_fabric=False "
-                  "(the weld joints must be authored on real per-env prims).")
-        # A constant weld frame requires a deterministic in-grip pose: zero the per-reset position
-        # jitter so the reset teleport target equals the welded transform (else PhysX fights it).
+        # The peg is folded into the Franka articulation as a rigid LINK on the env-0 prototype
+        # before clone_environments (replicate_physics propagates it to every env), so
+        # clone_in_fabric stays True and there is NO maximal-coordinate loop joint — which is what
+        # removes the host-RAM leak. (Turning glue off skips all of this: the peg stays a normal
+        # friction-held articulation, i.e. vanilla behaviour.)
+        # A constant link frame requires a deterministic in-grip pose: zero the per-reset position
+        # jitter so the env's intended grasp matches the fixed link frame.
         if any(float(v) != 0.0 for v in getattr(env_cfg.task, "held_asset_pos_noise", [])):
             print(f"[runner] glue_peg_to_gripper enabled: zeroing held_asset_pos_noise "
-                  f"(was {list(env_cfg.task.held_asset_pos_noise)}) so the constant weld frame "
-                  "matches the reset teleport.")
+                  f"(was {list(env_cfg.task.held_asset_pos_noise)}) so the constant link frame "
+                  "matches the deterministic grasp.")
             env_cfg.task.held_asset_pos_noise = [0.0 for _ in env_cfg.task.held_asset_pos_noise]
+        # The peg is no longer a separate asset, so the held-asset mass/material randomization
+        # events (which resolve the 'held_asset' scene entity) cannot run — disable them. The peg
+        # keeps its spawn-default mass/friction (it is rigidly fixed, not friction-held).
+        _events = getattr(env_cfg, "events", None)
+        for _ev in ("object_scale_mass", "held_physics_material"):
+            if _events is not None and getattr(_events, _ev, None) is not None:
+                setattr(_events, _ev, None)
+                print(f"[runner] glue_peg_to_gripper enabled: disabled held-asset event {_ev!r} "
+                      "(peg is a Franka link now, not a separate asset).")
         # Resolve the concrete env class to patch (only resolved above when a camera/contact
         # sensor needed it).
         if _env_cls is None:

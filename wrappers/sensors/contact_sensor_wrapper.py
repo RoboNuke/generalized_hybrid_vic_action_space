@@ -166,7 +166,17 @@ def install_contact_sensor(contact_cfg: Any, env_class: Any = None) -> None:
 
 
 class ContactSensorWrapper(gym.Wrapper):
-    """Per-step in-contact boolean from the held-vs-fixed ContactSensor (logging-only)."""
+    """Per-step held-vs-fixed in-contact boolean, read from a Fabric-compatible PhysX rigid
+    contact view that this wrapper creates itself.
+
+    Why not IsaacLab's ``ContactSensor``: its ``_initialize_impl`` builds the PhysX view at scene
+    setup, where under ``clone_in_fabric=True`` the replicated per-env bodies aren't yet resolvable,
+    so it sees only env-0 and fails its body-count check (this is what forced ``clone_in_fabric=False``
+    and caused the host-RAM leak via per-step USD ops on real prims). Instead we create the
+    ``rigid_contact_view`` LAZILY on the first step — once the sim is live the peg/hole bodies are
+    resolvable by a clean ``/World/envs/env_*/.../body`` glob — and read ``get_contact_force_matrix``,
+    the same per-pair force the stock sensor exposed as ``force_matrix_w``.
+    """
 
     def __init__(self, env, contact_cfg: Any) -> None:
         super().__init__(env)
@@ -175,10 +185,15 @@ class ContactSensorWrapper(gym.Wrapper):
         self._threshold = float(contact_cfg.contact_force_threshold)
         self._log_contact = bool(contact_cfg.log_contact_state)
 
-        self._sensor = None
-        self._initialized = False
+        # Resolve the held (sensor) + fixed (filter) contact-reporting body paths from the env-0
+        # prototype (a real USD prim at this point) and put them in PhysX GLOB form ('env_*', no
+        # regex groups), which resolves ALL envs under clone_in_fabric=True.
+        self._peg_glob = _resolve_contact_body_expr(contact_cfg.held_prim_expr).replace(".*", "*")
+        self._hole_glob = _resolve_contact_body_expr(contact_cfg.fixed_prim_expr).replace(".*", "*")
+        self._contact_view = None
+        self._dt = None
 
-        # Expose the raw flag on the env so a future change can feed it to obs/state.
+        # Exposed so the obs/append + phase-split paths can read it; zeros until the view is live.
         self.unwrapped.in_contact = torch.zeros(
             (self.num_envs, 3), dtype=torch.bool, device=self.device
         )
@@ -186,31 +201,44 @@ class ContactSensorWrapper(gym.Wrapper):
             self.unwrapped.extras["to_log"] = {}
 
     # ------------------------------------------------------------------ setup
-    def _initialize(self) -> None:
-        if self._initialized:
-            return
-        sensors = getattr(self.unwrapped.scene, "sensors", None)
-        if not sensors or CONTACT_SENSOR_KEY not in sensors:
-            raise RuntimeError(
-                f"ContactSensorWrapper: scene has no sensor '{CONTACT_SENSOR_KEY}'. "
-                "Ensure the runner calls install_contact_sensor(...) BEFORE gym.make() "
-                "(the sensor must be registered during env construction)."
+    def _ensure_view(self) -> bool:
+        """Create the rigid contact view once the sim is live (Fabric bodies then resolvable)."""
+        if self._contact_view is not None:
+            return True
+        from isaacsim.core.simulation_manager import SimulationManager
+
+        psv = SimulationManager.get_physics_sim_view()
+        if psv is None:
+            return False
+        try:
+            cv = psv.create_rigid_contact_view(
+                self._peg_glob,
+                filter_patterns=[self._hole_glob],
+                max_contact_data_count=64 * self.num_envs,
             )
-        self._sensor = sensors[CONTACT_SENSOR_KEY]
-        self._initialized = True
+        except Exception:
+            return False  # bodies not resolvable yet — retry next step
+        if cv is None or cv.sensor_count != self.num_envs:
+            return False
+        self._contact_view = cv
+        self._dt = float(self.unwrapped.sim.get_physics_dt())
+        print(
+            f"[contact-sensor] Fabric contact view ready: sensor_count={cv.sensor_count} "
+            f"peg={self._peg_glob} filter={self._hole_glob}",
+            flush=True,
+        )
+        return True
 
     # --------------------------------------------------------------- contact
     def _update_contact(self) -> None:
         from isaaclab.utils.math import quat_rotate_inverse
 
-        fm = self._sensor.data.force_matrix_w  # (num_envs, B, M, 3) or None before first update
-        if fm is None:
+        if not self._ensure_view():
             return
-        # Body index 0 = the (single) held-asset body; sum over filtered bodies (M) ->
-        # world-frame net contact force (num_envs, 3).
-        force_w = fm[:, 0, :, :].sum(dim=1)
-        # Rotate into the EE / force-torque frame (matches the hybrid-control frame) so
-        # the per-axis flags align with the task-space control axes.
+        # (num_envs, M_filters, 3) per-pair contact force; sum over filtered bodies -> world net.
+        fmat = self._contact_view.get_contact_force_matrix(self._dt)
+        force_w = fmat.sum(dim=1)
+        # Rotate into the EE / force-torque frame so per-axis flags align with the control axes.
         force_ee = quat_rotate_inverse(self.unwrapped.fingertip_midpoint_quat, force_w)
         in_contact = force_ee.abs() > self._threshold  # (num_envs, 3) bool
         self.unwrapped.in_contact = in_contact
@@ -223,24 +251,14 @@ class ContactSensorWrapper(gym.Wrapper):
 
     # ------------------------------------------------------------------ gym
     def step(self, action):
-        if not self._initialized and hasattr(self.unwrapped, "scene"):
-            self._initialize()
         out = super().step(action)
-        # After super().step(), the scene (and thus the contact sensor) has been
-        # updated for this step, and fingertip_midpoint_quat reflects the current pose.
-        if self._initialized:
-            self._update_contact()
-        # Expose the RAW per-axis contact bool (num_envs, 3) on the info dict so agents
-        # can buffer it as a supervised-selection target / append it as an input feature.
-        # Separate key from the to_log / per_env_to_log logging path; the outer scorer
-        # wrapper passes info through unchanged. Absent until the sensor's first update.
+        # After super().step() the physics has advanced and fingertip_midpoint_quat is current.
+        self._update_contact()
+        # Expose the RAW per-axis contact bool on the info dict (SSL target / obs feature).
         in_contact = getattr(self.unwrapped, "in_contact", None)
         if in_contact is not None and isinstance(out[4], dict):
             out[4]["in_contact"] = in_contact.float()
         return out
 
     def reset(self, **kwargs):
-        out = super().reset(**kwargs)
-        if not self._initialized and hasattr(self.unwrapped, "scene"):
-            self._initialize()
-        return out
+        return super().reset(**kwargs)
