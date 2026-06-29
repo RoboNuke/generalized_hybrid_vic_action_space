@@ -91,6 +91,7 @@ def build_env(
     import gymnasium as gym
 
     import isaaclab_tasks  # noqa: F401  registers Isaac-* gym ids
+    import tasks.flat_surface_follow  # noqa: F401  registers the repo-local Isaac-FlatSurfaceFollow- id
     from isaaclab_tasks.utils import parse_env_cfg
     from wrappers import (
         default_wrapper_for_task,
@@ -318,10 +319,11 @@ def build_env(
     if contact_enabled:
         if not (runner_cfg.task.startswith("Isaac-Forge-")
                 or runner_cfg.task.startswith("Isaac-Factory-")
+                or runner_cfg.task.startswith("Isaac-FlatSurfaceFollow-")
                 or is_automate_assembly):
             raise ValueError(
                 f"sensor_cfg.contact.enabled=True requires a Forge/Factory/AutoMate-Assembly "
-                f"task (held/fixed peg-insertion assets), but task is {runner_cfg.task!r}."
+                f"or FlatSurfaceFollow task (held/fixed assets), but task is {runner_cfg.task!r}."
             )
 
     # Optional in-gripper grasp-rotation offset (Forge/Factory peg insertion only): patch
@@ -406,18 +408,26 @@ def build_env(
     # the env-side prerequisites (no fabric clones so the joints land on real USD prims; no in-grip
     # position jitter so the constant weld frame agrees with the reset teleport).
     if runner_cfg.glue_peg_to_gripper:
-        if not (runner_cfg.task.startswith("Isaac-Forge-")
-                or runner_cfg.task.startswith("Isaac-Factory-")):
+        _task_name = getattr(env_cfg.task, "name", None)
+        _is_peg = (
+            (runner_cfg.task.startswith("Isaac-Forge-") or runner_cfg.task.startswith("Isaac-Factory-"))
+            and _task_name == "peg_insert"
+        )
+        _is_surface = (
+            runner_cfg.task.startswith("Isaac-FlatSurfaceFollow-") and _task_name == "flat_surface_follow"
+        )
+        if not (_is_peg or _is_surface):
             raise ValueError(
-                "runner_cfg.glue_peg_to_gripper=True requires a Forge/Factory peg-insertion task, "
-                f"but task is {runner_cfg.task!r}."
+                "runner_cfg.glue_peg_to_gripper=True supports the peg_insert (Forge/Factory) and "
+                f"flat_surface_follow tasks (the weld mirrors their grasp), but task={runner_cfg.task!r} "
+                f"name={_task_name!r}."
             )
-        if getattr(env_cfg.task, "name", None) != "peg_insert":
-            raise ValueError(
-                "runner_cfg.glue_peg_to_gripper=True supports the 'peg_insert' task only (the weld "
-                f"transform mirrors the peg_insert grasp), but env_cfg.task.name="
-                f"{getattr(env_cfg.task, 'name', None)!r}."
-            )
+        # The weld's constant in-gripper tilt: peg reads it from runner_cfg.rel_grasp_rot_init_deg
+        # (with grasp_rot_mode='fixed'); the surface reads its task.inhand_tilt_range_deg (treated as
+        # a fixed offset — the held cylinder is welded at that constant angle).
+        _weld_tilt = (
+            list(env_cfg.task.inhand_tilt_range_deg) if _is_surface else runner_cfg.rel_grasp_rot_init_deg
+        )
         # The peg is folded into the Franka articulation as a rigid LINK on the env-0 prototype
         # before clone_environments (replicate_physics propagates it to every env), so
         # clone_in_fabric stays True and there is NO maximal-coordinate loop joint — which is what
@@ -453,7 +463,7 @@ def build_env(
             _mod_name, _cls_name = _entry.split(":")
             _env_cls = getattr(importlib.import_module(_mod_name), _cls_name)
         from wrappers.sensors.peg_weld_wrapper import install_peg_weld
-        install_peg_weld(runner_cfg.rel_grasp_rot_init_deg, env_class=_env_cls)
+        install_peg_weld(_weld_tilt, env_class=_env_cls)
 
     env = gym.make(runner_cfg.task, cfg=env_cfg, render_mode=None)
 
@@ -532,6 +542,19 @@ def build_env(
             f"(threshold={sensor_cfg.contact.contact_force_threshold} N, "
             f"log_contact_state={sensor_cfg.contact.log_contact_state})"
         )
+
+    # Interaction frame for the upstream peg tasks (Factory/Forge/AutoMate). The surface env
+    # computes its own interaction frame internally, so this only covers the peg tasks we don't
+    # subclass. Attached AFTER the contact-sensor wrapper so `env.in_contact` exists to gate
+    # `interaction_exists`. Viz/obs only — does not feed control or change the spaces.
+    if contact_enabled and (
+        runner_cfg.task.startswith("Isaac-Forge-")
+        or runner_cfg.task.startswith("Isaac-Factory-")
+        or is_automate_assembly
+    ):
+        from wrappers.sensors.interaction_frame import InteractionFrameWrapper
+        env = InteractionFrameWrapper(env)
+        print("[runner] interaction-frame wrapper attached (peg tasks).")
 
     # Energy-metrics wrapper (logging-only): same layer as the contact sensor — inside
     # the scorer (so its energy_metrics/* entries in extras['to_log'] are forwarded) and

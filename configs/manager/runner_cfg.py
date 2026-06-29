@@ -253,14 +253,16 @@ class RunnerCfg:
                 "grasp_rot_mode='random' (symmetric ± range), "
                 f"got {self.rel_grasp_rot_init_deg!r}"
             )
-        # A constant peg-gripper weld is only well-defined for a deterministic grasp: the GPU
-        # pipeline parses a joint's local frame at play time and cannot change it per step.
-        if self.glue_peg_to_gripper and self.grasp_rot_mode != "fixed":
+        # A constant gripper weld is only well-defined for a DETERMINISTIC grasp: the GPU pipeline
+        # parses a joint's local frame at play time and cannot change it per step. 'random' grasp
+        # tilt is therefore incompatible. 'fixed' (peg tasks) and 'none' (surface task, whose grasp
+        # tilt comes from task.inhand_tilt_range_deg) are both deterministic and allowed; the
+        # per-task consistency (which tilt source feeds the weld) is enforced in env_setup.build_env.
+        if self.glue_peg_to_gripper and self.grasp_rot_mode == "random":
             raise ValueError(
-                "RunnerCfg.glue_peg_to_gripper=True requires grasp_rot_mode='fixed' "
-                "(a constant grasp). The welded peg-in-gripper transform is authored once before "
-                "play and cannot change between physics steps on the GPU pipeline, so a randomized "
-                f"or absent grasp tilt is not supported. Got grasp_rot_mode={self.grasp_rot_mode!r}."
+                "RunnerCfg.glue_peg_to_gripper=True is incompatible with grasp_rot_mode='random' "
+                "(the welded in-gripper transform is authored once before play and cannot change "
+                "per step). Use grasp_rot_mode='fixed' (peg) or 'none' (surface)."
             )
         # Fragile pegs reset individual envs out of sync; the native Factory/Forge reset path
         # assumes all envs reset together, so the efficient per-env reset is mandatory.

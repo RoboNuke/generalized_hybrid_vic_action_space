@@ -120,7 +120,13 @@ def _compute_peg_in_fingertip(env, tilt_deg: Sequence[float]):
     # NOTE: keep every tensor float32 — the env's torch_utils (TorchScript) refuse mixed
     # dtypes, and np.deg2rad below yields float64, so cast the Euler angles explicitly.
     rel_pos = torch.zeros((1, 3), device=device, dtype=torch.float32)
-    rel_pos[0, 2] = height - fingerpad
+    # Held-asset origin offset along the grasp axis. The peg USD origin is at the base
+    # (height - fingerpad); the procedural surface CYLINDER origin is at its CENTER
+    # (height/2 - fingerpad) — matching FlatSurfaceFollowEnv.get_handheld_asset_relative_pose.
+    if env.cfg_task.name == "flat_surface_follow":
+        rel_pos[0, 2] = height / 2.0 - fingerpad
+    else:
+        rel_pos[0, 2] = height - fingerpad
     identity = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device, dtype=torch.float32)
 
     # Fixed grasp tilt, composed onto the (identity) base exactly as grasp_tilt_wrapper:
@@ -272,10 +278,10 @@ def install_peg_weld(rel_grasp_rot_init_deg: Sequence[float], env_class: Any = N
     _original_setup_scene = env_class._setup_scene
 
     def _patched_setup_scene(self):
-        if self.cfg_task.name != "peg_insert":
+        if self.cfg_task.name not in ("peg_insert", "flat_surface_follow"):
             raise ValueError(
-                "install_peg_weld supports the 'peg_insert' task only (the weld transform "
-                f"mirrors the peg_insert grasp), but cfg_task.name is {self.cfg_task.name!r}."
+                "install_peg_weld supports the 'peg_insert' / 'flat_surface_follow' tasks (the weld "
+                f"transform mirrors their grasp), but cfg_task.name is {self.cfg_task.name!r}."
             )
 
         state = {}
@@ -359,6 +365,10 @@ def install_peg_weld(rel_grasp_rot_init_deg: Sequence[float], env_class: Any = N
                     pass
                 setattr(orig_held, _h, None)
         self.scene._articulations.pop("held_asset", None)
+        # The surface task registers the held cylinder as a RigidObject (procedural primitive), not
+        # an Articulation, so it lives in scene._rigid_objects — drop it from there too.
+        if hasattr(self.scene, "_rigid_objects"):
+            self.scene._rigid_objects.pop("held_asset", None)
         self._held_asset = _HeldLinkShim(self._robot, state["peg_body_name"], self.num_envs, self.device)
         print(
             f"[peg-weld] replaced held_asset articulation with a Franka-link shim "
@@ -368,7 +378,8 @@ def install_peg_weld(rel_grasp_rot_init_deg: Sequence[float], env_class: Any = N
 
     env_class._setup_scene = _patched_setup_scene
     print(
-        "[peg-weld] FactoryEnv._setup_scene patched: peg folded into the Franka articulation as a "
-        "rigid link before clone (Fabric-compatible; reduced-coordinate; no loop-joint leak).",
+        f"[peg-weld] {env_class.__name__}._setup_scene patched: held asset folded into the Franka "
+        "articulation as a rigid link before clone (Fabric-compatible; reduced-coordinate; no "
+        "loop-joint leak).",
         flush=True,
     )

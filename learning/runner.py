@@ -215,6 +215,7 @@ def main(argv: list[str] | None = None) -> None:
     import torch
 
     import isaaclab_tasks  # noqa: F401  registers Isaac-* gym ids
+    import tasks.flat_surface_follow  # noqa: F401  registers the repo-local Isaac-FlatSurfaceFollow- id
     from skrl.trainers.torch import SequentialTrainer
     from skrl.utils import set_seed
 

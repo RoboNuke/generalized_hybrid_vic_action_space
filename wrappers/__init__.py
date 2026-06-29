@@ -17,6 +17,7 @@ _REGISTRY: dict[str, str] = {
     "ant_success": "wrappers.scorers.ant_success.AntSuccessWrapper",
     "factory": "wrappers.scorers.factory.FactoryWrapper",
     "forge": "wrappers.scorers.forge.ForgeWrapper",
+    "flat_surface_follow": "wrappers.scorers.flat_surface_follow.FlatSurfaceFollowWrapper",
     "reward_decomposition": "wrappers.scorers.reward_decomposition.RewardDecompositionWrapper",
 }
 
@@ -33,6 +34,10 @@ _TASK_DEFAULTS: dict[str, str] = {
     "Isaac-Ant-": "ant_success",
     "Isaac-Factory-": "factory",
     "Isaac-Forge-": "forge",
+    # Repo-local surface path-following task (tasks/flat_surface_follow). Its env
+    # subclasses ForgeEnv and logs via _log_factory_metrics, so the Factory-style
+    # scorer (with surface-follow reward scales) applies.
+    "Isaac-FlatSurfaceFollow-": "flat_surface_follow",
     # AutoMate Assembly, wrapped by AutoMateForgeAdapter, exposes the FORGE reward
     # decomposition (_log_factory_metrics / _log_forge_metrics) — use the forge scorer.
     "Isaac-AutoMate-Assembly-": "forge",
