@@ -2,12 +2,18 @@
 # launchers/exp_file_launcher.bash — run sac_block_e2e.sh over every config in a folder.
 #
 # Usage:
-#   exp_file_launcher.bash <config_folder> [extra args passed through to sac_block_e2e.sh ...]
+#   exp_file_launcher.bash <config_folder> [--skip_existing] [extra args passed through to sac_block_e2e.sh ...]
 #
 # For each *.yaml file directly inside <config_folder> it calls:
 #   bash launchers/sac_block_e2e.sh <config_path> <exp_name> --record [extra args...]
 # where <exp_name> is the config filename with the .yaml suffix and the folder
 # path stripped (e.g. configs/exp_cfgs/sac_PiH/VIC.yaml -> VIC).
+#
+# --skip_existing (launcher-only flag, not forwarded): before running a config,
+# resolve the experiment output dir the same way runner.py does
+# (<logdir>/<family>/<exp_name>, with the legacy collapse) and SKIP the config if
+# that folder already exists and is non-empty. Lets you re-invoke a batch to fill
+# in only the runs that have not been done yet, without re-training finished ones.
 #
 # --record is passed so each run, after training (and eval), records a best-policy
 # (ckpt_best.pt) grid GIF per agent into <EXP_DIR>/<i>/videos/, using <config_folder>/_record.yaml
@@ -23,16 +29,38 @@ set -uo pipefail
 
 # ===== Args =====
 if [[ $# -lt 1 ]]; then
-    echo "Usage: $0 <config_folder> [extra args for sac_block_e2e.sh ...]" >&2
+    echo "Usage: $0 <config_folder> [--skip_existing] [extra args for sac_block_e2e.sh ...]" >&2
     echo "  e.g. $0 configs/exp_cfgs/sac_PiH" >&2
     exit 2
 fi
 CONFIG_FOLDER="$1"
 shift
-EXTRA_ARGS=("$@")
+# Pull out the launcher-only --skip_existing flag; everything else is forwarded to
+# the per-run launcher. We also note --experiment_directory (if present) because it
+# overrides the experiment "family" dir and is needed to resolve the skip target.
+SKIP_EXISTING=0
+EXP_DIR_OVERRIDE=""
+EXTRA_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --skip_existing) SKIP_EXISTING=1 ;;
+        --experiment_directory)
+            [[ $# -ge 2 ]] || { echo "[batch] --experiment_directory requires a value" >&2; exit 2; }
+            EXP_DIR_OVERRIDE="$2"
+            EXTRA_ARGS+=("$1" "$2")
+            shift ;;
+        *) EXTRA_ARGS+=("$1") ;;
+    esac
+    shift
+done
 
 # ===== Derived paths =====
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+# Mirror sac_block_e2e.sh: LOGDIR defaults to <project_root>/runs and can be
+# overridden via the LOGDIR env var. Used only to resolve --skip_existing targets.
+LOGDIR="${LOGDIR:-$PROJECT_ROOT/runs}"
+PYTHON="${PYTHON:-python}"
 PER_RUN_LAUNCHER="$SCRIPT_DIR/sac_block_e2e.sh"
 
 [[ -d "$CONFIG_FOLDER" ]] || { echo "[batch] config folder not found: $CONFIG_FOLDER" >&2; exit 1; }
@@ -63,12 +91,54 @@ IFS=$'\n' CONFIGS=($(sort <<<"${CONFIGS[*]}")); unset IFS
 
 echo "[batch] found ${#CONFIGS[@]} config(s) in $CONFIG_FOLDER"
 
+# ===== --skip_existing helper =====
+# Resolve the per-run output dir for a config exactly as runner.py does:
+#   <logdir>/<family>/<exp_name>, where family = sac_cfg/ppo_cfg.experiment.directory
+#   (overridden by --experiment_directory), with the legacy collapse when the family
+#   basename equals the logdir basename. Prints the resolved path on stdout.
+resolve_exp_dir() {
+    local config_path="$1" exp_name="$2"
+    "$PYTHON" - "$config_path" "$LOGDIR" "$EXP_DIR_OVERRIDE" "$exp_name" "$PROJECT_ROOT" <<'PY'
+import os, sys, yaml
+config_path, log_root, exp_dir_override, exp_name, project_root = sys.argv[1:6]
+cfg = yaml.safe_load(open(config_path)) or {}
+agent_type = str(cfg.get("runner_cfg", {}).get("agent_type", "sac")).lower()
+cfg_key = "ppo_cfg" if agent_type == "ppo" else "sac_cfg"
+family = (exp_dir_override or "").strip()
+if not family:
+    experiment = (cfg.get(cfg_key) or {}).get("experiment") or {}
+    family = str(experiment.get("directory") or "").strip()
+log_root_basename = os.path.basename(os.path.normpath(log_root)) if log_root else ""
+family_basename = os.path.basename(os.path.normpath(family)) if family else ""
+if not family or family_basename == log_root_basename:
+    final_directory = log_root
+else:
+    final_directory = os.path.join(log_root, family)
+if not os.path.isabs(final_directory):
+    final_directory = os.path.join(project_root, final_directory)
+print(os.path.join(final_directory, exp_name))
+PY
+}
+
 # ===== Run each config =====
 FAILED=()
 PASSED=()
+SKIPPED=()
 for config_path in "${CONFIGS[@]}"; do
     base="$(basename -- "$config_path")"   # strip folder path
     exp_name="${base%.yaml}"               # strip .yaml suffix
+
+    # --skip_existing: if the resolved output dir already exists and is non-empty,
+    # this config has already been run — skip it. If resolution fails (bad YAML,
+    # python error), fall through and run it rather than silently skipping.
+    if [[ "$SKIP_EXISTING" -eq 1 ]]; then
+        exp_dir="$(resolve_exp_dir "$config_path" "$exp_name")" || exp_dir=""
+        if [[ -n "$exp_dir" && -d "$exp_dir" ]] && compgen -G "$exp_dir/*" >/dev/null; then
+            echo "[batch] SKIP (exists): $exp_name -> $exp_dir"
+            SKIPPED+=("$exp_name")
+            continue
+        fi
+    fi
 
     echo ""
     echo "[batch] ===================================================================="
@@ -92,9 +162,10 @@ done
 # ===== Summary =====
 echo ""
 echo "[batch] ===================================================================="
-echo "[batch] DONE. ${#PASSED[@]} passed, ${#FAILED[@]} failed (of ${#CONFIGS[@]} total)"
+echo "[batch] DONE. ${#PASSED[@]} passed, ${#FAILED[@]} failed, ${#SKIPPED[@]} skipped (of ${#CONFIGS[@]} total)"
 for name in "${PASSED[@]}"; do echo "[batch]   PASS: $name"; done
 for name in "${FAILED[@]}"; do echo "[batch]   FAIL: $name"; done
+for name in "${SKIPPED[@]}"; do echo "[batch]   SKIP: $name"; done
 echo "[batch] ===================================================================="
 
 # Nonzero exit if any run failed, but only after attempting all of them.

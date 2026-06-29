@@ -104,7 +104,7 @@ sac_cfg:
   polyak: 0.005
   actor_lr: 1.0e-4
   critic_lr: 1.0e-4
-  entropy_lr: 1.0e-5
+  entropy_lr: 1.0e-4
   weight_decay: 1.0e-2
   random_timesteps: 0
   learning_starts: 300

@@ -8,7 +8,7 @@ the Factory/Forge ``fixed_asset`` / ``held_asset`` ArticulationCfg fields but as
 
 ``FlatSurfaceFollowTask`` keeps FLAT config fields (``{thing}_scale`` /
 ``{thing}_target`` / ``{thing}_range_deg``) so task params are easy to override
-via ``runner_cfg.env_cfg_overrides`` dotted paths (e.g. ``task.target_speed``).
+via ``runner_cfg.env_cfg_overrides`` dotted paths (e.g. ``task.desired_speed_cm_s``).
 """
 
 import isaaclab.sim as sim_utils
@@ -81,26 +81,51 @@ class FlatSurfaceFollowTask(ForgeTask):
     hand_init_orn_noise: list = [0.0, 0.0, 3.1416]  # yaw is free (cylinder is axisymmetric)
 
     # --- Task command setpoints ---
-    target_speed: float = 0.05                    # m/s along the path
-    target_normal_force: float = 5.0              # N into the surface
-    commanded_axis_angle_deg: float = 0.0         # angle between surface normal and cylinder axis
+    desired_speed_cm_s: float = 5.0               # v: desired along-track speed (cm/s) for the pace term
 
     # --- Observation toggles ---
     observe_eef_torque: bool = False              # add the 3-D EEF-frame torque to the obs (policy + critic)
 
     # --- Success tolerances ---
     success_pos_tol: float = 0.01                 # cylinder tip within this of the far-edge center
-    success_orn_tol_deg: float = 10.0             # orientation error within this of the command
+    success_orn_tol_deg: float = 10.0             # |orientation error| (deg) within this of the desired
 
-    # --- Reward weights (FLAT; reward TERMS are a later pass — these wire the scorer) ---
-    progress_scale: float = 1.0
-    goal_kp_scale: float = 1.0
-    cross_track_scale: float = 1.0
-    speed_scale: float = 1.0
-    normal_force_scale: float = 1.0
-    orientation_scale: float = 1.0
-    action_penalty_ee_scale: float = 0.0
-    action_grad_penalty_scale: float = 0.0
+    # --- Reward terms ---
+    # Convention: each term computes a RAW SIGNED value from REALIZED (measured/physics) state —
+    # never control targets — and maps it through the keypoint squashing function
+    #     r = weight * squashing_fn(value, a, b),   squashing_fn(x,a,b) = 1/(e^{a*x}+b+e^{-a*x})
+    # which peaks at value=0 (perfect match). Each term carries its own weight + (a, b).
+    #
+    # Force tracking: value = desired_force - (measured EEF force projected onto the surface normal).
+    # The desired force acts along the surface-normal (z); it is sampled once per episode in
+    # [force_desired_min, force_desired_max] (N), observed by the policy, and the measured EEF force
+    # is projected onto the world surface normal for a fair (same-frame) difference.
+    force_desired_min: float = 2.0                # N
+    force_desired_max: float = 10.0               # N
+    force_weight: float = 1.0
+    force_a: float = 0.5                          # squashing steepness over the force error (N)
+    force_b: float = 0.0
+    # Orientation constraint: value = orientation_desired_angle_deg - (angle of the held object's
+    # z-axis to the surface PLANE). Angle-to-plane = asin(|held_z . normal|): 90deg = perpendicular
+    # (tip-down), 0deg = lying in the plane. Free to rotate about the normal (only the plane angle is
+    # constrained). Realized from the physics held-object orientation.
+    orientation_desired_angle_deg: float = 90.0   # desired angle of the tool axis to the surface plane
+    orientation_weight: float = 1.0
+    orientation_a: float = 0.1                    # squashing steepness over the angle error (deg)
+    orientation_b: float = 0.0
+    # Straightness + pace (both built on the ideal straight path p0->p_g on the plate top surface):
+    #   d   = unit start->goal direction; L = |p_g - p0| (path length, m); dp = tip - p0
+    #   s     = dp . d            (along-track position, m)
+    #   e_perp= dp . (n x d)      (cross-track, signed, m)            -> STRAIGHTNESS value
+    #   s_ref = clamp(v . tau, 0, L), tau advances by dt only while in contact (a schedule clock)
+    #   e_pace= s - s_ref         (pace error, signed, m)             -> PACE value
+    # Tracking s_ref makes the tool reach the surface then trace the line at the desired speed.
+    straightness_weight: float = 1.0
+    straightness_a: float = 20.0                  # squashing steepness over the cross-track error (m)
+    straightness_b: float = 0.0
+    pace_weight: float = 1.0
+    pace_a: float = 20.0                          # squashing steepness over the pace error (m)
+    pace_b: float = 0.0
 
     # --- Procedural primitive spawns ---
     # Plate: kinematic so it never drifts under the cylinder's normal force.

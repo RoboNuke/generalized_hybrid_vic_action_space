@@ -465,6 +465,17 @@ def build_env(
         from wrappers.sensors.peg_weld_wrapper import install_peg_weld
         install_peg_weld(_weld_tilt, env_class=_env_cls)
 
+    # Full 6-DOF rotation: strip the upright-gripper (EEF/world-alignment) assumption from the base
+    # Forge/Factory env — the obs no longer zeroes the fingertip quat's w,z or the roll/pitch angular
+    # velocity, and the reset gripper-close holds the current (possibly tilted) pose. Required because
+    # the EEF-frame control convention lets the gripper rotate freely. Patches the classes, so it
+    # covers Forge/AutoMate peg tasks AND the surface task (which subclasses ForgeEnv).
+    if (runner_cfg.task.startswith("Isaac-Forge-")
+            or runner_cfg.task.startswith("Isaac-Factory-")
+            or runner_cfg.task.startswith("Isaac-FlatSurfaceFollow-")):
+        from wrappers.sensors.forge_full_rotation import install_forge_full_rotation
+        install_forge_full_rotation()
+
     env = gym.make(runner_cfg.task, cfg=env_cfg, render_mode=None)
 
     # AutoMate-as-Forge adapter: must wrap the raw env BEFORE the control wrapper, since the

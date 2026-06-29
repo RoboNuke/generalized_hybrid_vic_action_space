@@ -27,9 +27,10 @@ runner_cfg:
   # (No peg/Forge knobs: glue/grasp/disable_success_pred/kp_z_align/insertion-reward
   # are peg-only and would error on this task.)
   env_cfg_overrides:
-    task.target_speed: 0.05
-    task.target_normal_force: 5.0
-    task.commanded_axis_angle_deg: 0.0
+    task.desired_speed_cm_s: 5.0
+    task.force_desired_min: 2.0
+    task.force_desired_max: 10.0
+    task.orientation_desired_angle_deg: 90.0
     task.plate_tilt_range_deg: 10.0
     task.inhand_tilt_range_deg: [0.0, 0.0, 0.0]
     task.observe_eef_torque: false

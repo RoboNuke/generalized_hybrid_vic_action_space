@@ -24,19 +24,19 @@ from .flat_surface_follow_tasks_cfg import FlatSurfaceFollowTask
 # Factory/Forge obs layouts are unaffected.
 OBS_DIM_CFG.update(
     {
-        "goal_pos_rel": 3,     # R_eefᵀ (goal_pos - eef_pos): goal position in the EEF frame
-        "goal_rot_rel": 3,     # axis-angle(eef -> goal frame) in the EEF frame
-        "ft_torque_eef": 3,    # EEF-frame torque (appended to obs_order only when observe_eef_torque)
-        "target_speed": 1,
+        # Moving SETPOINT position (the point at arc-length s_ref along the path), relative to the
+        # tool in the EEF frame, sign-aligned — REPLACES the final-goal so the policy tracks the
+        # moving setpoint (generalizes to non-straight paths) and never sees the far-edge goal.
+        # No orientation setpoint — orientation is inferred (from force/torque + shaped by reward).
+        "setpoint_pos_rel": 3,  # R_eefᵀ (setpoint_pos - eef_pos): setpoint position in the EEF frame
+        "ft_torque_eef": 3,     # EEF-frame torque (appended to obs_order only when observe_eef_torque)
         "target_normal_force": 1,
     }
 )
 STATE_DIM_CFG.update(
     {
-        "goal_pos_rel": 3,
-        "goal_rot_rel": 3,
+        "setpoint_pos_rel": 3,
         "ft_torque_eef": 3,
-        "target_speed": 1,
         "target_normal_force": 1,
         # Privileged surface geometry (critic only — the policy must infer it).
         "surface_normal": 3,
@@ -64,33 +64,29 @@ class FlatSurfaceFollowEnvCfg(ForgeEnvCfg):
     task: FlatSurfaceFollowTask = FlatSurfaceFollowTask()
     events: FlatSurfaceFollowEventCfg = FlatSurfaceFollowEventCfg()
 
-    # Long enough to traverse plate_length (0.20 m) at target_speed (0.05 m/s) = 4 s,
+    # Long enough to traverse plate_length (0.20 m) at desired_speed_cm_s (5 cm/s) = 4 s,
     # with margin for approach + settling.
     episode_length_s = 15.0
 
-    # POLICY obs (all EEF-frame): goal pose relative to the goal frame (sign-aligned),
-    # EEF-frame velocities + force, command setpoints. The 3-D EEF torque is appended at
-    # env construction when task.observe_eef_torque is set. No surface geometry — the
-    # policy must infer contact from the force.
+    # POLICY obs (all EEF-frame): MOVING-SETPOINT pose relative to the tool (sign-aligned) + the
+    # scalar s_ref, EEF-frame velocities + force, command setpoints. NO final-goal observation —
+    # only the current setpoint. The 3-D EEF torque is appended at env construction when
+    # task.observe_eef_torque is set. No surface geometry — the policy must infer contact from force.
     obs_order: list = [
-        "goal_pos_rel",
-        "goal_rot_rel",
+        "setpoint_pos_rel",
+        "fingertip_quat",   # EEF orientation, world frame
         "ee_linvel",
         "ee_angvel",
         "ft_force",
-        "force_threshold",
-        "target_speed",
         "target_normal_force",
     ]
-    # CRITIC state: same relative pose + EEF-frame vel/force, plus the full privileged
-    # asset/robot state and the surface geometry.
+    # CRITIC state: same setpoint-relative pose + s_ref + EEF-frame vel/force, plus the full
+    # privileged asset/robot state and the surface geometry.
     state_order: list = [
-        "goal_pos_rel",
-        "goal_rot_rel",
+        "setpoint_pos_rel",
         "ee_linvel",
         "ee_angvel",
         "ft_force",
-        "force_threshold",
         "fingertip_pos",
         "fingertip_quat",
         "joint_pos",
@@ -108,6 +104,5 @@ class FlatSurfaceFollowEnvCfg(ForgeEnvCfg):
         "cross_track",
         "orn_error",
         "normal_force",
-        "target_speed",
         "target_normal_force",
     ]

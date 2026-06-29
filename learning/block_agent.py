@@ -37,6 +37,7 @@ from models.block_simba import (
     slice_optimizer_state,
 )
 from models.preprocessor_wrapper import PerAgentPreprocessorWrapper
+from learning.metric_writer import MetricWriter, make_wandb_run
 
 
 # Insertion-task phases for per-phase metric splitting (cfg.phase_split_families).
@@ -89,7 +90,9 @@ class BlockAgent(Agent):
         self._pending_contact: torch.Tensor | None = None
 
         # per-agent tracking buffers (writers created in init() once experiment_dir is set)
-        self.per_agent_writers: list[SummaryWriter] = []
+        # Per-agent scalar sink: a raw skrl SummaryWriter, or (when experiment.wandb
+        # is set) a MetricWriter wrapping it that also mirrors to a per-agent wandb run.
+        self.per_agent_writers: list = []
         # Separate torch.utils.tensorboard.SummaryWriter per agent dedicated to
         # image events. skrl's SummaryWriter (used for scalars) doesn't
         # implement add_image; both writers point at the same log dir so TB
@@ -272,7 +275,19 @@ class BlockAgent(Agent):
         """
         if getattr(self, "_init_done", False):
             return
-        super().init(trainer_cfg=trainer_cfg)
+        # The base Agent.init() fires its OWN single shared wandb.init() (with
+        # sync_tensorboard) for the shared writer we discard below. We publish a
+        # per-agent wandb run ourselves, so hide experiment.wandb across the base
+        # init and restore it afterward — the base never creates that stray run.
+        _exp = getattr(self.cfg, "experiment", None)
+        _wandb_flag = bool(getattr(_exp, "wandb", False)) if _exp is not None else False
+        if _wandb_flag:
+            _exp.wandb = False
+        try:
+            super().init(trainer_cfg=trainer_cfg)
+        finally:
+            if _wandb_flag:
+                _exp.wandb = True
         self.enable_models_training_mode(False)
 
         # tear down the shared writer the base class created (we publish per-agent only).
@@ -304,12 +319,26 @@ class BlockAgent(Agent):
         # per-agent writers + per-agent reward/episode deques.
         # Layout: <experiment_dir>/<i>/ holds tensorboard events AND checkpoints for agent i,
         # so each agent's folder is fully self-contained.
+        # Backend is the single experiment.wandb bool (skrl's ExperimentCfg): when set,
+        # each agent's SummaryWriter is wrapped in a MetricWriter that mirrors the same
+        # scalars to that agent's own wandb run (write_tracking_data is unchanged — it
+        # only calls add_scalar/flush, which the wrapper forwards to both backends).
+        wandb_enabled = bool(getattr(getattr(self.cfg, "experiment", None), "wandb", False))
         if self.write_interval > 0:
             for i in range(self.num_agents):
                 agent_log_dir = os.path.join(self.experiment_dir, str(i))
-                self.per_agent_writers.append(
-                    SummaryWriter(log_dir=agent_log_dir)
-                )
+                tb_writer = SummaryWriter(log_dir=agent_log_dir)
+                if wandb_enabled:
+                    wandb_run = make_wandb_run(
+                        agent_index=i,
+                        num_agents=self.num_agents,
+                        experiment_dir=self.experiment_dir,
+                        log_dir=agent_log_dir,
+                        cfg=self.cfg,
+                    )
+                    self.per_agent_writers.append(MetricWriter(tb_writer, wandb_run))
+                else:
+                    self.per_agent_writers.append(tb_writer)
                 self.per_agent_tracking.append(collections.defaultdict(list))
                 self.per_agent_dist_stats.append({})
                 self.per_agent_scalar_stats.append({})

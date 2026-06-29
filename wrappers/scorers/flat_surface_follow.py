@@ -20,14 +20,12 @@ class FlatSurfaceFollowWrapper(FactoryWrapper):
     """Factory-style scorer with surface-follow reward scales."""
 
     def _factory_scales(self) -> dict[str, float]:
+        # Weights for the per-term reward decomposition logging — must match the rew_scales in
+        # FlatSurfaceFollowEnv._get_rewards. Extend as new reward terms are added.
         cfg = self._unwrapped.cfg_task
         return {
-            "progress": float(cfg.progress_scale),
-            "goal_kp": float(cfg.goal_kp_scale),
-            "cross_track": float(cfg.cross_track_scale),
-            "speed": float(cfg.speed_scale),
-            "normal_force": float(cfg.normal_force_scale),
-            "orientation": float(cfg.orientation_scale),
-            "action_penalty_ee": -float(cfg.action_penalty_ee_scale),
-            "action_grad_penalty": -float(cfg.action_grad_penalty_scale),
+            "force": float(cfg.force_weight),
+            "orientation": float(cfg.orientation_weight),
+            "straightness": float(cfg.straightness_weight),
+            "pace": float(cfg.pace_weight),
         }

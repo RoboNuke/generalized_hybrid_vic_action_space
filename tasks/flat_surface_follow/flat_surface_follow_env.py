@@ -21,7 +21,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-from isaaclab.utils.math import axis_angle_from_quat, quat_apply, quat_from_matrix
+from isaaclab.utils.math import quat_apply, quat_from_matrix
 
 from isaaclab_tasks.direct.factory import factory_utils
 from isaaclab_tasks.direct.factory.factory_env import FactoryEnv
@@ -44,6 +44,14 @@ class FlatSurfaceFollowEnv(ForgeEnv):
                 if "ft_torque_eef" not in order:
                     order.append("ft_torque_eef")
         super().__init__(cfg, render_mode, **kwargs)
+        # Per-episode desired normal force (N), sampled in _reset_idx, observed by the policy.
+        self.desired_force = torch.zeros((self.num_envs,), device=self.device)
+        # Pace schedule clock (s): advances by the env step dt only while in contact; drives the
+        # moving along-track setpoint s_ref. Reset to 0 each episode.
+        self.pace_tau = torch.zeros((self.num_envs,), device=self.device)
+        # Moving setpoint (recomputed each _compute); init for safety before the first reset.
+        self.s_ref = torch.zeros((self.num_envs,), device=self.device)
+        self.setpoint_pos = torch.zeros((self.num_envs, 3), device=self.device)
 
     # ------------------------------------------------------------------
     # Small geometry helpers
@@ -170,12 +178,21 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         proj_minus = (end_minus * normal).sum(-1, keepdim=True)
         self.cyl_tip = torch.where(proj_plus < proj_minus, end_plus, end_minus)
 
-        rel = self.cyl_tip - start
-        self.progress = (rel * path_dir).sum(-1)
-        along = self.progress.unsqueeze(-1) * path_dir
-        normal_comp = (rel * normal).sum(-1, keepdim=True) * normal
-        self.cross_track = torch.linalg.norm(rel - along - normal_comp, dim=-1)
+        # Ideal straight path p0 -> p_g on the plate top surface. path_dir is d (unit start->goal).
+        rel = self.cyl_tip - start                                            # dp = tip - p0
+        self.path_length = torch.linalg.norm(goal - start, dim=-1)            # L = |p_g - p0|
+        self.d_lat = torch.cross(normal, path_dir, dim=-1)                    # d_lat = n x d (in-plane lateral)
+        self.progress = (rel * path_dir).sum(-1)                             # s = dp . d (along-track)
+        self.cross_track = (rel * self.d_lat).sum(-1)                        # e_perp = dp . d_lat (signed)
         self.v_along = (self.ee_linvel_fd * path_dir).sum(-1)
+
+        # Moving along-track setpoint s_ref = clamp(v*tau, 0, L) (tau = pace clock, advanced in
+        # _get_rewards). The setpoint POINT is at arc-length s_ref along the path on the surface;
+        # the policy/critic track this instead of the final goal, so the same interface generalizes
+        # to non-straight paths.
+        v_des = float(self.cfg_task.desired_speed_cm_s) / 100.0              # cm/s -> m/s
+        self.s_ref = (v_des * self.pace_tau).clamp_min(0.0).minimum(self.path_length)
+        self.setpoint_pos = start + self.s_ref.unsqueeze(-1) * path_dir
 
         # Measured normal force = projection of the FT force onto the true surface normal.
         # The raw smoothed force (force_sensor_world_smooth) is in the force_sensor child-joint
@@ -187,13 +204,15 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         force_world = quat_apply(sensor_quat, self.force_sensor_world_smooth[:, 0:3])
         self.measured_normal_force = (force_world * normal).sum(-1)
 
-        # Orientation error. The cylinder is axisymmetric (no preferred +/- along its
-        # axis), so use the LINE angle between the cylinder axis and the surface normal:
-        # |cyl_axis . normal| = cos(tilt-from-normal) (1 => perpendicular/tip-down,
-        # 0 => lying flat). Compare against the commanded angle. Sign-robust.
-        axis_from_normal = torch.arccos((self.cyl_axis * normal).sum(-1).abs().clamp(0.0, 1.0))
-        commanded = float(np.deg2rad(self.cfg_task.commanded_axis_angle_deg))
-        self.orn_error = (axis_from_normal - commanded).abs()
+        # Orientation: angle of the held object's z-axis to the surface PLANE
+        # (asin(|axis . normal|); 90deg = perpendicular/tip-down, 0deg = lying in the plane). The
+        # cylinder is axisymmetric, so only this plane angle is constrained (free about the normal).
+        # REALIZED from the physics held orientation. orn_error = desired - actual (signed, degrees)
+        # — the value the orientation reward squashes (and |orn_error| gates success).
+        self.held_angle_to_plane = torch.rad2deg(
+            torch.arcsin((self.cyl_axis * normal).sum(-1).abs().clamp(0.0, 1.0))
+        )
+        self.orn_error = float(self.cfg_task.orientation_desired_angle_deg) - self.held_angle_to_plane
 
         # --- Held-object END frame (the un-held / contact end) ---
         # Canonical "held object frame" = a frame at the un-held tip, oriented so z is the
@@ -229,13 +248,15 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         x_axis = torch.where(x_norm > 1e-6, x_dir / x_norm.clamp_min(1e-6), path_dir)
         y_axis = torch.cross(normal, x_axis, dim=-1)
         self.interaction_quat = quat_from_matrix(torch.stack([x_axis, y_axis, normal], dim=2))
-        # Exists only while in contact (per the contact-sensor wrapper's in_contact state).
-        in_contact = getattr(self, "in_contact", None)
-        self.interaction_exists = (
-            in_contact.any(dim=1)
-            if in_contact is not None
-            else torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        )
+        # In-contact bool (drives the interaction frame + the pace schedule clock). Prefer the
+        # contact-sensor wrapper's per-axis state; fall back to a small normal-force threshold when
+        # the contact sensor is disabled, so the env stays self-contained.
+        cw = getattr(self, "in_contact", None)
+        if torch.is_tensor(cw):
+            self.in_contact_any = cw.any(dim=1)
+        else:
+            self.in_contact_any = self.measured_normal_force.abs() > 0.1
+        self.interaction_exists = self.in_contact_any
 
         # Debug series (guarded — extras may not yet have a to_log dict).
         if hasattr(self, "extras"):
@@ -259,24 +280,14 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         fframe = (bq[:, self.fingertip_body_idx], bp[:, self.fingertip_body_idx])
         return forge_utils.change_FT_frame(raw[:, 0:3], raw[:, 3:6], sframe, fframe)
 
-    def _goal_frame_quat(self):
-        """Goal-frame orientation = surface frame at the far edge (z = normal, x = path)."""
-        z = self.surface_normal
-        x = self.path_dir
-        y = torch.cross(z, x, dim=-1)
-        return quat_from_matrix(torch.stack([x, y, z], dim=2))
-
     def _get_observations(self):
-        goal_quat = self._goal_frame_quat()
-        goal_pos = self.goal_world
+        setpoint_pos = self.setpoint_pos
 
-        def _pose_rel(eef_pos, eef_quat):
-            # Goal pose relative to the goal frame, expressed in the EEF frame, sign-aligned:
-            # a positive component => a positive action on that EEF axis moves toward the goal.
-            conj = torch_utils.quat_conjugate(eef_quat)
-            pos_rel = quat_apply(conj, goal_pos - eef_pos)                          # R_eefᵀ (goal - eef)
-            rot_rel = axis_angle_from_quat(torch_utils.quat_mul(conj, goal_quat))   # eef -> goal in eef
-            return pos_rel, rot_rel
+        def _setpoint_pos_rel(eef_pos, eef_quat):
+            # MOVING-SETPOINT position relative to the tool, in the EEF frame, sign-aligned: a
+            # positive component => a positive action on that EEF axis moves toward the setpoint.
+            # No orientation setpoint — orientation is inferred elsewhere (force/torque + reward).
+            return quat_apply(torch_utils.quat_conjugate(eef_quat), setpoint_pos - eef_pos)
 
         def _to_eef(vec, eef_quat):
             return quat_apply(torch_utils.quat_conjugate(eef_quat), vec)
@@ -284,36 +295,41 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         F_ft, T_ft = self._fingertip_wrench()  # clean fingertip-frame wrench
         force_noise = torch.randn((self.num_envs, 3), device=self.device) * float(self.cfg.obs_rand.ft_force)
 
-        ts = torch.full((self.num_envs, 1), float(self.cfg_task.target_speed), device=self.device)
-        tnf = torch.full((self.num_envs, 1), float(self.cfg_task.target_normal_force), device=self.device)
+        tnf = self.desired_force[:, None]  # per-episode desired normal force (the force target)
         prev_actions = self.actions.clone()
+        # EEF orientation (world frame): CLEAN quat for the critic; the policy gets a noisy estimate.
+        # Forge's noisy_fingertip_quat zeroes the quaternion w,z (a peg-upright encoding) and is
+        # INVALID for a full-orientation tool, so we build our own valid noisy quat: perturb the
+        # clean quat by a random small body-frame rotation of magnitude ~N(0, fingertip_rot_deg)
+        # (configurable via noise_cfg.fingertip_rot_deg -> obs_rand.fingertip_rot_deg).
+        eef_quat = self.fingertip_midpoint_quat
+        _axis = torch.randn((self.num_envs, 3), device=self.device)
+        _axis = _axis / torch.linalg.norm(_axis, dim=1, keepdim=True).clamp_min(1e-8)
+        _angle = torch.randn((self.num_envs,), device=self.device) * float(
+            np.deg2rad(self.cfg.obs_rand.fingertip_rot_deg)
+        )
+        noisy_eef_quat = torch_utils.quat_mul(eef_quat, torch_utils.quat_from_angle_axis(_angle, _axis))
 
-        # POLICY — noisy fingertip estimate (positions/orientation carry the Forge obs noise).
-        p_pos_rel, p_rot_rel = _pose_rel(self.noisy_fingertip_pos, self.noisy_fingertip_quat)
+        # POLICY — noisy position + noisy orientation estimate.
         obs_dict = {
-            "goal_pos_rel": p_pos_rel,
-            "goal_rot_rel": p_rot_rel,
-            "ee_linvel": _to_eef(self.fingertip_midpoint_linvel, self.noisy_fingertip_quat),
-            "ee_angvel": _to_eef(self.fingertip_midpoint_angvel, self.noisy_fingertip_quat),
+            "setpoint_pos_rel": _setpoint_pos_rel(self.noisy_fingertip_pos, noisy_eef_quat),
+            "fingertip_quat": noisy_eef_quat,  # EEF orientation, world frame (noisy)
+            "ee_linvel": _to_eef(self.fingertip_midpoint_linvel, noisy_eef_quat),
+            "ee_angvel": _to_eef(self.fingertip_midpoint_angvel, noisy_eef_quat),
             "ft_force": F_ft + force_noise,
             "ft_torque_eef": T_ft + force_noise,
-            "force_threshold": self.contact_penalty_thresholds[:, None],
-            "target_speed": ts,
             "target_normal_force": tnf,
             "prev_actions": prev_actions,
         }
         # CRITIC — clean + privileged geometry.
-        c_pos_rel, c_rot_rel = _pose_rel(self.fingertip_midpoint_pos, self.fingertip_midpoint_quat)
         state_dict = {
-            "goal_pos_rel": c_pos_rel,
-            "goal_rot_rel": c_rot_rel,
-            "ee_linvel": _to_eef(self.fingertip_midpoint_linvel, self.fingertip_midpoint_quat),
-            "ee_angvel": _to_eef(self.fingertip_midpoint_angvel, self.fingertip_midpoint_quat),
+            "setpoint_pos_rel": _setpoint_pos_rel(self.fingertip_midpoint_pos, eef_quat),
+            "ee_linvel": _to_eef(self.fingertip_midpoint_linvel, eef_quat),
+            "ee_angvel": _to_eef(self.fingertip_midpoint_angvel, eef_quat),
             "ft_force": F_ft,
             "ft_torque_eef": T_ft,
-            "force_threshold": self.contact_penalty_thresholds[:, None],
             "fingertip_pos": self.fingertip_midpoint_pos,
-            "fingertip_quat": self.fingertip_midpoint_quat,
+            "fingertip_quat": eef_quat,
             "joint_pos": self.joint_pos[:, 0:7],
             "held_pos": self.held_pos,
             "held_quat": self.held_quat,
@@ -329,7 +345,6 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "cross_track": self.cross_track[:, None],
             "orn_error": self.orn_error[:, None],
             "normal_force": self.measured_normal_force[:, None],
-            "target_speed": ts,
             "target_normal_force": tnf,
             "prev_actions": prev_actions,
         }
@@ -343,17 +358,51 @@ class FlatSurfaceFollowEnv(ForgeEnv):
     # ------------------------------------------------------------------
     def _get_curr_successes(self, success_threshold=None, check_rot=False):
         at_goal = torch.linalg.norm(self.cyl_tip - self.goal_world, dim=-1) < self.cfg_task.success_pos_tol
-        oriented = self.orn_error < float(np.deg2rad(self.cfg_task.success_orn_tol_deg))
+        oriented = self.orn_error.abs() < float(self.cfg_task.success_orn_tol_deg)  # orn_error in degrees
         return torch.logical_and(at_goal, oriented)
 
     def _get_rewards(self):
+        """Reward = sum over terms of weight * squashing_fn(raw signed REALIZED value, a, b).
+
+        Each value is computed from measured/physics state only (never control targets), so the
+        reward reflects what actually happened. squashing_fn peaks at value=0 (perfect match).
+        More terms (progress, speed, ...) come in later passes; the scorer's _factory_scales must
+        stay in sync with the weights below.
+        """
         curr_successes = self._get_curr_successes()
-        # TODO(reward pass): populate rew_dict with progress / goal_kp / cross_track /
-        # speed / normal_force / orientation / action penalties (all (E,) tensors,
-        # bounded via factory_utils.squashing_fn). The scorer reads the matching
-        # scales from FlatSurfaceFollowWrapper._factory_scales().
-        rew_dict: dict[str, torch.Tensor] = {}
+        cfg = self.cfg_task
+
+        # Force tracking: desired (sampled, along the surface normal) - measured normal force
+        # (world-rotated EEF force projected onto the surface normal, for a same-frame difference).
+        force_value = self.desired_force - self.measured_normal_force          # (E,) N, signed
+        # Orientation: desired plane angle - realized plane angle (self.orn_error, deg, signed).
+        orn_value = self.orn_error                                            # (E,) deg, signed
+        # Straightness: signed cross-track error e_perp = dp . d_lat (computed in _compute).
+        straightness_value = self.cross_track                                # (E,) m, signed
+        # Pace: along-track error vs the moving setpoint s_ref (computed in _compute from the pace
+        # clock). The clock advances by one env step only while in contact (updated below).
+        pace_value = self.progress - self.s_ref                             # (E,) m, signed
+
+        rew_dict = {
+            "force": factory_utils.squashing_fn(force_value, cfg.force_a, cfg.force_b),
+            "orientation": factory_utils.squashing_fn(orn_value, cfg.orientation_a, cfg.orientation_b),
+            "straightness": factory_utils.squashing_fn(straightness_value, cfg.straightness_a, cfg.straightness_b),
+            "pace": factory_utils.squashing_fn(pace_value, cfg.pace_a, cfg.pace_b),
+        }
+        rew_scales = {
+            "force": float(cfg.force_weight),
+            "orientation": float(cfg.orientation_weight),
+            "straightness": float(cfg.straightness_weight),
+            "pace": float(cfg.pace_weight),
+        }
         rew_buf = torch.zeros(self.num_envs, device=self.device)
+        for name in rew_dict:
+            rew_buf = rew_buf + rew_dict[name] * rew_scales[name]
+
+        # Advance the pace clock by one env step, ONLY where in contact (tau_{t+1} = tau_t + dt*in_contact).
+        step_dt = float(getattr(self, "step_dt", self.physics_dt * self.cfg.decimation))
+        self.pace_tau = self.pace_tau + step_dt * self.in_contact_any.float()
+
         self.prev_actions = self.actions.clone()
         self._log_factory_metrics(rew_dict, curr_successes)
         return rew_buf
@@ -390,6 +439,16 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         contact_rand = torch.rand((self.num_envs,), dtype=torch.float32, device=self.device)
         contact_lower, contact_upper = self.cfg.task.contact_penalty_threshold_range
         self.contact_penalty_thresholds = contact_lower + contact_rand * (contact_upper - contact_lower)
+
+        # Per-episode desired normal force (N), sampled in [min, max]; observed + used by the
+        # force-tracking reward. Constant for the episode (a per-env setpoint).
+        force_rand = torch.rand((self.num_envs,), dtype=torch.float32, device=self.device)
+        self.desired_force = self.cfg_task.force_desired_min + force_rand * (
+            self.cfg_task.force_desired_max - self.cfg_task.force_desired_min
+        )
+
+        # Reset the pace schedule clock (the moving along-track setpoint restarts at p0).
+        self.pace_tau = torch.zeros((self.num_envs,), device=self.device)
 
         self.dead_zone_thresholds = (
             torch.rand((self.num_envs, 6), dtype=torch.float32, device=self.device) * self.default_dead_zone
@@ -481,7 +540,9 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             # -normal), plus the commanded axis tilt (pitch) and free yaw noise.
             local_euler = torch.zeros((n_bad, 3), device=self.device)
             local_euler[:, 0] = np.pi
-            local_euler[:, 1] = float(np.deg2rad(self.cfg_task.commanded_axis_angle_deg))
+            # Hand pitch from straight-down = the tool axis's angle to the surface NORMAL =
+            # 90 - (desired angle to the surface PLANE), so the cylinder spawns at the desired tilt.
+            local_euler[:, 1] = float(np.deg2rad(90.0 - self.cfg_task.orientation_desired_angle_deg))
             yaw_noise = (2.0 * (torch.rand((n_bad,), device=self.device) - 0.5)) * float(
                 self.cfg_task.hand_init_orn_noise[2]
             )

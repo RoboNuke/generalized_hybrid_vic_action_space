@@ -15,11 +15,20 @@
 
 runner_cfg:
   task: Isaac-Forge-PegInsert-Direct-v0
+  agent_type: sac                   # "sac" (default) or "ppo"; selects sac_cfg vs ppo_cfg
+  num_envs: 256
+  num_agents: 2
+  total_timesteps: 20_100
+  eval_timesteps: 150
+  memory_size: 1_000_000
+  seed: -1
+  
+  
   disable_success_pred: true              # turn OFF Forge's success-prediction head: forces
                                           # task.delay_until_ratio=1.1 (success_pred reward off),
                                           # force-zeros action dim 6, and withholds the
                                           # success_pred_error / early_term_* metrics. false = restore.
-  kp_z_align_enabled: false               # add the kp_z_align orientation reward (aligns peg z-axis
+  kp_z_align_enabled: true               # add the kp_z_align orientation reward (aligns peg z-axis
                                           # with socket z-axis; rewards the DOF the 30deg tilted grasp fights)
   kp_z_align_a: 8.0                     # squashing steepness a (default)
   kp_z_align_b: 2                     # squashing offset b, peak height 1/(2+b) (default)
@@ -49,13 +58,7 @@ runner_cfg:
   success_check_z_aligned: true        # require z alignment to count as success
   z_align_max_deg: 10.0                 # max peg-vs-socket axis angle (deg) for check_z_aligned
   ee_success_yaw_deg: null              # yaw threshold (deg) for check_yaw; null keeps task default
-  agent_type: sac                   # "sac" (default) or "ppo"; selects sac_cfg vs ppo_cfg
-  num_envs: 256
-  num_agents: 3
-  total_timesteps: 20_100
-  eval_timesteps: 150
-  memory_size: 1_000_000
-  seed: -1
+  
   glue_peg_to_gripper: true              # rigidly weld peg to gripper (constant fixed grasp)
   grasp_rot_mode: fixed                 # none | random | fixed. how the peg is grasped relative
                                           # to the gripper: none => perfectly aligned (upstream);

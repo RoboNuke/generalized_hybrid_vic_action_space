@@ -323,16 +323,15 @@ class AutoMateForgeAdapter(gym.Wrapper):
             pos_n = cfg.obs_rand.fingertip_pos
             u.noisy_fingertip_pos = u.fingertip_midpoint_pos + torch.randn((n, 3), device=dev) * pos_n
 
-            # Fingertip rotation noise (random axis, small angle), then zero w/z and flip sign.
+            # Fingertip rotation noise (random axis, small angle). FULL 6-DOF orientation: no
+            # quat w,z zeroing and no sign flip (those belong to the upright-only reduced-quat
+            # scheme and are invalid once the gripper can rotate freely, which it now always can).
             axis = torch.randn((n, 3), device=dev)
             axis = axis / torch.linalg.norm(axis, dim=1, keepdim=True)
             angle = torch.randn((n,), device=dev) * np.deg2rad(cfg.obs_rand.fingertip_rot_deg)
             u.noisy_fingertip_quat = torch_utils.quat_mul(
                 u.fingertip_midpoint_quat, torch_utils.quat_from_angle_axis(angle, axis)
             )
-            if not getattr(cfg.ctrl, "full_orientation_control", False):
-                u.noisy_fingertip_quat[:, [0, 3]] = 0.0
-            u.noisy_fingertip_quat = u.noisy_fingertip_quat * u.flip_quats.unsqueeze(-1)
 
             # Finite-diff EE velocities from the noisy fingertip values (overwrites clean FD).
             u.ee_linvel_fd = (u.noisy_fingertip_pos - u.prev_fingertip_pos) / dt
@@ -341,9 +340,8 @@ class AutoMateForgeAdapter(gym.Wrapper):
                 u.noisy_fingertip_quat, torch_utils.quat_conjugate(u.prev_fingertip_quat)
             )
             rot_diff = rot_diff * torch.sign(rot_diff[:, 0]).unsqueeze(-1)
+            # FULL angular velocity (no roll/pitch zeroing).
             u.ee_angvel_fd = axis_angle_from_quat(rot_diff) / dt
-            if not getattr(cfg.ctrl, "full_orientation_control", False):
-                u.ee_angvel_fd[:, 0:2] = 0.0
             u.prev_fingertip_quat = u.noisy_fingertip_quat.clone()
 
             # Force sensor: read incoming joint force, EMA-smooth, reframe to the bolt frame, noise.
