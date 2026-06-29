@@ -117,12 +117,12 @@ sac_cfg:
 
 model_cfg:
   actor:
-    act_init_std: 1.0
+    act_init_std: 0.6 #1.0
     selection_distribution: product  # hybrid-only: "product" (independent) or "match" (selection-conditioned)
     selection_init_bias: -2.2         # hybrid-only: sigmoid(-2.2)~=0.10 force prob => ~90% position-dominant at init
     actor_n: 2
     actor_latent: 512
-    last_layer_scale: 0.1
+    last_layer_scale: 0.05 #0.1
     clip_log_std: true
     min_log_std: -20.0
     max_log_std: 2.0
@@ -130,7 +130,7 @@ model_cfg:
     use_state_dependent_std: false
     bernoulli_action_dims: null
     force_zero_action_dims: null   # dim 6 (success-pred) force-zeroed by runner_cfg.disable_success_pred; full_orientation_control keeps Rx/Ry learnable
-    scale_down_action_dims: [0, 1, 2]   # apply last_layer_scale to ONLY the 6 pose deltas (3 pos + 3 orient); gain/selection dims stay unshrunk so they explore
+    scale_down_action_dims: [0, 1, 2, 13, 14, 15, 16, 17, 18]   # apply last_layer_scale to ONLY the 6 pose deltas (3 pos + 3 orient); gain/selection dims stay unshrunk so they explore
   critic:
     critic_output_init_mean: 0.0 #50 before
     critic_n: 4
