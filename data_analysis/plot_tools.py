@@ -17,6 +17,7 @@ import os
 from dataclasses import dataclass, field
 
 import numpy as np
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 
 import data_loader as dl
@@ -358,7 +359,9 @@ def plot_stiffness_ellipses(data: dict, phases: list, style: PlotStyle,
                             axial_template="RotationFrame_{phase}/k_axial_mean",
                             lateral_template="RotationFrame_{phase}/k_lateral_mean",
                             zangle_template="RotationFrame_{phase}/z_angle",
-                            figsize_per=(2.3, 2.3)):
+                            figsize_per=(2.3, 2.3),
+                            color_by_axial=False, ghost=False, ghost_axial=None,
+                            scale_mode="max", cmap="viridis"):
     """Cartoon of the translational stiffness ellipse vs. the peg axis, per phase.
 
     Grid: rows = controller, cols = phase. The peg axis is drawn vertical; each
@@ -367,6 +370,22 @@ def plot_stiffness_ellipses(data: dict, phases: list, style: PlotStyle,
     z; 0 for modes that don't emit it). Turns the abstract numbers into a shape:
     round = isotropic, squished-along-peg = compliant insertion, tilted = the
     off-axis expressiveness GAS adds. Returns the Figure.
+
+    Three cues (composable) make axial-stiffness variation easier to read:
+
+    * ``color_by_axial``: fill each ellipse by its *true* k_axial via ``cmap``
+      with a shared colorbar -- separates panels even when shapes look alike.
+    * ``ghost``: draw a reference ellipse (dashed grey) in every panel as a fixed
+      anchor, so each ellipse's deviation from the reference is salient. By
+      default the reference is the grand-mean ellipse; pass ``ghost_axial`` (a
+      stiffness value in true units) to instead anchor on a fixed circle of that
+      radius -- mapped through the same display scale and identical on every panel.
+    * ``scale_mode``: ``"max"`` normalizes both semi-axes by the global largest
+      value (true geometry, but small ellipses cluster near zero). ``"range"``
+      affine-maps the global [min, max] over ALL semi-axis values (axial AND
+      lateral pooled) onto [0.25, 1.0] -- the same transform on both axes, so it
+      stays *relatively* geometric while stretching the dynamic range so axial
+      differences between panels pop.
     """
     groups = groups if groups is not None else list(data.keys())
     a = dl.phase_summary(data, axial_template, phases, reduce=reduce, ci_z=style.ci_z,
@@ -376,19 +395,52 @@ def plot_stiffness_ellipses(data: dict, phases: list, style: PlotStyle,
     z = dl.phase_summary(data, zangle_template, phases, reduce=reduce, ci_z=style.ci_z,
                          step_ceiling=style.step_ceiling, selection_metric=selection_metric)
 
-    # Global scale so every ellipse is comparable: normalize by the largest semi-axis.
-    scale = 1.0
-    vals = [a[g][p][0] for g in a for p in a[g]] + [l[g][p][0] for g in l for p in l[g]]
-    if vals:
-        scale = max(vals)
+    # Pool all semi-axis magnitudes (axial + lateral) to fix a shared display scale.
+    axial_vals = [a[g][p][0] for g in a for p in a[g]]
+    vals = axial_vals + [l[g][p][0] for g in l for p in l[g]]
+    range_note = None
+    if scale_mode == "range" and vals:
+        # Affine remap of global [min, max] -> [0.25, 1.0], applied to both axes.
+        gmin, gmax = min(vals), max(vals)
+        span = (gmax - gmin) or 1.0
+        to_disp = lambda v: 0.25 + 0.75 * (v - gmin) / span
+        range_note = (f"Range-stretched scale: semi-axis 0.25 = {gmin:.0f}, "
+                      f"1.0 = {gmax:.0f} (stiffness units, global min/max over all axes)")
+    else:
+        scale = max(vals) if vals else 1.0
+        to_disp = lambda v: v / scale
+
+    # Optional colormap encoding of the true (absolute) axial stiffness.
+    sm = None
+    if color_by_axial and axial_vals:
+        norm = mpl.colors.Normalize(vmin=min(axial_vals), vmax=max(axial_vals))
+        sm = mpl.cm.ScalarMappable(norm=norm, cmap=plt.get_cmap(cmap))
+
+    # Reference ("ghost") ellipse parameters (axial, lateral, angle) in true units.
+    # ghost_axial pins a fixed circle of that stiffness; else use the grand mean.
+    ghost_params = None
+    if ghost and ghost_axial is not None:
+        ghost_params = (float(ghost_axial), float(ghost_axial), 0.0)
+    elif ghost and axial_vals:
+        z_vals = [z[g][p][0] for g in z for p in z[g]]
+        ghost_params = (float(np.mean(axial_vals)),
+                        float(np.mean([l[g][p][0] for g in l for p in l[g]])),
+                        float(np.mean(z_vals)) if z_vals else 0.0)
+
+    t = np.linspace(0, 2 * np.pi, 100)
+
+    def _ellipse_xy(ka, kl, ang):
+        # Semi-axis ka along the (tilted) peg direction, kl across it.
+        ex, ey = kl * np.cos(t), ka * np.sin(t)
+        return (ex * np.cos(ang) - ey * np.sin(ang),
+                ex * np.sin(ang) + ey * np.cos(ang))
 
     nrows, ncols = len(groups), len(phases)
     fig, axes = plt.subplots(nrows, ncols,
                              figsize=(figsize_per[0] * ncols, figsize_per[1] * nrows),
-                             squeeze=False)
-    t = np.linspace(0, 2 * np.pi, 100)
+                             squeeze=False, constrained_layout=color_by_axial)
     for r, group in enumerate(groups):
-        color = style.color(group, r)
+        outline = style.color(group, r)
         for c, ph in enumerate(phases):
             ax = axes[r][c]
             ax.set_aspect("equal")
@@ -398,23 +450,252 @@ def plot_stiffness_ellipses(data: dict, phases: list, style: PlotStyle,
             ax.set_yticks([])
             # Peg axis reference (vertical).
             ax.plot([0, 0], [-1.1, 1.1], color="0.6", linestyle=":", linewidth=1)
+            if ghost_params is not None:
+                gx, gy = _ellipse_xy(to_disp(ghost_params[0]), to_disp(ghost_params[1]),
+                                     np.deg2rad(ghost_params[2]))
+                ax.plot(gx, gy, color="0.7", linestyle="--", linewidth=1.0, zorder=1)
             if group in a and ph in a[group] and group in l and ph in l[group]:
-                ka = a[group][ph][0] / scale
-                kl = l[group][ph][0] / scale
+                ka = to_disp(a[group][ph][0])
+                kl = to_disp(l[group][ph][0])
                 ang = np.deg2rad(z[group][ph][0]) if (group in z and ph in z[group]) else 0.0
-                # Ellipse: semi-axis ka along the (tilted) peg direction, kl across it.
-                ex = kl * np.cos(t)
-                ey = ka * np.sin(t)
-                xr = ex * np.cos(ang) - ey * np.sin(ang)
-                yr = ex * np.sin(ang) + ey * np.cos(ang)
-                ax.fill(xr, yr, color=color, alpha=0.35)
-                ax.plot(xr, yr, color=color, linewidth=1.2)
+                xr, yr = _ellipse_xy(ka, kl, ang)
+                fill = sm.to_rgba(a[group][ph][0]) if sm is not None else outline
+                ax.fill(xr, yr, color=fill, alpha=0.6 if sm is not None else 0.35, zorder=2)
+                ax.plot(xr, yr, color=outline, linewidth=1.2, zorder=3)
             if r == 0:
                 ax.set_title(ph, fontsize=9)
             if c == 0:
                 ax.set_ylabel(style.name(group), fontsize=9)
+    if sm is not None:
+        sm.set_array([])
+        fig.colorbar(sm, ax=axes.ravel().tolist(), shrink=0.6,
+                     label="k_axial (true units)")
     fig.suptitle("Translational stiffness ellipse vs. peg axis (dotted = insertion axis)")
-    fig.tight_layout()
+    if not color_by_axial:
+        fig.tight_layout()
+    if range_note:
+        # Footnote spelling out the display scale; reserve a strip at the bottom.
+        fig.subplots_adjust(bottom=max(fig.subplotpars.bottom, 0.06))
+        fig.text(0.5, 0.01, range_note, ha="center", va="bottom", fontsize=8,
+                 color="0.3")
+    return fig
+
+
+def plot_stiffness_ellipses_coupling(data: dict, phases: list, style: PlotStyle,
+                                     groups=None, reduce="mean_tail", selection_metric=None,
+                                     axial_template="RotationFrame_{phase}/k_axial_mean",
+                                     lateral_template="RotationFrame_{phase}/k_lateral_mean",
+                                     cross_template="RotationFrame_{phase}/cross_coupling_mean",
+                                     socket_template="RotationFrame_{phase}/peg_socket_angle_mean",
+                                     figsize_per=(2.3, 2.3),
+                                     color_by_axial=False, ghost=False, ghost_axial=None,
+                                     scale_mode="max", cmap="viridis", socket_color=None):
+    """Stiffness-ellipse cartoon whose TILT is recovered from ``cross_coupling``.
+
+    Identical layout, scaling, colour, and ghost cues to ``plot_stiffness_ellipses``,
+    but it does NOT read ``z_angle`` (which is logged for the rotated modes only, so
+    that version forces every baseline upright). Instead it reconstructs, per phase,
+    the 2x2 block of the translational stiffness K in the plane spanned by the peg
+    axis z_hat and the cross-coupling direction. In the orthonormal basis
+    ``(x = cross dir, y = peg axis)`` that block is exactly the logged scalars::
+
+        M = [[ d,  b ],     a = k_axial       = z_hatᵀ K z_hat                 (along peg)
+             [ b,  a ]]     b = cross_coupling = ‖(I − z_hat z_hatᵀ) K z_hat‖  (EXACT off-diagonal)
+                            d ≈ k_lateral     = (tr K − k_axial)/2            (mean lateral stiffness)
+
+    because ``cross_dirᵀ K z_hat = ‖(I − z_hat z_hatᵀ) K z_hat‖`` identically. The
+    principal axis of M is tilted off the peg axis by ``psi = ½·atan2(2b, a − d)`` with
+    eigenvalues ``(a+d)/2 ± hypot((a−d)/2, b)`` used as the ellipse semi-axes. So
+    ``b = 0`` (peg is a principal axis: GAS-fixed-rot, or VICES once the peg is
+    vertical at insertion) reproduces the upright ellipse, while ``b > 0`` (VICES /
+    Cholesky off the peg in free/search) now tilts as it should -- for EVERY mode.
+
+    Each panel also draws the principal axis nearest the peg as a solid line in the ellipse
+    colour and writes the tilt ``gamma`` (deg) in the wedge between that axis and the
+    vertical peg axis, with a small arc. ``gamma = ½·atan2(2·cc, |k_axial − k_lateral|)``
+    in ``[0, 45]`` is the rotation of the stiffness eigenframe off the peg/lateral axes:
+    it is driven by the coupling ``cc`` (0 when uncoupled), NOT by which diagonal is larger.
+    The annotation is SKIPPED for a near-circular ellipse (relative eccentricity < 2%),
+    where the principal direction is undefined -- this is what stops the isotropic Fixed
+    gains (a == d with cc = float noise ~2e-5, which would otherwise snap the raw angle to
+    45 deg) from being drawn as tilted. The ``cross_coupling`` value used is printed in each
+    panel's bottom-right corner.
+
+    A second dotted line marks the PHYSICAL mean peg<->socket angle (``socket_template``),
+    drawn off the peg axis on the same side as the stiffness tilt so the two offsets are read
+    side by side: the solid line is how far the STIFFNESS frame is rotated off the peg, the
+    dotted one how far the peg itself sits off the socket. It is drawn in the method's own
+    colour (dotted style distinguishes it from the solid principal axis); pass ``socket_color``
+    to force a single fixed colour instead. Its angle is labelled in the same colour. Both
+    peg<->socket and the stiffness tilt are magnitudes (direction is cosmetic), so they are
+    co-drawn to one side purely for comparison.
+
+    Two approximations are baked in and worth reading the cartoon with: ``d`` is taken
+    as the logged ``k_lateral`` (the mean of both perpendicular stiffnesses, exact only
+    under transverse isotropy), and ``cross_coupling`` is a magnitude (env-averaged), so
+    only ``|psi|`` is recovered -- the left/right tilt direction is cosmetic. Returns
+    the Figure. See ``plot_stiffness_ellipses`` for the ``color_by_axial`` / ``ghost`` /
+    ``scale_mode`` cue semantics, which are unchanged.
+    """
+    groups = groups if groups is not None else list(data.keys())
+    a = dl.phase_summary(data, axial_template, phases, reduce=reduce, ci_z=style.ci_z,
+                         step_ceiling=style.step_ceiling, selection_metric=selection_metric)
+    l = dl.phase_summary(data, lateral_template, phases, reduce=reduce, ci_z=style.ci_z,
+                         step_ceiling=style.step_ceiling, selection_metric=selection_metric)
+    cc = dl.phase_summary(data, cross_template, phases, reduce=reduce, ci_z=style.ci_z,
+                          step_ceiling=style.step_ceiling, selection_metric=selection_metric)
+    ps = dl.phase_summary(data, socket_template, phases, reduce=reduce, ci_z=style.ci_z,
+                          step_ceiling=style.step_ceiling, selection_metric=selection_metric)
+
+    # Eigen-reconstruct the 2x2 block M=[[d,b],[b,a]] per (group, phase) in TRUE units:
+    # the eigenvalue paired with the psi-tilted eigenvector is the larger one (lam_plus),
+    # so it is the semi-axis placed along the tilted axis. b=0 collapses to (a along peg,
+    # d across) -- i.e. the upright ellipse -- including the a<d swap (psi -> 90deg).
+    ell = {}   # group -> phase -> (lam_plus, lam_minus, psi_deg)
+    for g in a:
+        for p in a[g]:
+            if not (g in l and p in l[g]):
+                continue
+            a_t = a[g][p][0]                                          # k_axial
+            d_t = l[g][p][0]                                          # k_lateral (~ d)
+            b_t = cc[g][p][0] if (g in cc and p in cc[g]) else 0.0    # cross_coupling
+            psi = 0.5 * np.arctan2(2.0 * b_t, a_t - d_t)              # tilt off peg axis
+            spread = float(np.hypot((a_t - d_t) / 2.0, b_t))
+            mean = (a_t + d_t) / 2.0
+            ell.setdefault(g, {})[p] = (max(mean + spread, 0.0),
+                                        max(mean - spread, 0.0),
+                                        float(np.rad2deg(psi)),
+                                        float(b_t))
+
+    # Colour still encodes TRUE k_axial; display scale pools the eigen-semi-axes drawn.
+    axial_vals = [a[g][p][0] for g in a for p in a[g]]
+    vals = [v for g in ell for p in ell[g] for v in ell[g][p][:2]]
+    range_note = None
+    if scale_mode == "range" and vals:
+        gmin, gmax = min(vals), max(vals)
+        span = (gmax - gmin) or 1.0
+        to_disp = lambda v: 0.25 + 0.75 * (v - gmin) / span
+        range_note = (f"Range-stretched scale: semi-axis 0.25 = {gmin:.0f}, "
+                      f"1.0 = {gmax:.0f} (stiffness units, global min/max over eigen-axes)")
+    else:
+        scale = max(vals) if vals else 1.0
+        to_disp = lambda v: v / scale
+
+    sm = None
+    if color_by_axial and axial_vals:
+        norm = mpl.colors.Normalize(vmin=min(axial_vals), vmax=max(axial_vals))
+        sm = mpl.cm.ScalarMappable(norm=norm, cmap=plt.get_cmap(cmap))
+
+    # Ghost reference ellipse (major, minor, angle_deg) in true units: fixed circle if
+    # ghost_axial is given, else the grand-mean eigen-ellipse.
+    ghost_params = None
+    if ghost and ghost_axial is not None:
+        ghost_params = (float(ghost_axial), float(ghost_axial), 0.0)
+    elif ghost and vals:
+        majors = [ell[g][p][0] for g in ell for p in ell[g]]
+        minors = [ell[g][p][1] for g in ell for p in ell[g]]
+        angs = [ell[g][p][2] for g in ell for p in ell[g]]
+        ghost_params = (float(np.mean(majors)), float(np.mean(minors)), float(np.mean(angs)))
+
+    t = np.linspace(0, 2 * np.pi, 100)
+
+    def _ellipse_xy(ka, kl, ang):
+        # Semi-axis ka along the (psi-tilted) major direction, kl across it.
+        ex, ey = kl * np.cos(t), ka * np.sin(t)
+        return (ex * np.cos(ang) - ey * np.sin(ang),
+                ex * np.sin(ang) + ey * np.cos(ang))
+
+    nrows, ncols = len(groups), len(phases)
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(figsize_per[0] * ncols, figsize_per[1] * nrows),
+                             squeeze=False, constrained_layout=color_by_axial)
+    for r, group in enumerate(groups):
+        outline = style.color(group, r)
+        for c, ph in enumerate(phases):
+            ax = axes[r][c]
+            ax.set_aspect("equal")
+            ax.set_xlim(-1.2, 1.2)
+            ax.set_ylim(-1.2, 1.2)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            # Peg axis reference (vertical).
+            ax.plot([0, 0], [-1.1, 1.1], color="0.6", linestyle=":", linewidth=1)
+            if ghost_params is not None:
+                gx, gy = _ellipse_xy(to_disp(ghost_params[0]), to_disp(ghost_params[1]),
+                                     np.deg2rad(ghost_params[2]))
+                ax.plot(gx, gy, color="0.7", linestyle="--", linewidth=1.0, zorder=1)
+            if group in ell and ph in ell[group]:
+                lam_p, lam_m, psi_deg, b_t = ell[group][ph]
+                ka = to_disp(lam_p)                      # major semi-axis (display)
+                kl = to_disp(lam_m)                      # minor semi-axis (display)
+                psi = np.deg2rad(psi_deg)                # major-axis orientation (signed)
+                xr, yr = _ellipse_xy(ka, kl, psi)
+                fill = sm.to_rgba(a[group][ph][0]) if sm is not None else outline
+                ax.fill(xr, yr, color=fill, alpha=0.6 if sm is not None else 0.35, zorder=2)
+                ax.plot(xr, yr, color=outline, linewidth=1.2, zorder=3)
+                # The cross-coupling actually used for this panel (true units), bottom-right.
+                ax.text(1.12, -1.12, f"cc={b_t:.1f}", ha="right", va="bottom",
+                        fontsize=7, color="0.4", zorder=5)
+                # Side the stiffness tilt is drawn on (major-near => left, minor-near =>
+                # right); the socket line shares it so the two offsets compare directly.
+                side = 1.0 if psi_deg <= 45.0 else -1.0
+                # Physical mean peg<->socket angle: a dotted reference axis. Match the
+                # method's colour by default (dotted vs the solid principal axis keeps them
+                # distinct); socket_color overrides with a single fixed colour.
+                sc = outline if socket_color is None else socket_color
+                if group in ps and ph in ps[group]:
+                    sock_deg = ps[group][ph][0]
+                    sphi = side * np.deg2rad(sock_deg)
+                    sux, suy = -np.sin(sphi), np.cos(sphi)
+                    ax.plot([-1.08 * sux, 1.08 * sux], [-1.08 * suy, 1.08 * suy],
+                            color=sc, linestyle=":", linewidth=1.3, zorder=4)
+                    ax.text(0.82 * sux, 0.82 * suy, f"{sock_deg:.1f}°", ha="center",
+                            va="center", fontsize=7.5, color=sc, zorder=5,
+                            bbox=dict(boxstyle="round,pad=0.1", fc="white", ec="none", alpha=0.7))
+                # Principal-axis tilt = rotation of the stiffness eigenframe off the peg,
+                # gamma = ½·atan2(2·cc, |k_axial-k_lateral|) in [0,45], driven by cc (0 when
+                # uncoupled). Skip it for a near-circular ellipse, where the principal
+                # DIRECTION is undefined and the raw angle is meaningless (the isotropic
+                # Fixed gains: cc is float noise ~2e-5 but a==d, so it would snap to 45deg).
+                ecc = (lam_p - lam_m) / (lam_p + lam_m) if (lam_p + lam_m) > 0 else 0.0
+                if ecc >= 0.02:
+                    # Near-peg eigenvector (closest to vertical) and its length; phi is its
+                    # SIGNED angle off the peg axis so the line lies on the drawn ellipse.
+                    if psi_deg <= 45.0:
+                        phi, near_len = psi, lam_p        # major axis is the near-peg one
+                    else:
+                        phi, near_len = psi - np.pi / 2.0, lam_m  # minor axis is near-peg
+                    gamma_deg = abs(np.rad2deg(phi))
+                    kn = to_disp(near_len)
+                    ux, uy = -np.sin(phi), np.cos(phi)
+                    ax.plot([-kn * ux, kn * ux], [-kn * uy, kn * uy],
+                            color=outline, linewidth=1.7, zorder=4)
+                    # Thin arc from the peg axis to that principal axis + the value on the
+                    # wedge bisector (faint box so it stays legible over the fill).
+                    arc_r, txt_r = 0.34, 0.52
+                    aa = np.linspace(0.0, phi, 24)
+                    ax.plot(-np.sin(aa) * arc_r, np.cos(aa) * arc_r,
+                            color=outline, linewidth=1.0, zorder=4)
+                    ax.text(-np.sin(phi / 2.0) * txt_r, np.cos(phi / 2.0) * txt_r,
+                            f"{gamma_deg:.1f}°", ha="center", va="center", fontsize=8,
+                            color="0.15", zorder=5,
+                            bbox=dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.75))
+            if r == 0:
+                ax.set_title(ph, fontsize=9)
+            if c == 0:
+                ax.set_ylabel(style.name(group), fontsize=9)
+    if sm is not None:
+        sm.set_array([])
+        fig.colorbar(sm, ax=axes.ravel().tolist(), shrink=0.6,
+                     label="k_axial (true units)")
+    fig.suptitle("Translational stiffness ellipse vs. peg axis (tilt from cross-coupling)")
+    if not color_by_axial:
+        fig.tight_layout()
+    if range_note:
+        # Footnote spelling out the display scale; reserve a strip at the bottom.
+        fig.subplots_adjust(bottom=max(fig.subplotpars.bottom, 0.06))
+        fig.text(0.5, 0.01, range_note, ha="center", va="bottom", fontsize=8,
+                 color="0.3")
     return fig
 
 
