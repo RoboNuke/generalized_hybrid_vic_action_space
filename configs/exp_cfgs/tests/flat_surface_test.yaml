@@ -1,0 +1,10 @@
+# Bare-bones config for the flat surface-following task (tasks/flat_surface_follow).
+#
+# Minimal on purpose: everything not set here falls back to defaults
+# (agent_type=sac, control_type=pose, no contact sensor, no domain randomization).
+# Intended for init_calib spawn/grasp inspection and quick wiring smoke tests, NOT
+# for training. Unknown headers/keys are hard errors; omitted fields use defaults.
+
+runner_cfg:
+  task: Isaac-FlatSurfaceFollow-Direct-v0
+  num_envs: 1   # required field; init_calib forces a single env regardless
