@@ -31,7 +31,7 @@ PYVER="${PYVER:-3.11}"
 
 # --- code sources ---
 REPO_URL="${REPO_URL:-https://github.com/RoboNuke/generalized_hybrid_vic_action_space.git}"
-REPO_BRANCH="${REPO_BRANCH:-eef-frame-control-and-surface-task}"
+REPO_BRANCH="${REPO_BRANCH:-main}"
 ISAACLAB_URL="${ISAACLAB_URL:-https://github.com/isaac-sim/IsaacLab.git}"
 ISAACLAB_COMMIT="${ISAACLAB_COMMIT:-e06a0674a9}"        # = local /home/hunter/IsaacLab HEAD (newest)
 
