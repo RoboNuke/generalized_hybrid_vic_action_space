@@ -123,6 +123,12 @@ class ControlCfg(ForgeCtrlCfg):
     # in the task/FORGE fixed-asset offsets), so the peg-tip and hole frames coincide on insertion.
     visualize_hole_frame: bool = False
     hole_frame_axis_scale: float = 0.05
+    # interaction frame (env-defined contact frame: z = surface normal at the contact point,
+    # x = motion/goal direction), drawn at the contact point ONLY while in contact. Supplied by
+    # the env (env.interaction_pos/quat/exists) — surface task computes its own; peg tasks get
+    # it from InteractionFrameWrapper. Silently skipped when the env exposes no interaction frame.
+    visualize_interaction_frame: bool = False
+    interaction_frame_axis_scale: float = 0.04
     # Translational stiffness ellipsoid (the position 3x3 block of K), drawn at the peg tip. Its
     # principal axes/magnitudes come from an eigendecomposition of the ACTUAL applied K_pos, so it
     # is correct for every gain_mapping (including cholesky coupling, which no single frame shows).

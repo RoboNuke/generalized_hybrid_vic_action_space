@@ -24,15 +24,34 @@ except ImportError:
         torch_utils = None
 
 try:
-    from isaaclab.utils.math import axis_angle_from_quat
+    from isaaclab.utils.math import axis_angle_from_quat, quat_apply
 except ImportError:
     try:
-        from omni.isaac.lab.utils.math import axis_angle_from_quat
+        from omni.isaac.lab.utils.math import axis_angle_from_quat, quat_apply
     except ImportError:
-        try:
-            from omni.isaac.lab.utils.math import axis_angle_from_quat
-        except ImportError:
-            axis_angle_from_quat = None
+        axis_angle_from_quat = None
+        quat_apply = None
+
+
+def rotate_vec_to_eef(vec_world, eef_quat):
+    """Express a world-frame vector in the EEF (fingertip) frame: ``R_eefᵀ · v``."""
+    return quat_apply(torch_utils.quat_conjugate(eef_quat), vec_world)
+
+
+def rotate_wrench_to_world(wrench_eef, eef_quat):
+    """Rotate a 6-D EEF-frame wrench [F(3), T(3)] into world axes (orientation only).
+
+    Used at the actuation boundary: the control loop (pose error, gains, force error) runs
+    in the EEF frame, but ``compute_dof_torque_from_wrench`` maps via the WORLD geometric
+    Jacobian, so the assembled task wrench is rotated back to world here. Both the force and
+    torque triplets rotate by the same ``R_eef`` (a wrench's force and moment are free
+    vectors about the SAME point — the fingertip origin — for both frames, so no lever-arm
+    term is needed; only the axes change).
+    """
+    return torch.cat(
+        (quat_apply(eef_quat, wrench_eef[:, 0:3]), quat_apply(eef_quat, wrench_eef[:, 3:6])),
+        dim=1,
+    )
 
 
 def compute_pose_task_wrench(
@@ -267,85 +286,56 @@ def wrap_yaw(angle):
 
 
 def compute_ctrl_targets(env, actions):
-    """Bit-exact replica of ``ForgeEnv._apply_action`` target generation.
+    """EEF-relative pose targets: position + orientation deltas in the CURRENT fingertip
+    (EEF) frame, applied to the current fingertip pose.
 
-    ``actions`` is the (EMA'd) action tensor; its ``[:, 0:3]`` / ``[:, 3:6]`` are the
-    pose (position / rotation) actions — same slices the base env reads. Returns
-    ``(ctrl_target_pos, ctrl_target_quat, delta_pos, delta_yaw)`` where the two deltas
-    match what the base sets on the env for its action-penalty reward.
+    This is the new global convention (replacing FORGE's bolt-relative, upright-locked,
+    joint-limit-yaw-wrapped scheme): ``actions[:, 0:3]`` is a Δposition (scaled by
+    ``pos_action_bounds``) expressed in the EEF frame, and ``actions[:, 3:6]`` is a Δrotation
+    (axis-angle, scaled by ``rot_action_bounds``) about the EEF axes. Both deltas are clipped
+    per-axis by ``pos_threshold`` / ``rot_threshold`` (per-step limits) and composed onto the
+    live pose:
+
+        ``target_pos  = eef_pos  + R_eef · Δpos``           (Δpos rotated EEF→world)
+        ``target_quat = eef_quat ∘ Δquat``                  (body-frame compose, right-mul)
+
+    Returns ``(ctrl_target_pos, ctrl_target_quat, delta_pos_world, delta_angle)``: the world
+    position delta and the total rotation angle, used by the action-penalty reward.
     """
     device = env.device
-    num_envs = env.num_envs
 
-    # Step 0: scale actions to the allowed range (diag(pos/rot_action_bounds)).
-    pos_actions = actions[:, 0:3] @ torch.diag(
+    eef_pos = env.fingertip_midpoint_pos
+    eef_quat = env.fingertip_midpoint_quat
+
+    # Scale pose actions to EEF-frame deltas: position (m) and rotation (axis-angle, rad).
+    pos_delta_eef = actions[:, 0:3] @ torch.diag(
         torch.tensor(env.cfg.ctrl.pos_action_bounds, device=device)
     )
-    rot_actions = actions[:, 3:6] @ torch.diag(
+    rot_delta_eef = actions[:, 3:6] @ torch.diag(
         torch.tensor(env.cfg.ctrl.rot_action_bounds, device=device)
     )
 
-    # Step 1: desired pose targets in EE frame.
-    fixed_pos_action_frame = env.fixed_pos_obs_frame + env.init_fixed_pos_obs_noise
-    ctrl_target_preclipped_pos = fixed_pos_action_frame + pos_actions
+    # Per-step clip in the EEF frame (pos_threshold / rot_threshold are per-axis (E,3)).
+    pos_delta_eef = torch.clip(pos_delta_eef, -env.pos_threshold, env.pos_threshold)
+    rot_delta_eef = torch.clip(rot_delta_eef, -env.rot_threshold, env.rot_threshold)
 
-    rot_actions = rot_actions.clone()
-    # Nominal downward EE orientation (180° roll) the rotation target is built relative to.
-    rot_180_euler = torch.tensor([math.pi, 0.0, 0.0], device=device).repeat(num_envs, 1)
-    quat_bolt_to_ee = torch_utils.quat_from_euler_xyz(
-        roll=rot_180_euler[:, 0], pitch=rot_180_euler[:, 1], yaw=rot_180_euler[:, 2]
+    # Position target: current + (Δpos rotated from EEF into world).
+    delta_pos_world = quat_apply(eef_quat, pos_delta_eef)
+    ctrl_target_pos = eef_pos + delta_pos_world
+
+    # Orientation target: EEF-frame Δrotation (axis-angle) right-multiplied onto the current
+    # quat (body-frame compose). Identity where the commanded angle is ~0.
+    angle = torch.norm(rot_delta_eef, p=2, dim=-1)
+    axis = rot_delta_eef / angle.clamp_min(1e-6).unsqueeze(-1)
+    delta_quat = torch_utils.quat_from_angle_axis(angle, axis)
+    delta_quat = torch.where(
+        angle.unsqueeze(-1) > 1e-6,
+        delta_quat,
+        torch.tensor([1.0, 0.0, 0.0, 0.0], device=device).repeat(env.num_envs, 1),
     )
-    if getattr(env.cfg.ctrl, "full_orientation_control", False):
-        # Full 3-DOF orientation: treat the scaled rot_actions as a single delta rotation
-        # (angle = ‖·‖, axis = normalized) composed onto the nominal downward orientation.
-        # The orientation range is governed by rot_action_bounds.
-        angle = torch.norm(rot_actions, p=2, dim=-1)
-        axis = rot_actions / angle.clamp_min(1e-6).unsqueeze(-1)
-        delta_quat = torch_utils.quat_from_angle_axis(angle, axis)
-        ctrl_target_preclipped_quat = torch_utils.quat_mul(delta_quat, quat_bolt_to_ee)
-    else:
-        rot_actions[:, 0:2] = 0.0
-        # Joint-limit yaw map (assumes limit in (+x,-y)-quadrant of world frame).
-        rot_actions[:, 2] = math.radians(-180.0) + math.radians(270.0) * (rot_actions[:, 2] + 1.0) / 2.0
-        bolt_frame_quat = torch_utils.quat_from_euler_xyz(
-            roll=rot_actions[:, 0], pitch=rot_actions[:, 1], yaw=rot_actions[:, 2]
-        )
-        ctrl_target_preclipped_quat = torch_utils.quat_mul(quat_bolt_to_ee, bolt_frame_quat)
+    ctrl_target_quat = torch_utils.quat_mul(eef_quat, delta_quat)
 
-    # Step 2a: clip position targets toward current pose, within pos_threshold.
-    delta_pos = ctrl_target_preclipped_pos - env.fingertip_midpoint_pos
-    pos_error_clipped = torch.clip(delta_pos, -env.pos_threshold, env.pos_threshold)
-    ctrl_target_pos = env.fingertip_midpoint_pos + pos_error_clipped
-
-    # Step 2b: clip orientation targets in Euler space (yaw uses the joint-limit wrap).
-    curr_roll, curr_pitch, curr_yaw = torch_utils.get_euler_xyz(env.fingertip_midpoint_quat)
-    desired_roll, desired_pitch, desired_yaw = torch_utils.get_euler_xyz(ctrl_target_preclipped_quat)
-    desired_xyz = torch.stack([desired_roll, desired_pitch, desired_yaw], dim=1)
-
-    curr_yaw = wrap_yaw(curr_yaw)
-    desired_yaw = wrap_yaw(desired_yaw)
-    delta_yaw = desired_yaw - curr_yaw
-    clipped_yaw = torch.clip(delta_yaw, -env.rot_threshold[:, 2], env.rot_threshold[:, 2])
-    desired_xyz[:, 2] = curr_yaw + clipped_yaw
-
-    desired_roll = torch.where(desired_roll < 0.0, desired_roll + 2 * math.pi, desired_roll)
-    desired_pitch = torch.where(desired_pitch < 0.0, desired_pitch + 2 * math.pi, desired_pitch)
-
-    delta_roll = desired_roll - curr_roll
-    clipped_roll = torch.clip(delta_roll, -env.rot_threshold[:, 0], env.rot_threshold[:, 0])
-    desired_xyz[:, 0] = curr_roll + clipped_roll
-
-    curr_pitch = torch.where(curr_pitch > math.pi, curr_pitch - 2 * math.pi, curr_pitch)
-    desired_pitch = torch.where(desired_pitch > math.pi, desired_pitch - 2 * math.pi, desired_pitch)
-
-    delta_pitch = desired_pitch - curr_pitch
-    clipped_pitch = torch.clip(delta_pitch, -env.rot_threshold[:, 1], env.rot_threshold[:, 1])
-    desired_xyz[:, 1] = curr_pitch + clipped_pitch
-
-    ctrl_target_quat = torch_utils.quat_from_euler_xyz(
-        roll=desired_xyz[:, 0], pitch=desired_xyz[:, 1], yaw=desired_xyz[:, 2]
-    )
-    return ctrl_target_pos, ctrl_target_quat, delta_pos, delta_yaw
+    return ctrl_target_pos, ctrl_target_quat, delta_pos_world, angle
 
 
 def compute_pose_motion_wrench(

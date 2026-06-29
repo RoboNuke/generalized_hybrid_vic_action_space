@@ -25,7 +25,7 @@ D -> damping_min/max, K_f -> force_gain_min/max (length-6 lists on ``ControlCfg`
 import torch
 
 from .hybrid_force_position_wrapper import HybridForcePositionWrapper, AXIS_NAMES
-from .factory_control_utils import get_pose_error, compute_pose_motion_wrench
+from .factory_control_utils import compute_pose_motion_wrench
 
 
 class HybridVICWrapper(HybridForcePositionWrapper):
@@ -152,20 +152,18 @@ class HybridVICWrapper(HybridForcePositionWrapper):
                     log[f"Impedance_Stiffness/force_{AXIS_NAMES[i]}"] = kf_diag[:, i]
 
     def _pose_motion_wrench(self):
-        """Pose motion wrench using the policy's full 6x6 K/D (matrix path) + dead zone."""
-        pos_error, aa_error = get_pose_error(
-            fingertip_midpoint_pos=self.unwrapped.fingertip_midpoint_pos,
-            fingertip_midpoint_quat=self.unwrapped.fingertip_midpoint_quat,
-            ctrl_target_fingertip_midpoint_pos=self.unwrapped.ctrl_target_fingertip_midpoint_pos,
-            ctrl_target_fingertip_midpoint_quat=self.unwrapped.ctrl_target_fingertip_midpoint_quat,
-            jacobian_type="geometric",
-            rot_error_type="axis_angle",
-        )
-        delta_pose = torch.cat((pos_error, aa_error), dim=1)
+        """Pose motion wrench using the policy's full 6x6 K/D (matrix path) + dead zone.
+
+        Error + velocity are taken in the EEF frame (shared base helper), so K_pose / D_pose
+        are applied as EEF-frame impedance matrices and the resulting wrench is EEF-frame
+        (rotated to world by the caller). No world composition of the matrices is needed —
+        expressing the error in the EEF frame makes the policy's K/D EEF-frame by definition.
+        """
+        delta_pose_eef, linvel_eef, angvel_eef = self._eef_pose_error_and_vel()
         return compute_pose_motion_wrench(
-            delta_pose,
-            self.unwrapped.fingertip_midpoint_linvel,
-            self.unwrapped.fingertip_midpoint_angvel,
+            delta_pose_eef,
+            linvel_eef,
+            angvel_eef,
             task_prop_gains=self._K_pose,
             task_deriv_gains=self._D_pose,
             dead_zone_thresholds=getattr(self.unwrapped, "dead_zone_thresholds", None),

@@ -38,7 +38,14 @@ from .factory_control_utils import (
     compute_pose_motion_wrench,
     get_pose_error,
     compute_dof_torque_from_wrench,
+    rotate_vec_to_eef,
+    rotate_wrench_to_world,
 )
+
+try:
+    from isaaclab_tasks.direct.forge import forge_utils as _forge_utils
+except ImportError:
+    _forge_utils = None
 
 try:
     import isaacsim.core.utils.torch as torch_utils
@@ -250,8 +257,29 @@ class HybridForcePositionWrapper(gym.Wrapper):
 
     @property
     def robot_force_torque(self):
-        """Latest physics-step EEF-frame wrench from the Forge force sensor (6-D [F, T])."""
-        return self.unwrapped.force_sensor_smooth
+        """Latest physics-step wrench (6-D [F, T]) expressed in the FINGERTIP-MIDPOINT frame.
+
+        The Forge sensor's raw smoothed reading (``force_sensor_world_smooth``) is in the
+        ``force_sensor`` child-joint frame, which differs from the fingertip-midpoint frame by
+        a constant rigid offset (rotation + translation). We re-express the full wrench in the
+        fingertip frame via ``change_FT_frame`` (rotate F and T by the relative rotation, and
+        re-reference the torque to the fingertip origin with the lever-arm term), so the force
+        loop closes in the SAME frame the pose loop controls. Both poses are read live so the
+        conversion stays correct as the tool tilts (the whole point of the rework).
+
+        NOTE: assumes the force_sensor child-joint frame coincides with that link's body frame
+        (the usual authoring for these fixed sensor joints); refine if viz shows an offset.
+        """
+        u = self.unwrapped
+        if _forge_utils is None:
+            return u.force_sensor_smooth  # fallback (Forge utils unavailable)
+        raw = u.force_sensor_world_smooth  # (E,6) sensor child-joint frame [F, T]
+        body_quat = u._robot.data.body_quat_w
+        body_pos = u._robot.data.body_pos_w
+        sensor_frame = (body_quat[:, u.force_sensor_body_idx], body_pos[:, u.force_sensor_body_idx])
+        fingertip_frame = (body_quat[:, u.fingertip_body_idx], body_pos[:, u.fingertip_body_idx])
+        F, T = _forge_utils.change_FT_frame(raw[:, 0:3], raw[:, 3:6], sensor_frame, fingertip_frame)
+        return torch.cat((F, T), dim=1)
 
     @property
     def fixed_pos_action_frame(self):
@@ -379,25 +407,40 @@ class HybridForcePositionWrapper(gym.Wrapper):
                 if i < 3:
                     log[f"Control Target / Force {AXIS_NAMES[i]} Goal"] = torch.abs(fg[:, i])
 
-    def _pose_motion_wrench(self):
-        """Pose PD motion wrench using the env's diagonal task gains + dead zone.
+    def _eef_pose_error_and_vel(self):
+        """Pose error + velocity expressed in the CURRENT EEF (fingertip) frame.
 
-        Bit-exact with the base controller. Overridden by HybridVICWrapper to use full
-        6x6 stiffness/damping matrices from the policy instead of the env's diagonal gains.
+        ``get_pose_error`` returns the position/orientation error in world axes; we rotate
+        both (and the fingertip linear/angular velocity) into the EEF frame so the impedance
+        gains act along EEF axes. Returns ``(delta_pose_eef (E,6), linvel_eef (E,3),
+        angvel_eef (E,3))``. Shared by the diagonal (base) and matrix (VIC) pose wrenches.
         """
+        u = self.unwrapped
         pos_error, aa_error = get_pose_error(
-            fingertip_midpoint_pos=self.unwrapped.fingertip_midpoint_pos,
-            fingertip_midpoint_quat=self.unwrapped.fingertip_midpoint_quat,
-            ctrl_target_fingertip_midpoint_pos=self.unwrapped.ctrl_target_fingertip_midpoint_pos,
-            ctrl_target_fingertip_midpoint_quat=self.unwrapped.ctrl_target_fingertip_midpoint_quat,
+            fingertip_midpoint_pos=u.fingertip_midpoint_pos,
+            fingertip_midpoint_quat=u.fingertip_midpoint_quat,
+            ctrl_target_fingertip_midpoint_pos=u.ctrl_target_fingertip_midpoint_pos,
+            ctrl_target_fingertip_midpoint_quat=u.ctrl_target_fingertip_midpoint_quat,
             jacobian_type="geometric",
             rot_error_type="axis_angle",
         )
-        delta_pose = torch.cat((pos_error, aa_error), dim=1)
+        q = u.fingertip_midpoint_quat
+        delta_pose_eef = torch.cat((rotate_vec_to_eef(pos_error, q), rotate_vec_to_eef(aa_error, q)), dim=1)
+        linvel_eef = rotate_vec_to_eef(u.fingertip_midpoint_linvel, q)
+        angvel_eef = rotate_vec_to_eef(u.fingertip_midpoint_angvel, q)
+        return delta_pose_eef, linvel_eef, angvel_eef
+
+    def _pose_motion_wrench(self):
+        """Pose PD motion wrench (EEF frame) using the env's diagonal task gains + dead zone.
+
+        Overridden by HybridVICWrapper to use full 6x6 stiffness/damping matrices from the
+        policy. Returns the wrench in the EEF frame (rotated to world by the caller).
+        """
+        delta_pose_eef, linvel_eef, angvel_eef = self._eef_pose_error_and_vel()
         return compute_pose_motion_wrench(
-            delta_pose,
-            self.unwrapped.fingertip_midpoint_linvel,
-            self.unwrapped.fingertip_midpoint_angvel,
+            delta_pose_eef,
+            linvel_eef,
+            angvel_eef,
             task_prop_gains=self.unwrapped.task_prop_gains,
             task_deriv_gains=self.unwrapped.task_deriv_gains,
             dead_zone_thresholds=getattr(self.unwrapped, "dead_zone_thresholds", None),
@@ -447,13 +490,17 @@ class HybridForcePositionWrapper(gym.Wrapper):
                 log[f"Controller Output / Position Error {AXIS_NAMES[i]}"] = perr[:, i]
             self._should_log_wrenches = False
 
-        # Blend via the selection matrix (force-axes already baked into sel_matrix).
-        # On the pose axes (sel=0) this is exactly the base controller's motion wrench, so
-        # pose-only control stays bit-exact (no extra wrench bound-zeroing — base has none).
+        # Blend via the selection matrix (force-axes are EEF-frame axes now). pose_wrench and
+        # force_wrench are BOTH in the EEF frame, so the blend + optional wrench EMA happen in
+        # the EEF frame. sel_matrix selects per (EEF) axis.
         task_wrench = (1 - self.sel_matrix) * pose_wrench + self.sel_matrix * force_wrench
         if self.ema_mode == "wrench":
             task_wrench = self.ema_factor * task_wrench + (1 - self.ema_factor) * self.ema_task_wrench
             self.ema_task_wrench = task_wrench.clone()
+
+        # Rotate the assembled EEF-frame wrench into world axes for the world geometric
+        # Jacobianᵀ (the control loop runs in the EEF frame; actuation maps via the world J).
+        task_wrench = rotate_wrench_to_world(task_wrench, self.unwrapped.fingertip_midpoint_quat)
 
         # Task wrench -> joint torques (Jᵀ + null-space posture), then actuate.
         self.unwrapped.joint_torque, task_wrench = compute_dof_torque_from_wrench(

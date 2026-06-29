@@ -162,10 +162,13 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         self._peg_tip_frame_scale = float(cfg.peg_tip_frame_axis_scale)
         self._eef_frame_scale = float(cfg.eef_frame_axis_scale)
         self._hole_frame_scale = float(cfg.hole_frame_axis_scale)
+        self._viz_interaction = bool(cfg.visualize_interaction_frame)
+        self._interaction_frame_scale = float(cfg.interaction_frame_axis_scale)
         self._marker_rotation = None
         self._marker_peg_tip = None
         self._marker_eef = None
         self._marker_hole = None
+        self._marker_interaction = None
         self._R_frame = None
 
         # Translational stiffness ellipsoid. Eigenvalues of the position 3x3 block of K are linearly
@@ -274,7 +277,9 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         if not hasattr(self.unwrapped, "extras"):
             return
         env = self.unwrapped
-        z_net = self._R_frame[:, :, 2]                                   # (E,3) world z of R
+        # _R_frame is now EEF-frame (R_(eef<-interaction)); compose with R_eef to get world axes.
+        R_world = matrix_from_quat(env.fingertip_midpoint_quat) @ self._R_frame
+        z_net = R_world[:, :, 2]                                         # (E,3) world z of R
         local_z = torch.zeros((self.num_envs, 3), device=self.device)
         local_z[:, 2] = 1.0
         z_peg = quat_apply(env.held_quat, local_z)                       # (E,3) world z of peg tip
@@ -314,7 +319,10 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         if not hasattr(self.unwrapped, "extras"):
             return
         env = self.unwrapped
-        K = self._K_pose[:, :3, :3]                                      # (E,3,3) world translational stiffness
+        # _K_pose is now applied in the EEF frame; rotate the translational block to world so the
+        # comparison against the (world) peg axis stays gauge-consistent.
+        R_eef = matrix_from_quat(env.fingertip_midpoint_quat)           # (E,3,3) world<-eef
+        K = R_eef @ self._K_pose[:, :3, :3] @ R_eef.transpose(1, 2)      # (E,3,3) world translational stiffness
         local_z = torch.zeros((self.num_envs, 3), device=self.device)
         local_z[:, 2] = 1.0
         z = quat_apply(env.held_quat, local_z)                          # (E,3) unit peg axis in world
@@ -354,7 +362,7 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         markers default off, so training pays nothing here.
         """
         if not (self._viz_rotation or self._viz_peg_tip or self._viz_eef
-                or self._viz_hole or self._viz_ellipsoid):
+                or self._viz_hole or self._viz_ellipsoid or self._viz_interaction):
             return
 
         from .frame_viz import AxisFrameMarker, EllipsoidMarker
@@ -365,12 +373,13 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
 
         show_rotation = self._viz_rotation and self._mode == "rotated" and self._R_frame is not None
 
-        # Peg tip pose in absolute world coords (shared by the rotated, peg-tip, and ellipsoid
-        # markers). Read the env's OWN geometric base frame for the held asset — the point it uses
-        # for keypoints and success — via factory_utils.get_held_base_pose, which already bakes in
-        # the task and FORGE asset offsets (peg height, gear/nut base offsets) from cfg_task. No local
-        # offset knob to keep in sync. held_base_pos is env-relative (held_pos is), so add env_origins.
-        if self._viz_peg_tip or show_rotation or self._viz_ellipsoid:
+        # Control happens at the EEF now, so the rotated stiffness frame + stiffness ellipsoid are
+        # drawn there (world<-eef rotation R_eef), not at the peg tip.
+        R_eef = matrix_from_quat(env.fingertip_midpoint_quat)               # (E,3,3) world<-eef
+        eef_pos_w = env.fingertip_midpoint_pos + env_origins
+
+        # Peg-tip pose (only the peg-tip marker still needs it). held_base_pos is env-relative.
+        if self._viz_peg_tip:
             from isaaclab_tasks.direct.factory import factory_utils
             held_base_pos, held_base_quat = factory_utils.get_held_base_pose(
                 env.held_pos, env.held_quat, env.cfg_task.name,
@@ -382,7 +391,8 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
             if self._marker_rotation is None:
                 self._marker_rotation = AxisFrameMarker(
                     "/World/Visuals/RotatedStiffnessFrame", self._rotation_frame_scale)
-            self._marker_rotation.update(tip_pos_w, quat_from_matrix(self._R_frame))
+            # _R_frame is EEF-frame (R_(eef<-interaction)); compose to world, draw at the EEF.
+            self._marker_rotation.update(eef_pos_w, quat_from_matrix(R_eef @ self._R_frame))
 
         if self._viz_peg_tip:
             if self._marker_peg_tip is None:
@@ -420,6 +430,21 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
             )
             self._marker_hole.update(hole_pos + env_origins, hole_quat)
 
+        if self._viz_interaction and hasattr(env, "interaction_pos"):
+            if self._marker_interaction is None:
+                self._marker_interaction = AxisFrameMarker(
+                    "/World/Visuals/InteractionFrame", self._interaction_frame_scale)
+            # The env-defined contact frame, drawn at the contact point — ONLY while in contact.
+            # VisualizationMarkers draws every instance (no per-instance hide), so non-contact envs
+            # are parked far below the ground to keep them off-camera.
+            pos_w = env.interaction_pos + env_origins
+            exists = getattr(env, "interaction_exists", None)
+            if exists is not None:
+                hidden = pos_w.clone()
+                hidden[:, 2] = -1000.0
+                pos_w = torch.where(exists.unsqueeze(-1), pos_w, hidden)
+            self._marker_interaction.update(pos_w, env.interaction_quat)
+
         if self._viz_ellipsoid:
             if self._marker_ellipsoid is None:
                 self._marker_ellipsoid = EllipsoidMarker(
@@ -440,7 +465,8 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
             flip = (torch.linalg.det(evecs) < 0).unsqueeze(-1)                   # (E,1)
             col0 = torch.where(flip, -evecs[:, :, 0], evecs[:, :, 0])
             evecs = torch.stack((col0, evecs[:, :, 1], evecs[:, :, 2]), dim=2)
-            self._marker_ellipsoid.update(tip_pos_w, quat_from_matrix(evecs), scales)
+            # eigenvectors are in the EEF frame; rotate to world and draw at the EEF.
+            self._marker_ellipsoid.update(eef_pos_w, quat_from_matrix(R_eef @ evecs), scales)
 
     def _build_pose_KD(self, a):
         """Pose stiffness K and critically-damped D, per ``self._mode``.
@@ -533,29 +559,23 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         return 2.0 * torch.sqrt(kdiag.clamp_min(0.0))
 
     def _rotation_frame(self, a):
-        """(E,3,3) world-frame stiffness rotation R for ``rotated`` mode from a gain-action ``a``.
+        """(E,3,3) stiffness rotation ``R = R_(eef←interaction)`` for ``rotated`` mode.
 
-        The rotation is defined RELATIVE TO THE HELD ASSET'S NOMINAL IN-HAND FRAME ``F_flip`` (the
-        EEF flipped 180° about y, matching factory's grasp convention), not the world or the raw
-        EEF. ``R_local`` (config-fixed or policy-emitted) orients the stiffness ellipsoid in that
-        peg-body frame, and we compose to the world-frame R that builds K/D/K_f (which act on the
-        world-frame pose error):
+        New convention: gains are authored in the INTERACTION frame and rotated into the EEF
+        frame (where control now happens) — ``K_eef = R · diag(k) · Rᵀ``. ``R`` IS that
+        interaction→EEF rotation, supplied directly by the policy (Gram-Schmidt of the trailing
+        6 action dims) or the config (``fixed_rotation_rpy``). No world composition and no
+        ``F_flip`` peg-nominal anchor anymore: the pose error the gains multiply is itself
+        expressed in the EEF frame, so ``R`` alone places the stiffness axes.
 
-            ``R_world = R_(world←eef) · R_flip · R_local``
-
-        Anchoring to ``F_flip`` makes a given rpy mean the same orientation for the stiffness
-        ellipsoid as for ``rel_grasp_rot_init_deg`` on every axis (the raw-EEF anchor only agreed
-        on y, the flip axis). The stiffness axes still ride with the gripper as it reorients.
-        ``R_local`` is the constant config frame in the fixed-rotation variant (``fixed_rotation_rpy``
-        set; ``a`` carries only the diagonal gains, no rot6d tail), else decoded (Gram-Schmidt) from
-        the trailing 6 dims of ``a``.
+        NOTE (viz/metrics): the cached ``self._R_frame`` is now EEF-frame, not world. The
+        rotated-stiffness-frame marker, ``_log_rotation_frame_angle`` and
+        ``_log_stiffness_frame_metrics`` still assume world axes — they're corrected in the
+        visualization stage (compose with ``R_eef`` for drawing / metrics).
         """
         if self._fixed_rot:
-            R_local = self._R_fixed.expand(a.shape[0], 3, 3)
-        else:
-            R_local = rotation_6d_to_matrix(a[:, -6:])
-        R_eef = matrix_from_quat(self.unwrapped.fingertip_midpoint_quat)        # (E,3,3) world←eef
-        return R_eef @ self._R_flip @ R_local                                   # world←peg-nominal←stiffness
+            return self._R_fixed.expand(a.shape[0], 3, 3)
+        return rotation_6d_to_matrix(a[:, -6:])
 
     @staticmethod
     def _rotate_blockdiag(R, kdiag):
