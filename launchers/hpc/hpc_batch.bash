@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+#SBATCH -J HPC_BATCH                       # job name (overridden by sbatch -J from the submitter)
+#SBATCH -A virl-grp                        # sponsored account (overridden by sbatch -A)
+#SBATCH -p dgxh,dgx2,tiamat,gpu,eecs2      # partitions (overridden by sbatch -p)
+#SBATCH --time=0-09:00:00                  # wall-clock limit (overridden by sbatch --time)
+#SBATCH --gres=gpu:1                       # GPUs (overridden by sbatch --gres)
+#SBATCH --mem=32G                          # host memory (overridden by sbatch --mem)
+#SBATCH -c 12                              # cores/threads (overridden by sbatch -c)
+#SBATCH --signal=TERM@300                  # SIGTERM 300s before the limit (overridden by sbatch --signal)
+#
+# launchers/hpc/hpc_batch.bash — the per-config SLURM job. Runs on a compute node.
+#
+# Enters the Apptainer/Singularity container and runs the existing, env-agnostic worker
+# launchers/sac_block_e2e.sh INSIDE it (train -> verify -> eval -> record). All container
+# and resource settings come from launchers/hpc/hpc_env.bash, which this script sources.
+#
+# Usage (normally invoked by sbatch_launcher.bash, not by hand):
+#   sbatch [resource flags] hpc_batch.bash --config <path> --exp_name <name> [-- <forwarded args...>]
+#
+# Everything after the literal `--` is forwarded VERBATIM to sac_block_e2e.sh, so any of
+# its flags pass straight through:  -- --no_eval --experiment_directory FOO --record_config f.yaml
+#
+# The #SBATCH directives above are only FALLBACK defaults so the script is runnable
+# standalone; the submitter passes the hpc_env.bash values as sbatch CLI flags, which win.
+#
+# Fail loud, fail fast.
+set -Eeuo pipefail
+trap 'echo "[hpc-batch] FAILED at ${BASH_SOURCE[0]}:${LINENO} (exit $?)" >&2' ERR
+
+# ===== Load central config =====
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=hpc_env.bash
+source "$SCRIPT_DIR/hpc_env.bash"
+
+# ===== Args =====
+CONFIG_PATH=""
+EXP_NAME=""
+FORWARD=()                 # everything after `--`, passed through to sac_block_e2e.sh
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --config)   [[ $# -ge 2 ]] || { echo "[hpc-batch] --config requires a value" >&2; exit 2; }
+                    CONFIG_PATH="$2"; shift 2 ;;
+        --exp_name) [[ $# -ge 2 ]] || { echo "[hpc-batch] --exp_name requires a value" >&2; exit 2; }
+                    EXP_NAME="$2"; shift 2 ;;
+        --)         shift; FORWARD=("$@"); break ;;
+        *)          echo "[hpc-batch] unknown argument before '--': $1" >&2; exit 2 ;;
+    esac
+done
+
+[[ -n "$CONFIG_PATH" ]] || { echo "[hpc-batch] --config is required" >&2; exit 2; }
+[[ -n "$EXP_NAME"    ]] || { echo "[hpc-batch] --exp_name is required" >&2; exit 2; }
+
+# Resolve a project-root-relative config to absolute (the container sees the same path).
+if [[ "$CONFIG_PATH" != /* ]]; then
+    CONFIG_PATH="$PROJECT_ROOT/$CONFIG_PATH"
+fi
+
+# ===== Sanity =====
+hpc_require_container
+WORKER="$PROJECT_ROOT/launchers/sac_block_e2e.sh"
+[[ -f "$WORKER"      ]] || { echo "[hpc-batch] worker not found: $WORKER" >&2; exit 1; }
+[[ -f "$CONFIG_PATH" ]] || { echo "[hpc-batch] config not found: $CONFIG_PATH" >&2; exit 1; }
+mkdir -p "$LOGDIR"
+
+echo "=== HPC Batch Job ==="
+echo "  Job name:   ${SLURM_JOB_NAME:-<none>}"
+echo "  Job ID:     ${SLURM_JOB_ID:-<none>}"
+echo "  Node:       $(hostname)"
+echo "  Container:  $APPTAINER_BIN exec  ($SIF_IMAGE)"
+echo "  Worker:     $WORKER"
+echo "  Config:     $CONFIG_PATH"
+echo "  Exp name:   $EXP_NAME"
+echo "  LOGDIR:     $LOGDIR"
+echo "  Forwarded:  ${FORWARD[*]+${FORWARD[*]}}"
+echo ""
+
+# ===== Bind mounts =====
+# Always bind the project at the same path so sac_block_e2e.sh resolves PROJECT_ROOT
+# identically inside and outside the container. Bind LOGDIR separately only if it lives
+# outside the project tree. Then any user-specified extra binds from hpc_env.bash.
+BIND_ARGS=(--bind "$PROJECT_ROOT:$PROJECT_ROOT")
+case "$LOGDIR" in
+    "$PROJECT_ROOT"/*|"$PROJECT_ROOT") ;;                 # already covered by the project bind
+    *) BIND_ARGS+=(--bind "$LOGDIR:$LOGDIR") ;;
+esac
+for _b in $APPTAINER_BINDS; do
+    BIND_ARGS+=(--bind "$_b")
+done
+
+# ===== Run worker inside the container =====
+# --nv exposes the GPU. We export into the container: PYTHON (the kit python wrapper the
+# worker invokes), LOGDIR (so outputs land where we bound them), and TORCHDYNAMO_DISABLE
+# (the worker sets this too, but set it here so it's present from process start).
+#
+# `exec` replaces this bash process with the container process so SLURM's --signal=TERM@300
+# is delivered straight to it (no forwarding shim), matching the RoboNuke pattern. The
+# `${FORWARD[@]+...}` guard keeps an EMPTY forwarded-args array from tripping `set -u` on
+# the older bash found on many clusters.
+echo "[hpc-batch] launching container worker..."
+exec "$APPTAINER_BIN" exec --nv \
+    "${BIND_ARGS[@]}" \
+    --env PYTHON="$CONTAINER_PYTHON" \
+    --env LOGDIR="$LOGDIR" \
+    --env TORCHDYNAMO_DISABLE=1 \
+    --env PYTHONUNBUFFERED=1 \
+    "$SIF_IMAGE" \
+    bash "$WORKER" "$CONFIG_PATH" "$EXP_NAME" ${FORWARD[@]+"${FORWARD[@]}"}
