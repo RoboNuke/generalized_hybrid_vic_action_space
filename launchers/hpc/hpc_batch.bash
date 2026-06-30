@@ -113,11 +113,20 @@ mkdir -p "$ISAAC_CACHE_HOME"
 # instead of crashing on "No API key configured"; if WANDB_API_KEY is set, go online and
 # pass it in. An explicit WANDB_MODE always wins.
 WANDB_ENV=(--env WANDB_MODE="${WANDB_MODE:-offline}")
+WANDB_DESC="offline (no key)"
 if [[ -n "${WANDB_API_KEY:-}" ]]; then
-    WANDB_ENV=(--env WANDB_API_KEY="$WANDB_API_KEY" --env WANDB_MODE="${WANDB_MODE:-online}")
+    if [[ "${#WANDB_API_KEY}" -ge 40 ]]; then
+        WANDB_ENV=(--env WANDB_API_KEY="$WANDB_API_KEY" --env WANDB_MODE="${WANDB_MODE:-online}")
+        WANDB_DESC="online (key len ${#WANDB_API_KEY})"
+    else
+        # A malformed key in online mode makes wandb.init raise and KILL training. Degrade
+        # to offline instead of crashing the whole job over a bad paste.
+        echo "[hpc-batch] WARNING: WANDB_API_KEY is ${#WANDB_API_KEY} chars (wandb needs 40+) — ignoring it, using offline. Fix it in hpc_env.bash for online logging." >&2
+        WANDB_DESC="offline (key too short: ${#WANDB_API_KEY})"
+    fi
 fi
 
-echo "[hpc-batch] launching container worker...  (wandb: ${WANDB_API_KEY:+online}${WANDB_API_KEY:-offline})"
+echo "[hpc-batch] launching container worker...  (wandb: $WANDB_DESC)"
 exec "$APPTAINER_BIN" exec --nv --writable-tmpfs \
     --home "$ISAAC_CACHE_HOME:/root" \
     "${BIND_ARGS[@]}" \
