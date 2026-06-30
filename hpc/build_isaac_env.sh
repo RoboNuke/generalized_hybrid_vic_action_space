@@ -87,7 +87,12 @@ From: ${BASE_IMAGE#docker://}
     curl -sS https://bootstrap.pypa.io/get-pip.py | python${PYVER}
     ln -sf /usr/bin/python${PYVER} /usr/local/bin/python
     ln -sf /usr/bin/python${PYVER} /usr/local/bin/python3
-    python -m pip install --upgrade pip wheel setuptools packaging
+    python -m pip install --upgrade pip wheel "setuptools<80" packaging
+    # Legacy sdists (e.g. flatdict, a transitive Isaac Lab dep) do \`import pkg_resources\`
+    # in setup.py; setuptools 80+ drops pkg_resources from the PEP-517 build-isolation
+    # overlay, breaking the wheel build. Constrain build envs to setuptools<80 too.
+    printf 'setuptools<80\n' > /opt/pip-constraints.txt
+    export PIP_CONSTRAINT=/opt/pip-constraints.txt
 
     # this repo (carries requirements.lock.txt + the split helper)
     git clone --branch ${REPO_BRANCH} ${REPO_URL} /opt/ghvic
