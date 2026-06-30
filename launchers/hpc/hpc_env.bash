@@ -50,7 +50,7 @@ export LOGDIR EXP_LOG_DIR
 # fallback #SBATCH directives baked into hpc_batch.bash. Edit here to change resources
 # for every job at once. Defaults mirror the RoboNuke/Continuous_Force_RL setup.
 : "${HPC_ACCOUNT:=virl-grp}"                              # -A  sponsored account
-: "${HPC_PARTITIONS:=dgxh,dgx2,tiamat,gpu,eecs2}"        # -p  partition list
+: "${HPC_PARTITIONS:=dgxh,dgx2,tiamat,eecs2}"            # -p  partition list (NOT gpu: its AllowAccounts=eecs,coeit excludes virl-grp)
 : "${HPC_TIME:=0-09:00:00}"                              # --time  wall-clock limit
 : "${HPC_GRES:=gpu:1}"                                   # --gres  GPUs to request
 : "${HPC_MEM:=32G}"                                      # --mem  host memory
