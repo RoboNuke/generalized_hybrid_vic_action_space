@@ -131,12 +131,7 @@ DEF
 echo "[build] wrote $DEF"
 
 # ----- build -----------------------------------------------------------------
-# Persist pip's download cache on the host (local /tmp) across builds so retries
-# don't re-download torch + Isaac Sim (~12 GB). HOME is /root inside %post.
-PIPCACHE="${PIPCACHE:-$APPTAINER_TMPDIR/pipcache}"
-mkdir -p "$PIPCACHE"
 apptainer build --fakeroot \
-    --bind "$PIPCACHE":/root/.cache/pip \
     --mksquashfs-args "-mem 8G -processors 4" \
     "$IMG" "$DEF" 2>&1 | tee "$BUILD/build.log"
 
