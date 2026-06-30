@@ -74,7 +74,7 @@ From: ${BASE_IMAGE#docker://}
     # system deps: graphics + build libs Isaac Sim / kit need at runtime
     apt-get update
     apt-get install -y --no-install-recommends \\
-        software-properties-common git git-lfs curl wget ca-certificates build-essential \\
+        software-properties-common git git-lfs curl wget ca-certificates build-essential cmake \\
         libgl1 libglu1-mesa libegl1 libgomp1 libglib2.0-0 \\
         libxrandr2 libxinerama1 libxcursor1 libxi6 libxext6 libxrender1 libsm6
     add-apt-repository -y ppa:deadsnakes/ppa
