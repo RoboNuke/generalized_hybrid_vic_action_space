@@ -139,6 +139,10 @@ SBATCH_RES=(
     --mem="$HPC_MEM"
     -c "$HPC_CPUS"
     --signal="$HPC_SIGNAL"
+    # Pass the REAL launcher dir into the job env: sbatch copies the job script to a spool
+    # dir, so hpc_batch.bash can't find hpc_env.bash via BASH_SOURCE. ALL also propagates
+    # any HPC_* env overrides used at submit time.
+    --export="ALL,HPC_LAUNCHER_DIR=$SCRIPT_DIR"
 )
 
 # ===== Submit one job per config =====

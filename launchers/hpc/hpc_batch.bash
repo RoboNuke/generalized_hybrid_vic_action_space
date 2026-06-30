@@ -28,7 +28,10 @@ set -Eeuo pipefail
 trap 'echo "[hpc-batch] FAILED at ${BASH_SOURCE[0]}:${LINENO} (exit $?)" >&2' ERR
 
 # ===== Load central config =====
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# Under sbatch the script is COPIED into a spool dir, so BASH_SOURCE no longer points at
+# launchers/hpc and a sibling source would miss. sbatch_launcher.bash passes the real dir
+# via HPC_LAUNCHER_DIR (--export); fall back to BASH_SOURCE for standalone/manual runs.
+SCRIPT_DIR="${HPC_LAUNCHER_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 # shellcheck source=hpc_env.bash
 source "$SCRIPT_DIR/hpc_env.bash"
 
