@@ -38,6 +38,18 @@ export PROJECT_ROOT
 : "${APPTAINER_BINDS:=}"
 export SIF_IMAGE APPTAINER_BIN CONTAINER_PYTHON ISAAC_CACHE_HOME APPTAINER_BINDS
 
+# ===== Weights & Biases (only matters if a config sets wandb: true) =====
+# Unattended jobs can't do the interactive `wandb login`, and --containall hides your host
+# credentials from the container. So:
+#   * Set WANDB_API_KEY here (or export it before submitting) to log ONLINE. Get it from
+#     https://wandb.ai/authorize.  With --export=ALL the submitter propagates it to the job.
+#   * Leave it empty to default to OFFLINE: a wandb:true config logs locally to the run dir
+#     and never crashes; sync afterwards with `wandb sync <dir>`.
+# WANDB_MODE (online/offline/disabled) overrides the auto behavior if you set it explicitly.
+: "${WANDB_API_KEY:=}"
+: "${WANDB_MODE:=}"
+export WANDB_API_KEY WANDB_MODE
+
 # ===== Output locations (repo-relative defaults) =====
 # Where runner.py writes experiment runs (matches sac_block_e2e.sh's LOGDIR default).
 : "${LOGDIR:=$PROJECT_ROOT/runs}"

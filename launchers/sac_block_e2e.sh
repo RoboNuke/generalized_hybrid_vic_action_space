@@ -67,13 +67,9 @@ RUNNER="$PROJECT_ROOT/learning/runner.py"
 # The family subdir is sac_cfg.experiment.directory, which --experiment_directory
 # overrides. Replicate the runner's legacy collapse: if family basename equals the
 # logdir basename, the family level is dropped (runs/runs/<exp> -> runs/<exp>).
-EXP_FAMILY_DIR="$LOGDIR"
-if [[ -n "$EXPERIMENT_DIRECTORY" \
-      && "$(basename "$EXPERIMENT_DIRECTORY")" != "$(basename "$LOGDIR")" ]]; then
-    EXP_FAMILY_DIR="$LOGDIR/$EXPERIMENT_DIRECTORY"
-fi
-EXP_DIR="$EXP_FAMILY_DIR/$EXPERIMENT_NAME"
-EVAL_EXP_NAME="${EXPERIMENT_NAME}_eval"
+# EXP_FAMILY_DIR / EXP_DIR / EVAL_EXP_NAME are computed below — AFTER the config's
+# sac_cfg.experiment.directory is read — so the worker's checkpoint/eval paths match
+# runner.py's output dir even when --experiment_directory was not passed.
 
 # Resolve config to absolute (allow caller to pass a project-root-relative path).
 if [[ "$CONFIG_PATH" != /* ]]; then
@@ -99,6 +95,23 @@ command -v "$PYTHON" >/dev/null \
 NUM_AGENTS="$("$PYTHON" -c "import yaml,sys; print(yaml.safe_load(open('$CONFIG_PATH'))['runner_cfg']['num_agents'])")"
 [[ "$NUM_AGENTS" =~ ^[0-9]+$ ]] \
     || { echo "[launcher] could not read runner_cfg.num_agents from $CONFIG_PATH (got '$NUM_AGENTS')" >&2; exit 1; }
+
+# ===== Resolve the output dir EXACTLY like runner.py (<logdir>/<family>/<exp_name>) =====
+# Family subdir: --experiment_directory wins; otherwise fall back to the config's own
+# sac_cfg.experiment.directory (what runner.py uses). Without this, a caller that omits
+# --experiment_directory (e.g. the SLURM batch path) would look in <logdir>/<exp_name>
+# while runner.py wrote to <logdir>/<family>/<exp_name>. We use a SEPARATE var (FAMILY) so
+# this fallback does NOT change what is forwarded to runner.py via EXP_DIR_FLAG below.
+FAMILY="$EXPERIMENT_DIRECTORY"
+if [[ -z "$FAMILY" ]]; then
+    FAMILY="$("$PYTHON" -c "import yaml; c=yaml.safe_load(open('$CONFIG_PATH')) or {}; e=(c.get('sac_cfg') or {}).get('experiment') or {}; print(e.get('directory') or '')" 2>/dev/null || true)"
+fi
+EXP_FAMILY_DIR="$LOGDIR"
+if [[ -n "$FAMILY" && "$(basename "$FAMILY")" != "$(basename "$LOGDIR")" ]]; then
+    EXP_FAMILY_DIR="$LOGDIR/$FAMILY"
+fi
+EXP_DIR="$EXP_FAMILY_DIR/$EXPERIMENT_NAME"
+EVAL_EXP_NAME="${EXPERIMENT_NAME}_eval"
 
 echo "[launcher] python=$(command -v "$PYTHON")  config=$CONFIG_PATH  experiment=$EXPERIMENT_NAME  num_agents=$NUM_AGENTS"
 

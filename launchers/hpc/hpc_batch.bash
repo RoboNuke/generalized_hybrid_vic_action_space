@@ -107,7 +107,17 @@ done
 # `${FORWARD[@]+...}` guard keeps an EMPTY forwarded-args array from tripping `set -u` on
 # the older bash found on many clusters.
 mkdir -p "$ISAAC_CACHE_HOME"
-echo "[hpc-batch] launching container worker..."
+
+# wandb: online needs an API key, but unattended jobs can't do the interactive login and
+# --containall hides host creds. Default to OFFLINE so a wandb:true config logs locally
+# instead of crashing on "No API key configured"; if WANDB_API_KEY is set, go online and
+# pass it in. An explicit WANDB_MODE always wins.
+WANDB_ENV=(--env WANDB_MODE="${WANDB_MODE:-offline}")
+if [[ -n "${WANDB_API_KEY:-}" ]]; then
+    WANDB_ENV=(--env WANDB_API_KEY="$WANDB_API_KEY" --env WANDB_MODE="${WANDB_MODE:-online}")
+fi
+
+echo "[hpc-batch] launching container worker...  (wandb: ${WANDB_API_KEY:+online}${WANDB_API_KEY:-offline})"
 exec "$APPTAINER_BIN" exec --nv --writable-tmpfs \
     --home "$ISAAC_CACHE_HOME:/root" \
     "${BIND_ARGS[@]}" \
@@ -116,5 +126,6 @@ exec "$APPTAINER_BIN" exec --nv --writable-tmpfs \
     --env OMNI_KIT_ACCEPT_EULA=YES \
     --env TORCHDYNAMO_DISABLE=1 \
     --env PYTHONUNBUFFERED=1 \
+    "${WANDB_ENV[@]}" \
     "$SIF_IMAGE" \
     bash "$WORKER" "$CONFIG_PATH" "$EXP_NAME" ${FORWARD[@]+"${FORWARD[@]}"}
