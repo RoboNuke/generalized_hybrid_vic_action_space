@@ -127,6 +127,10 @@ class FlatSurfaceFollowTask(ForgeTask):
     pace_a: float = 20.0                          # squashing steepness over the pace error (m)
     pace_b: float = 0.0
 
+    # Action penalties (linear, exactly as in FactoryEnv; NOT squashed) are inherited from
+    # FactoryTask: action_penalty_ee_scale and action_grad_penalty_scale, both default 0.0 (off).
+    # _get_rewards applies them with negative scales. Raise action_grad_penalty_scale to damp chatter.
+
     # --- Procedural primitive spawns ---
     # Plate: kinematic so it never drifts under the cylinder's normal force.
     fixed_asset: RigidObjectCfg = RigidObjectCfg(

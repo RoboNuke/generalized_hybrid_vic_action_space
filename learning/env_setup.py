@@ -476,6 +476,17 @@ def build_env(
         from wrappers.sensors.forge_full_rotation import install_forge_full_rotation
         install_forge_full_rotation()
 
+    # Orientation observation representation. Register the 6-D rotation-matrix channel dims, then
+    # (when selected) rewrite obs_order/state_order to use them in place of the raw quaternions.
+    # Must precede gym.make: the env sizes observation_space/state_space from the orders in
+    # __init__, and the env's obs builders publish the matching *_rot6d channels every step. No-op
+    # for the default "quat" mode. Harmless on tasks without these orders/keys.
+    from isaaclab_tasks.direct.factory.factory_env_cfg import OBS_DIM_CFG, STATE_DIM_CFG
+    from wrappers.sensors.orientation_obs import apply_orientation_obs_mode, register_rot6d_dims
+
+    register_rot6d_dims(OBS_DIM_CFG, STATE_DIM_CFG)
+    apply_orientation_obs_mode(env_cfg, getattr(controller_cfg, "orientation_obs_mode", "quat"))
+
     env = gym.make(runner_cfg.task, cfg=env_cfg, render_mode=None)
 
     # AutoMate-as-Forge adapter: must wrap the raw env BEFORE the control wrapper, since the

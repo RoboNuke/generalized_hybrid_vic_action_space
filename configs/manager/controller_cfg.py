@@ -100,6 +100,13 @@ class ControlCfg(ForgeCtrlCfg):
     # Remember to set the actor's force_zero_action_dims=null so Rx/Ry are learnable.
     full_orientation_control: bool = False
 
+    # Orientation OBSERVATION representation (policy + critic). "quat" keeps the raw (w,x,y,z)
+    # quaternion; "6d_rot_mat" swaps every quaternion-valued orientation channel (fingertip /
+    # held / fixed) for the 6-D rotation-matrix rep (first two columns of R; Zhou et al. 2019) --
+    # continuous, sign-unambiguous, smoother to optimize (no double-cover / unit-norm pathology).
+    # Wired in learning.env_setup before gym.make (it resizes the obs); physics/control unchanged.
+    orientation_obs_mode: str = "quat"
+
     # ---- eval-recording frame visualization (ctrl-action-interface only) ----
     # Each marker is an independent RGB coordinate-axis frame drawn into the sim (captured by
     # the recorder camera). All default OFF so training is unaffected; enable per-marker in the

@@ -336,7 +336,12 @@ class BlockAgent(Agent):
                         log_dir=agent_log_dir,
                         cfg=self.cfg,
                     )
-                    self.per_agent_writers.append(MetricWriter(tb_writer, wandb_run))
+                    # The runner dumps the verbatim runtime config to this path
+                    # AFTER init(); MetricWriter.close() attaches it to the run.
+                    cfg_path = os.path.join(agent_log_dir, "config.yaml")
+                    self.per_agent_writers.append(
+                        MetricWriter(tb_writer, wandb_run, config_path=cfg_path)
+                    )
                 else:
                     self.per_agent_writers.append(tb_writer)
                 self.per_agent_tracking.append(collections.defaultdict(list))

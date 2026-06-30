@@ -763,6 +763,29 @@ def main(argv: list[str] | None = None) -> None:
     train_exc: BaseException | None = None
     try:
         if args.mode == "train":
+            # Annotate the tqdm bar with progress toward the next TB/wandb flush:
+            # the agent logs when timestep % write_interval == 0, so "log x/W" shows
+            # how many steps into the current logging interval we are. We swap the
+            # `tqdm` reference inside the SequentialTrainer module ONLY (a shim whose
+            # .tqdm is a postfix-setting subclass), so no other progress bar is
+            # affected and skrl's train loop stays untouched. Train mode only.
+            _wi = int(getattr(agent, "write_interval", 0) or 0)
+            if _wi > 0 and not getattr(trainer.cfg, "disable_progressbar", False):
+                import skrl.trainers.torch.sequential as _seq
+
+                class _IntervalBar(_seq.tqdm.tqdm):
+                    def update(self, n=1):
+                        # Set the postfix to the POST-increment count BEFORE super()
+                        # so the redraw inside update() shows the current value (not
+                        # the previous cycle's). refresh=False piggybacks on tqdm's
+                        # own redraw cadence rather than forcing a draw every step.
+                        self.set_postfix_str(f"log {(self.n + n) % _wi}/{_wi}", refresh=False)
+                        return super().update(n)
+
+                class _TqdmShim:
+                    tqdm = _IntervalBar
+
+                _seq.tqdm = _TqdmShim
             trainer.train()
         else:
             trainer.eval()

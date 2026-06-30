@@ -28,4 +28,6 @@ class FlatSurfaceFollowWrapper(FactoryWrapper):
             "orientation": float(cfg.orientation_weight),
             "straightness": float(cfg.straightness_weight),
             "pace": float(cfg.pace_weight),
+            "action_penalty_ee": -float(cfg.action_penalty_ee_scale),
+            "action_grad_penalty": -float(cfg.action_grad_penalty_scale),
         }

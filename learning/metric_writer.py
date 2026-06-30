@@ -41,11 +41,21 @@ class MetricWriter:
     ``add_scalar``, ``flush``, ``close``. TensorBoard writes pass through
     immediately; wandb scalars are buffered per interval and committed on
     ``flush()`` (see module docstring).
+
+    ``config_path`` is the per-agent ``config.yaml`` the runner dumps (the exact
+    merged + CLI-applied runtime config used to reconstruct a run). It does not
+    exist yet at construction time — the runner dumps it after ``agent.init()`` —
+    so we attach it to the run at ``close()`` (via ``run.save(policy="now")``),
+    by which point the file is guaranteed on disk. This uploads the verbatim
+    file to the run's Files tab as ``runtime_config.yaml`` (NOT as an artifact,
+    and NOT named ``config.yaml`` — wandb reserves that for its own config),
+    complementing the structured ``wandb.config`` dict set at init.
     """
 
-    def __init__(self, tb_writer, wandb_run=None) -> None:
+    def __init__(self, tb_writer, wandb_run=None, config_path: str | None = None) -> None:
         self._tb = tb_writer
         self._wandb_run = wandb_run
+        self._config_path = config_path
         self._pending: dict[str, float] = {}
         self._pending_step: int | None = None
 
@@ -72,6 +82,22 @@ class MetricWriter:
         if self._tb is not None:
             self._tb.close()
         if self._wandb_run is not None:
+            # Attach the verbatim runtime config (now dumped on disk) to the run's
+            # Files before finishing. Saved as "runtime_config.yaml" (NOT
+            # "config.yaml": wandb reserves that name for its own serialized
+            # wandb.config, so reusing it would collide). Copy into wandb's own
+            # files dir and save with policy="now" so it uploads immediately and
+            # leaves no duplicate in the experiment tree.
+            if self._config_path and os.path.isfile(self._config_path):
+                try:
+                    import shutil
+                    files_dir = self._wandb_run.settings.files_dir
+                    dst = os.path.join(files_dir, "runtime_config.yaml")
+                    shutil.copyfile(self._config_path, dst)
+                    self._wandb_run.save(dst, base_path=files_dir, policy="now")
+                except Exception as e:  # never let a logging extra abort shutdown
+                    print(f"[metric_writer] wandb runtime_config.yaml save failed: {e!r}",
+                          flush=True)
             # Blocks until the run's data is synced (online) — must happen before
             # the runner's os._exit(0) or the tail of the run is lost.
             self._wandb_run.finish()
@@ -93,9 +119,12 @@ def make_wandb_run(
 
       * project = basename of the experiment "family" dir (the parent of
         ``experiment_dir``, e.g. ``forge_pih``)
-      * group   = experiment_name (basename of ``experiment_dir``) — so the N
-        agents of one run cluster together
-      * name    = ``<experiment_name>_agent<i>``
+      * group   = experiment_name with any ``.yaml``/``.yml`` extension stripped
+        (so e.g. ``1_fixed.yaml`` -> ``1_fixed``) — the N agents cluster together
+      * name    = ``<stripped_experiment_name>_agent<i>``
+
+    Note: only the wandb-facing names drop the extension; ``experiment_dir`` (the
+    on-disk tfevents/checkpoint layout) keeps the full ``experiment_name``.
 
     Any of these (plus ``entity``, ``tags``, ``mode``, ``id``, ...) can be
     overridden via ``experiment.wandb_kwargs``. Returns a wandb ``Run``.
@@ -110,6 +139,13 @@ def make_wandb_run(
 
     experiment_name = os.path.basename(experiment_dir.rstrip("/")) or "experiment"
     family = os.path.basename(os.path.dirname(experiment_dir.rstrip("/"))) or "skrl"
+    # Strip a YAML extension from the wandb-facing names only (configs are commonly
+    # named e.g. "1_fixed.yaml"); the on-disk experiment_dir keeps the full name.
+    wandb_name = experiment_name
+    for _ext in (".yaml", ".yml"):
+        if wandb_name.lower().endswith(_ext):
+            wandb_name = wandb_name[: -len(_ext)]
+            break
 
     experiment_cfg = getattr(cfg, "experiment", None)
     user_kwargs = {}
@@ -132,8 +168,8 @@ def make_wandb_run(
 
     kwargs: dict[str, Any] = dict(user_kwargs)
     kwargs.setdefault("project", family)
-    kwargs.setdefault("group", experiment_name)
-    kwargs.setdefault("name", f"{experiment_name}_agent{agent_index}")
+    kwargs.setdefault("group", wandb_name)
+    kwargs.setdefault("name", f"{wandb_name}_agent{agent_index}")
     kwargs.setdefault("dir", log_dir)
     # Independent concurrent run per agent in one process (vs. the default, which
     # would finish the previous agent's run on each init()).

@@ -349,6 +349,13 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "prev_actions": prev_actions,
         }
 
+        # Publish the 6-D rotation-matrix counterpart of every quaternion channel (inert unless
+        # the corresponding *_rot6d key is in obs_order/state_order; selected before gym.make).
+        from wrappers.sensors.orientation_obs import augment_obs_dict_with_rot6d
+
+        augment_obs_dict_with_rot6d(obs_dict)
+        augment_obs_dict_with_rot6d(state_dict)
+
         obs_tensors = factory_utils.collapse_obs_dict(obs_dict, self.cfg.obs_order + ["prev_actions"])
         state_tensors = factory_utils.collapse_obs_dict(state_dict, self.cfg.state_order + ["prev_actions"])
         return {"policy": obs_tensors, "critic": state_tensors}
@@ -362,12 +369,13 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         return torch.logical_and(at_goal, oriented)
 
     def _get_rewards(self):
-        """Reward = sum over terms of weight * squashing_fn(raw signed REALIZED value, a, b).
+        """Reward = bounded task terms + the Factory action penalties.
 
-        Each value is computed from measured/physics state only (never control targets), so the
-        reward reflects what actually happened. squashing_fn peaks at value=0 (perfect match).
-        More terms (progress, speed, ...) come in later passes; the scorer's _factory_scales must
-        stay in sync with the weights below.
+        Task terms (force, orientation, straightness, pace) are weight * squashing_fn(raw signed
+        REALIZED value, a, b) — computed from measured/physics state only (never control targets),
+        peaking at value=0. The two action penalties (action_penalty_ee, action_grad_penalty) are
+        the FactoryEnv linear penalties applied with NEGATIVE scales, both default 0.0 (off). The
+        scorer's _factory_scales must stay in sync with the weights/scales below.
         """
         curr_successes = self._get_curr_successes()
         cfg = self.cfg_task
@@ -382,18 +390,29 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # Pace: along-track error vs the moving setpoint s_ref (computed in _compute from the pace
         # clock). The clock advances by one env step only while in contact (updated below).
         pace_value = self.progress - self.s_ref                             # (E,) m, signed
+        # Action penalties: EXACTLY as in FactoryEnv._get_factory_rew_dict (linear, NOT squashed).
+        # action_penalty_ee penalizes raw action magnitude; action_grad_penalty penalizes the
+        # step-to-step action change (chatter). Applied with NEGATIVE scales; both scales default
+        # 0.0 (inherited from FactoryTask -> off). prev_actions holds the previous step's action
+        # (refreshed at the end of this method).
+        action_penalty_ee = torch.norm(self.actions, p=2)
+        action_grad_penalty = torch.norm(self.actions - self.prev_actions, p=2, dim=-1)
 
         rew_dict = {
             "force": factory_utils.squashing_fn(force_value, cfg.force_a, cfg.force_b),
             "orientation": factory_utils.squashing_fn(orn_value, cfg.orientation_a, cfg.orientation_b),
             "straightness": factory_utils.squashing_fn(straightness_value, cfg.straightness_a, cfg.straightness_b),
             "pace": factory_utils.squashing_fn(pace_value, cfg.pace_a, cfg.pace_b),
+            "action_penalty_ee": action_penalty_ee,
+            "action_grad_penalty": action_grad_penalty,
         }
         rew_scales = {
             "force": float(cfg.force_weight),
             "orientation": float(cfg.orientation_weight),
             "straightness": float(cfg.straightness_weight),
             "pace": float(cfg.pace_weight),
+            "action_penalty_ee": -float(cfg.action_penalty_ee_scale),
+            "action_grad_penalty": -float(cfg.action_grad_penalty_scale),
         }
         rew_buf = torch.zeros(self.num_envs, device=self.device)
         for name in rew_dict:

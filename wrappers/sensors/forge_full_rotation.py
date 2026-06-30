@@ -12,6 +12,13 @@ places exploit that lock and silently break once the gripper is allowed full 6-D
      (``ee_angvel_fd[:, 0:2] = 0``).
   2. ``FactoryEnv.close_gripper_in_place`` (used during reset's grasp-close) servos the gripper
      to roll=pi, pitch=0 — yanking any TILTED initial orientation back to upright.
+  3. ``ForgeEnv._get_observations`` zeroes the roll/pitch components of the previous-action obs
+     (``prev_actions[:, 3:5] = 0``) — valid only when the policy commands yaw alone; under full
+     6-DOF those carry real commanded rotation, so zeroing them corrupts the obs.
+
+It also makes the orientation obs representation switchable: every quaternion-valued channel is
+augmented with its 6-D rotation-matrix counterpart (``*_rot6d``), and ``cfg.obs_order`` selects
+which the policy/critic sees (see ``orientation_obs.py`` / ``learning.env_setup``).
 
 This installer patches both at the CLASS level (so every Forge/Factory subclass, incl. the
 surface task, is fixed) with full-rotation versions: a corrected ``_compute_intermediate_values``
@@ -35,9 +42,12 @@ def install_forge_full_rotation() -> None:
     import isaacsim.core.utils.torch as torch_utils
     from isaaclab.utils.math import axis_angle_from_quat
 
+    from isaaclab_tasks.direct.factory import factory_utils
     from isaaclab_tasks.direct.factory.factory_env import FactoryEnv
     from isaaclab_tasks.direct.forge import forge_utils
     from isaaclab_tasks.direct.forge.forge_env import ForgeEnv
+
+    from wrappers.sensors.orientation_obs import augment_obs_dict_with_rot6d
 
     if getattr(ForgeEnv, "_full_rotation_patched", False):
         return
@@ -105,11 +115,55 @@ def install_forge_full_rotation() -> None:
             ctrl_target_gripper_dof_pos=0.0,
         )
 
+    def _get_observations(self):
+        """Forge obs/state WITHOUT the prev-action roll/pitch zeroing, augmented with 6-D rot reps.
+
+        Faithful copy of ``ForgeEnv._get_observations`` with two changes for full 6-DOF: (a) keep
+        all six prev-action components (no ``prev_actions[:, 3:5] = 0``), and (b) publish a
+        ``*_rot6d`` channel alongside every quaternion so ``cfg.obs_order``/``state_order`` can
+        select the 6-D rotation-matrix rep. Which rep is consumed is decided by the orders, set
+        before gym.make; the physics are untouched.
+        """
+        obs_dict, state_dict = self._get_factory_obs_state_dict()
+
+        noisy_fixed_pos = self.fixed_pos_obs_frame + self.init_fixed_pos_obs_noise
+        prev_actions = self.actions.clone()  # full 6-DOF: do NOT zero prev_actions[:, 3:5]
+
+        obs_dict.update(
+            {
+                "fingertip_pos": self.noisy_fingertip_pos,
+                "fingertip_pos_rel_fixed": self.noisy_fingertip_pos - noisy_fixed_pos,
+                "fingertip_quat": self.noisy_fingertip_quat,
+                "force_threshold": self.contact_penalty_thresholds[:, None],
+                "ft_force": self.noisy_force,
+                "prev_actions": prev_actions,
+            }
+        )
+        state_dict.update(
+            {
+                "ema_factor": self.ema_factor,
+                "ft_force": self.force_sensor_smooth[:, 0:3],
+                "force_threshold": self.contact_penalty_thresholds[:, None],
+                "prev_actions": prev_actions,
+            }
+        )
+
+        # Publish the 6-D rotation-matrix counterpart of every quaternion channel (inert unless
+        # the corresponding *_rot6d key is in obs_order/state_order).
+        augment_obs_dict_with_rot6d(obs_dict)
+        augment_obs_dict_with_rot6d(state_dict)
+
+        obs_tensors = factory_utils.collapse_obs_dict(obs_dict, self.cfg.obs_order + ["prev_actions"])
+        state_tensors = factory_utils.collapse_obs_dict(state_dict, self.cfg.state_order + ["prev_actions"])
+        return {"policy": obs_tensors, "critic": state_tensors}
+
     ForgeEnv._compute_intermediate_values = _compute_intermediate_values
     FactoryEnv.close_gripper_in_place = close_gripper_in_place
+    ForgeEnv._get_observations = _get_observations
     ForgeEnv._full_rotation_patched = True
     print(
         "[full-rotation] patched ForgeEnv._compute_intermediate_values (no quat w,z / angvel "
-        "zeroing) and FactoryEnv.close_gripper_in_place (hold current pose) for full 6-DOF.",
+        "zeroing), ForgeEnv._get_observations (no prev-action roll/pitch zeroing + 6-D rot reps) "
+        "and FactoryEnv.close_gripper_in_place (hold current pose) for full 6-DOF.",
         flush=True,
     )

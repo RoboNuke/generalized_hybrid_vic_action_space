@@ -104,7 +104,7 @@ sac_cfg:
   polyak: 0.005
   actor_lr: 1.0e-4
   critic_lr: 1.0e-4
-  entropy_lr: 1.0e-4
+  entropy_lr: 1.0e-5
   weight_decay: 1.0e-2
   random_timesteps: 0
   learning_starts: 300
@@ -125,6 +125,37 @@ sac_cfg:
     experiment_name: "1_fixed.yaml"
     write_interval: 150
     checkpoint_interval: auto
+    # ---- Weights & Biases (optional; runs IN PARALLEL with TensorBoard) ----
+    # TensorBoard is always on. Setting `wandb: true` does not replace it — every
+    # per-agent SummaryWriter is wrapped so the SAME scalars (same single-slash
+    # tags, same write_interval flush) are mirrored to wandb as well. Local
+    # tfevents under <logdir>/eef_glued_peg/1_fixed.yaml/<agent>/ keep being written.
+    #
+    # To turn wandb on, uncomment the single bool below:
+    wandb: true
+    #
+    # Each block-parallel agent gets its OWN wandb run, auto-named from the fields
+    # above (no extra config needed):
+    #   project = eef_glued_peg        (this experiment's `directory`)
+    #   group   = 1_fixed              (this `experiment_name`, .yaml stripped)
+    #   run     = 1_fixed_agent0 ...   (one per agent; they cluster in the group)
+    # The exact merged+CLI runtime config is also attached to each run's Files tab
+    # as `runtime_config.yaml` (verbatim file, not an artifact) for reproducibility.
+    #
+    # Optional overrides (any wandb.init kwarg) — uncomment as needed:
+    wandb_kwargs:
+    #     project: my_project    # override the default project name
+      entity: hur        # wandb team/user
+    #     mode: online           # or "offline" to log locally without a network/login
+    #     tags: [glued_peg, fixed]
+    #
+    # Before launching with wandb online you must be authenticated ONCE on the
+    # machine (host or inside the container):
+    #   wandb login                      # interactive, or
+    #   export WANDB_API_KEY=<key>       # non-interactive (e.g. HPC/Singularity)
+    # No code or launch-flag changes are needed — just `wandb: true` here, then run
+    # the normal training command. To log without any network/login, use
+    # `wandb_kwargs: { mode: offline }` (syncs later via `wandb sync`).
 
 model_cfg:
   actor:
@@ -197,6 +228,12 @@ controller_cfg:
   # scaled by rot_action_bounds, instead of the default yaw-only map (roll/pitch forced to 0).
   # Only affects wrapper control types (no-op for control_type: pose, which uses the base env).
   full_orientation_control: true
+
+  # Orientation OBSERVATION rep: "6d_rot_mat" feeds the policy/critic the 6-D rotation-matrix
+  # form (first two columns of R) instead of the raw quaternion "quat" — continuous and
+  # sign-unambiguous, avoiding the double-cover / w~=0 conditioning that hurt the full-6-DOF
+  # quaternion obs. Physics/control unchanged. Set "quat" to A/B against the old representation.
+  orientation_obs_mode: "6d_rot_mat"
 
   # ---- rotation action scaling / per-step clip (Forge defaults) ----
   # rot_action_bounds: action[3:6] scaled to this (rad); governs the orientation cone when

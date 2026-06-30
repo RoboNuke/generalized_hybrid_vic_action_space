@@ -140,6 +140,12 @@ controller_cfg:
   # Only affects wrapper control types (no-op for control_type: pose, which uses the base env).
   full_orientation_control: true
 
+  # Orientation OBSERVATION rep: "6d_rot_mat" feeds the policy/critic the 6-D rotation-matrix
+  # form (first two columns of R) instead of the raw quaternion "quat" — continuous and
+  # sign-unambiguous, avoiding the double-cover / w~=0 conditioning that hurt the full-6-DOF
+  # quaternion obs. Physics/control unchanged. Set "quat" to A/B against the old representation.
+  orientation_obs_mode: "6d_rot_mat"
+
   # ---- rotation action scaling / per-step clip (Forge defaults) ----
   # rot_action_bounds: action[3:6] scaled to this (rad); governs the orientation cone when
   # full_orientation_control is on. rot_action_threshold: per-step clip on the orientation
