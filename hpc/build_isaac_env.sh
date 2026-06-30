@@ -114,13 +114,10 @@ From: ${BASE_IMAGE#docker://}
     # 4) everything else (re-pinned last so versions match \`general\`)
     python -m pip install -r /opt/reqs/rest.txt
 
-    # smoke check: torch/skrl import, and isaacsim/isaaclab are INSTALLED. We do NOT
-    # import isaaclab/isaaclab_tasks here — they pull omni.* which only resolves after
-    # AppLauncher bootstraps the kit runtime (no GPU/app context during build). Full
-    # verification is the AppLauncher boot test post-build.
-    python -c "import torch, skrl; print('torch', torch.__version__, 'cuda', torch.version.cuda, '| skrl', skrl.__version__)"
-    python -c "import importlib.util as u; missing=[m for m in ('isaacsim','isaaclab','isaaclab_tasks','isaaclab_assets') if u.find_spec(m) is None]; assert not missing, f'NOT installed: {missing}'; print('installed:', 'isaacsim isaaclab isaaclab_tasks isaaclab_assets')"
-
+    # NOTE: verification is intentionally NOT done here. A failed check in %post would
+    # abort the whole build (no .sif written) and force a full rebuild. pip install
+    # success above IS the build criterion. Verify the image separately on a GPU node:
+    #   ~/hpc-share/isaac/run.sh python hpc/verify_env.py
     chmod -R a+rX /opt/ghvic /opt/IsaacLab
 
 %runscript
@@ -186,6 +183,6 @@ echo "  run   : $RUN"
 echo "  slurm : $SLURM   (account=$SLURM_ACCOUNT partitions=$SLURM_PARTITIONS)"
 echo "  log   : $BUILD/build.log"
 echo
-echo "Smoke test on a GPU node:"
+echo "Verify the image on a GPU node (separate from the build — re-runnable):"
 echo "  srun -A $SLURM_ACCOUNT -p $SLURM_PARTITIONS --gres=gpu:1 --time=0:20:00 --pty bash"
-echo "  $RUN python -c 'from isaaclab.app import AppLauncher; AppLauncher(headless=True); print(\"sim boots\")'"
+echo "  $RUN python hpc/verify_env.py"
