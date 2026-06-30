@@ -82,6 +82,13 @@ class RecorderCfg:
 class SAC_CFG(AgentCfg):
     """Configuration for the SAC agent."""
 
+    tensorboard: bool = True
+    """Write per-agent TensorBoard scalar events (under ``<experiment_dir>/<i>/``). Set
+    ``false`` to log ONLY to wandb: the per-agent ``MetricWriter`` then skips the TB
+    ``SummaryWriter`` and mirrors scalars to wandb alone. Requires ``experiment.wandb: true``
+    — if both this and wandb are off, TensorBoard is kept on so logging isn't silently lost.
+    (Sibling of ``experiment`` because skrl's ``ExperimentCfg`` has no such field.)"""
+
     gradient_steps: int = 1
     """Number of gradient steps to perform for each update."""
 

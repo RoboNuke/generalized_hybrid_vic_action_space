@@ -215,6 +215,11 @@ class BlockAgent(Agent):
         if not self.per_agent_dist_stats:
             return
         v = vals.reshape(-1).to(torch.float64)
+        # Drop non-finite samples: lets a publisher use NaN to mark "not applicable this step"
+        # (e.g. engagement_quality's depth-conditioned fractions, NaN where depth isn't met) so the
+        # running mean/std cover only the valid population; also guards existing (dist)/(stat) tags
+        # against an inf sample (e.g. a singular-matrix condition number) poisoning the sum.
+        v = v[torch.isfinite(v)]
         if v.numel() == 0:
             return
         acc = self.per_agent_dist_stats[i].get(tag)
@@ -324,10 +329,18 @@ class BlockAgent(Agent):
         # scalars to that agent's own wandb run (write_tracking_data is unchanged — it
         # only calls add_scalar/flush, which the wrapper forwards to both backends).
         wandb_enabled = bool(getattr(getattr(self.cfg, "experiment", None), "wandb", False))
+        # SAC_CFG.tensorboard (sibling of experiment): False => log only to wandb. MetricWriter
+        # already no-ops every TB call when its tb_writer is None, so we just pass None.
+        tb_enabled = bool(getattr(self.cfg, "tensorboard", True))
+        if not tb_enabled and not wandb_enabled:
+            print("[block_agent] tensorboard=false but experiment.wandb is off — keeping "
+                  "TensorBoard so scalars aren't silently lost.", flush=True)
+            tb_enabled = True
         if self.write_interval > 0:
             for i in range(self.num_agents):
                 agent_log_dir = os.path.join(self.experiment_dir, str(i))
-                tb_writer = SummaryWriter(log_dir=agent_log_dir)
+                os.makedirs(agent_log_dir, exist_ok=True)  # SummaryWriter normally makes this; ensure it exists when TB is off
+                tb_writer = SummaryWriter(log_dir=agent_log_dir) if tb_enabled else None
                 if wandb_enabled:
                     wandb_run = make_wandb_run(
                         agent_index=i,
