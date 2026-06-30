@@ -114,9 +114,12 @@ From: ${BASE_IMAGE#docker://}
     # 4) everything else (re-pinned last so versions match \`general\`)
     python -m pip install -r /opt/reqs/rest.txt
 
-    # smoke check: imports resolve (does NOT boot the sim)
-    python -c "import torch, skrl, isaaclab, isaaclab_tasks; \\
-print('torch', torch.__version__, 'cuda', torch.version.cuda, '| skrl', skrl.__version__)"
+    # smoke check: torch/skrl import, and isaacsim/isaaclab are INSTALLED. We do NOT
+    # import isaaclab/isaaclab_tasks here — they pull omni.* which only resolves after
+    # AppLauncher bootstraps the kit runtime (no GPU/app context during build). Full
+    # verification is the AppLauncher boot test post-build.
+    python -c "import torch, skrl; print('torch', torch.__version__, 'cuda', torch.version.cuda, '| skrl', skrl.__version__)"
+    python -c "import importlib.util as u; missing=[m for m in ('isaacsim','isaaclab','isaaclab_tasks','isaaclab_assets') if u.find_spec(m) is None]; assert not missing, f'NOT installed: {missing}'; print('installed:', 'isaacsim isaaclab isaaclab_tasks isaaclab_assets')"
 
     chmod -R a+rX /opt/ghvic /opt/IsaacLab
 
