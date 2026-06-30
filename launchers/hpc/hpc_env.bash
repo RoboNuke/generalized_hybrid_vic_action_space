@@ -20,20 +20,23 @@ _HPC_ENV_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 export PROJECT_ROOT
 
 # ===== Container (Apptainer / Singularity) =====
-# REQUIRED: absolute path to the Isaac Lab .sif image on the HPC. Leave empty here and
-# the launchers will refuse to run with a clear error until you fill it in.
-: "${SIF_IMAGE:=}"
+# Absolute path to the Isaac Lab .sif image on the HPC. Default matches hpc/build_isaac_env.sh
+# (SHARE=$HOME/hpc-share). Override here or via the SIF_IMAGE env var if you moved it.
+: "${SIF_IMAGE:=$HOME/hpc-share/isaac/ghvic.sif}"
 # Container runtime binary: `apptainer` on newer clusters, `singularity` on older ones.
 : "${APPTAINER_BIN:=apptainer}"
-# Python wrapper INSIDE the container. For the Isaac Sim container this is the kit
-# python launcher. Exported to the worker as PYTHON (sac_block_e2e.sh reads PYTHON).
-: "${CONTAINER_PYTHON:=/isaac-sim/python.sh}"
+# Python INSIDE the container. Our pip-based Isaac Sim 5.1 image has python (->3.11) on PATH;
+# this is NOT the old nvcr container's /isaac-sim/python.sh. Exported to the worker as PYTHON.
+: "${CONTAINER_PYTHON:=python}"
+# Writable HOME bound into the container so Isaac Sim's kit/shader caches (GBs) land on the
+# big share, not your small home NFS quota. Mirrors hpc/run.sh's --home. On Lustre is fine.
+: "${ISAAC_CACHE_HOME:=$HOME/hpc-share/isaac_cache_home}"
 # Extra bind mounts, space-separated, each "host:container" or just "host". The project
 # root is always bound automatically; add Isaac cache/asset dirs here if they live
 # outside the project and outside $HOME. Example:
 #   APPTAINER_BINDS="/scratch/$USER/isaac_cache:/root/.cache /nfs/assets:/nfs/assets"
 : "${APPTAINER_BINDS:=}"
-export SIF_IMAGE APPTAINER_BIN CONTAINER_PYTHON APPTAINER_BINDS
+export SIF_IMAGE APPTAINER_BIN CONTAINER_PYTHON ISAAC_CACHE_HOME APPTAINER_BINDS
 
 # ===== Output locations (repo-relative defaults) =====
 # Where runner.py writes experiment runs (matches sac_block_e2e.sh's LOGDIR default).

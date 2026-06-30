@@ -88,19 +88,29 @@ for _b in $APPTAINER_BINDS; do
 done
 
 # ===== Run worker inside the container =====
-# --nv exposes the GPU. We export into the container: PYTHON (the kit python wrapper the
+# --nv exposes the GPU. We export into the container: PYTHON (the in-container python the
 # worker invokes), LOGDIR (so outputs land where we bound them), and TORCHDYNAMO_DISABLE
 # (the worker sets this too, but set it here so it's present from process start).
+#
+# Pip-based Isaac Sim 5.1 in a read-only .sif needs (validated via hpc/run.sh):
+#   --writable-tmpfs       : ephemeral overlay so Isaac Sim can write its EULA_ACCEPTED
+#                            marker into the otherwise read-only image.
+#   OMNI_KIT_ACCEPT_EULA   : auto-accept the EULA so a batch job never hangs on the
+#                            interactive Yes/No prompt.
+#   --home CACHE:/root     : kit/shader caches (GBs) go to the big share, not home NFS quota.
 #
 # `exec` replaces this bash process with the container process so SLURM's --signal=TERM@300
 # is delivered straight to it (no forwarding shim), matching the RoboNuke pattern. The
 # `${FORWARD[@]+...}` guard keeps an EMPTY forwarded-args array from tripping `set -u` on
 # the older bash found on many clusters.
+mkdir -p "$ISAAC_CACHE_HOME"
 echo "[hpc-batch] launching container worker..."
-exec "$APPTAINER_BIN" exec --nv \
+exec "$APPTAINER_BIN" exec --nv --writable-tmpfs \
+    --home "$ISAAC_CACHE_HOME:/root" \
     "${BIND_ARGS[@]}" \
     --env PYTHON="$CONTAINER_PYTHON" \
     --env LOGDIR="$LOGDIR" \
+    --env OMNI_KIT_ACCEPT_EULA=YES \
     --env TORCHDYNAMO_DISABLE=1 \
     --env PYTHONUNBUFFERED=1 \
     "$SIF_IMAGE" \
