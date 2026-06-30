@@ -76,7 +76,7 @@ From: ${BASE_IMAGE#docker://}
     apt-get install -y --no-install-recommends \\
         software-properties-common git git-lfs curl wget ca-certificates build-essential cmake \\
         libgl1 libglu1-mesa libegl1 libgomp1 libglib2.0-0 \\
-        libxrandr2 libxinerama1 libxcursor1 libxi6 libxext6 libxrender1 libsm6
+        libxrandr2 libxinerama1 libxcursor1 libxi6 libxext6 libxrender1 libsm6 libxt6
     add-apt-repository -y ppa:deadsnakes/ppa
     apt-get update
     apt-get install -y --no-install-recommends \\
@@ -152,7 +152,11 @@ CACHE="\${CACHE:-\$SHARE/isaac_cache_home}"                             # writab
 mkdir -p "\$CACHE"
 BINDS=(--bind "\$SHARE:/work" --bind /tmp:/tmp)
 [ -d "\$HOST_REPO" ] && BINDS+=(--bind "\$HOST_REPO:/opt/ghvic")
-exec apptainer run --nv --containall --home "\$CACHE":/root "\${BINDS[@]}" "\$IMG" "\$@"
+# --writable-tmpfs: ephemeral overlay so Isaac Sim can write its EULA_ACCEPTED marker
+#   into the read-only image (bulky caches still go to the bound writable HOME).
+# OMNI_KIT_ACCEPT_EULA=YES: auto-accept the EULA (no interactive prompt -> sbatch-safe).
+exec apptainer run --nv --containall --writable-tmpfs --env OMNI_KIT_ACCEPT_EULA=YES \\
+    --home "\$CACHE":/root "\${BINDS[@]}" "\$IMG" "\$@"
 RUNEOF
 chmod +x "$RUN"
 

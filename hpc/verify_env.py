@@ -50,10 +50,11 @@ def main() -> int:
         import isaaclab            # noqa: F401  (omni.* now resolves)
         import isaaclab_tasks      # noqa: F401  (triggers task registration)
         print("      Isaac Sim booted; isaaclab + isaaclab_tasks import OK", flush=True)
+        # Print success BEFORE app.close(): Isaac Sim's close() does an os._exit that
+        # swallows any trailing output, so VERIFY OK must come first.
+        print("VERIFY OK", flush=True)
     finally:
         app.close()
-
-    print("VERIFY OK", flush=True)
     return 0
 
 
