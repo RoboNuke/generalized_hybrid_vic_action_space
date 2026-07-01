@@ -167,6 +167,15 @@ class RunnerCfg:
     (radians) before ``gym.make``. ``None`` keeps the task default (0.0). Only meaningful when a
     ``check_yaw`` gate is active (e.g. :attr:`engage_check_yaw`, or the nut_thread success check)."""
 
+    engagement_quality_enabled: bool = False
+    """Publish the ``engagement_quality`` diagnostic metric family (Forge/Factory peg insertion only).
+    Reports, every step, the fraction of steps meeting the engagement DEPTH criterion and — among
+    depth-met steps — the fraction also meeting each of the centering / orientation / (optional) yaw
+    criteria, so you can see WHICH criterion bottlenecks engagement. Privileged/reward-side only;
+    nothing enters an observation. Uses :attr:`z_align_max_deg` for the orientation criterion and
+    :attr:`engage_check_yaw` to decide whether to report the yaw criterion. Installs
+    :func:`~wrappers.scorers.engagement_quality.install_engagement_quality`."""
+
     disable_success_pred: bool = False
     """Turn off the base Forge env's success-prediction head end to end (Isaac-Forge- tasks only).
     Forge's 7th action (``actions[:, 6]``) is a learned success predictor: it feeds the

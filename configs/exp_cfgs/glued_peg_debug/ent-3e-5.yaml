@@ -1,0 +1,269 @@
+# Forge Peg Insertion + Control Action Interface (ctrl-action-interface).
+# CtrlActionInterfaceWrapper is a HybridVICWrapper whose pose stiffness K, pose damping D, and
+# force stiffness K_f are produced from a CONFIG-SELECTABLE action-space formulation rather than
+# raw 6x6 matrices. Switch formulations by changing `gain_mapping` only. D is always derived from
+# K (never sampled); force control is pure stiffness (K_f, no damping). All formulations assume
+# policy actions in [-1, 1] and scale them internally.
+#
+# Action-dim formula: base 7 + 2*N + pdim + (pdim if use_hybrid_force else 0),
+#   where N = sum(force_axes) and pdim depends on gain_mapping:
+#     constant=0, variable_diagonal=6, cholesky=12, rotated=12.
+#   This config (variable_diagonal, force_axes x,y,z => N=3, hybrid on): 7 + 6 + 6 + 6 = 25.
+# NOTE: target_entropy is a PLACEHOLDER — the action dim changes with gain_mapping/hybrid, so
+# re-tune per formulation; don't read too much into the value.
+# Unknown headers/keys are hard errors; omitted sections/fields fall back to defaults.
+
+runner_cfg:
+  task: Isaac-Forge-PegInsert-Direct-v0
+  disable_success_pred: true              # turn OFF Forge's success-prediction head: forces
+                                          # task.delay_until_ratio=1.1 (success_pred reward off),
+                                          # force-zeros action dim 6, and withholds the
+                                          # success_pred_error / early_term_* metrics. false = restore.
+  kp_z_align_enabled: false               # add the kp_z_align orientation reward (aligns peg z-axis
+                                          # with socket z-axis; rewards the DOF the 30deg tilted grasp fights)
+  kp_z_align_a: 8.0                     # squashing steepness a (default)
+  kp_z_align_b: 2                     # squashing offset b, peak height 1/(2+b) (default)
+  engagement_quality_enabled: true       # publish engagement_quality/* (depth/centering/orientation breakdown)
+
+  # ---- insertion-reward scales + alignment gates (stock scales 1.0/1.0, gates off) ----
+  # curr_engaged/curr_success are per-step bonuses. The alignment gates AND extra conditions into
+  # those masks: check_yaw requires EE yaw < ee_success_yaw (yaw only); check_z_aligned requires the
+  # angle between the held (peg) and fixed (socket) z-axes to be < z_align_max_deg. Gating the
+  # dominant engaged bonus on z-alignment makes "near the socket" only pay when actually oriented to
+  # insert — useful for tilted/complex geometries. Success is NOT terminal, so gating it is safe.
+  curr_engaged_scale: 1.0               # stock 1.0 — per-step "near the socket" bonus
+  curr_success_scale: 1.0               # stock 1.0 — per-step "fully inserted" bonus
+  # Keypoint-term weights (stock 1.0 each). Multiply the kp reward components so you can rebalance
+  # baseline vs coarse vs fine. NOTE: keypoint_scale below is 0.32 (default 0.15) — the wide spacing
+  # shrinks coarse/fine (sharp a=50/100) far more than baseline (broad a=5), so baseline currently
+  # dominates the return. Lower kp_baseline_scale and/or raise kp_fine_scale to compensate.
+  kp_baseline_scale: 0.0                
+  kp_coarse_scale: 1.0                  # stock 1.0 — "align the assets" term (a=50)
+  kp_fine_scale: 1.0                    # stock 1.0 — "last-inch insertion" term (a=100)
+  
+  
+  
+  
+  engage_check_yaw: false               # gate engaged bonus on EE yaw (yaw only; rarely useful here)
+  engage_check_z_aligned: true         # gate engaged bonus on peg-vs-socket z alignment
+  success_check_yaw: false              # gate success on EE yaw (nut_thread is always yaw-gated)
+  success_check_z_aligned: true        # require z alignment to count as success
+  z_align_max_deg: 10.0                 # max peg-vs-socket axis angle (deg) for check_z_aligned
+  ee_success_yaw_deg: null              # yaw threshold (deg) for check_yaw; null keeps task default
+  agent_type: sac                   # "sac" (default) or "ppo"; selects sac_cfg vs ppo_cfg
+  num_envs: 256
+  num_agents: 3
+  total_timesteps: 20_100
+  eval_timesteps: 150
+  memory_size: 1_000_000
+  seed: -1
+  glue_peg_to_gripper: true              # rigidly weld peg to gripper (constant fixed grasp)
+  grasp_rot_mode: fixed                 # none | random | fixed. how the peg is grasped relative
+                                          # to the gripper: none => perfectly aligned (upstream);
+                                          # random => RANDOM roll/pitch/yaw tilt re-sampled each
+                                          # reset (suboptimal-grasp sim, unobservable to the actor
+                                          # so it must use force feedback); fixed => constant
+                                          # signed offset, identical every env every reset.
+  rel_grasp_rot_init_deg: [0.0, 30.0, 0.0] # [roll, pitch, yaw] deg. random => symmetric ± range
+                                          # sampled U(-x,+x) per env per reset, per axis (e.g.
+                                          # [0, 3, 0] = pitch-only ±3°, components >= 0). fixed =>
+                                          # constant signed offset (negatives allowed). Ignored
+                                          # when grasp_rot_mode is none.
+
+  # ---- keypoint reward geometry (applied to env_cfg.task before gym.make) ----
+  # env_cfg_overrides sets dotted attribute paths on the Isaac Lab env_cfg tree. The keypoint
+  # reward (kp_baseline/coarse/fine) scores the mean distance between num_keypoints points
+  # strung along the peg's insertion (local +z) axis and the matching points on the socket.
+  #   * task.num_keypoints  — how many points along the axis (FactoryTask default 4).
+  #   * task.keypoint_scale — total length of that point line in METERS; points span
+  #                           ±keypoint_scale/2 about the held-base origin (peg_insert default 0.15).
+  # Fewer/closer points => coarser, more forgiving alignment signal; more/wider => sharper.
+  env_cfg_overrides:
+    task.num_keypoints: 4        # default 4
+    task.keypoint_scale: 0.32   # default 0.15 m (0.05 for nut thread) 0.32
+    # Keypoint squashing coefs [a, b]: reward = 1/(e^{a*x} + b + e^{-a*x}), x = mean keypoint dist.
+    # Peak at x=0 is 1/(2+b); larger a => sharper/narrower (decays to 0 faster as x grows). These set
+    # the SHAPE of each kp term (the kp_*_scale knobs above set the linear weight). Defaults below.
+    task.keypoint_coef_baseline: [5, 4]    # default [5, 4]   (broad: peak 1/6, tolerant of distance)
+    task.keypoint_coef_coarse: [50, 2]     # default [50, 2]  (peak 1/4)
+    task.keypoint_coef_fine: [100, 0]      # default [100, 0] (sharp: peak 1/2, near-zero unless inserted)
+    task.contact_penalty_scale: 0.0       # was 0.2 (peg-insert default): zero the contact penalty
+                                          #   so early training isn't pushed into a hover-above-the-hole optimum
+    task.action_penalty_ee_scale: 0.0     # Forge default (EE action penalty)
+    task.action_penalty_asset_scale: 0.001  # Forge default (asset action penalty)
+    task.action_grad_penalty_scale: 0.1   # Forge default (action-grad penalty)
+
+loss_cfg:
+  supervised_selection_enabled: false
+  supervised_selection_policy_weight: 1.0
+  supervised_selection_critic_weight: 0.0
+
+sac_cfg:
+  tensorboard: false        # log ONLY to wandb (requires experiment.wandb: true)
+  gradient_steps: 8
+  batch_size: 1024
+  discount_factor: 0.99
+  polyak: 0.005
+  actor_lr: 1.0e-4
+  critic_lr: 1.0e-4
+  entropy_lr: 3.0e-5
+  weight_decay: 1.0e-2
+  random_timesteps: 0
+  learning_starts: 300
+  learn_entropy: true
+  initial_entropy_value: 0.05 #0.05
+  target_entropy: -3.5            # -|continuous|/2 then +1 (raised for exploration)
+  grad_norm_clip: 1.0
+  mixed_precision: false
+  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor_kwargs: {}
+  rewards_shaper_scale: 0.1
+  gripper_action_idx: null
+  phase_split_families: [RotationFrame, Impedance_Stiffness]
+  recorder:
+    enabled: false
+  experiment:
+    directory: glued_peg_debug
+    experiment_name: "ent-3e-5.yaml"
+    write_interval: 150
+    checkpoint_interval: auto
+    # ---- Weights & Biases (optional; runs IN PARALLEL with TensorBoard) ----
+    # TensorBoard is always on. Setting `wandb: true` does not replace it — every
+    # per-agent SummaryWriter is wrapped so the SAME scalars (same single-slash
+    # tags, same write_interval flush) are mirrored to wandb as well. Local
+    # tfevents under <logdir>/eef_glued_peg/1_fixed.yaml/<agent>/ keep being written.
+    #
+    # To turn wandb on, uncomment the single bool below:
+    wandb: true
+    #
+    # Each block-parallel agent gets its OWN wandb run, auto-named from the fields
+    # above (no extra config needed):
+    #   project = eef_glued_peg        (this experiment's `directory`)
+    #   group   = 1_fixed              (this `experiment_name`, .yaml stripped)
+    #   run     = 1_fixed_agent0 ...   (one per agent; they cluster in the group)
+    # The exact merged+CLI runtime config is also attached to each run's Files tab
+    # as `runtime_config.yaml` (verbatim file, not an artifact) for reproducibility.
+    #
+    # Optional overrides (any wandb.init kwarg) — uncomment as needed:
+    wandb_kwargs:
+    #     project: my_project    # override the default project name
+      entity: hur        # wandb team/user
+    #     mode: online           # or "offline" to log locally without a network/login
+    #     tags: [glued_peg, fixed]
+    #
+    # Before launching with wandb online you must be authenticated ONCE on the
+    # machine (host or inside the container):
+    #   wandb login                      # interactive, or
+    #   export WANDB_API_KEY=<key>       # non-interactive (e.g. HPC/Singularity)
+    # No code or launch-flag changes are needed — just `wandb: true` here, then run
+    # the normal training command. To log without any network/login, use
+    # `wandb_kwargs: { mode: offline }` (syncs later via `wandb sync`).
+
+model_cfg:
+  actor:
+    act_init_std: 1.0
+    selection_distribution: product  # hybrid-only: "product" (independent) or "match" (selection-conditioned)
+    actor_n: 2
+    actor_latent: 512
+    last_layer_scale: 0.1
+    clip_log_std: true
+    min_log_std: -20.0
+    max_log_std: 2.0
+    reduction: sum
+    use_state_dependent_std: false
+    bernoulli_action_dims: null
+    force_zero_action_dims: null   # dim 6 (success-pred) force-zeroed by runner_cfg.disable_success_pred; full_orientation_control keeps Rx/Ry learnable
+    scale_down_action_dims: [0, 1, 2]   # apply last_layer_scale to ONLY the 6 pose deltas (3 pos + 3 orient); gain/selection dims stay unshrunk so they explore
+  critic:
+    critic_output_init_mean: 0.0 #8.6 #50 before
+    critic_n: 4
+    critic_latent: 1024
+    clip_actions: false
+
+controller_cfg:
+  # ---- control type selector (the single switch) ----
+  # "pose"                  : No wrapper
+  # "pose-VICES"            : Applies VICPoseWrapper (diagonal vic only)
+  # "hybrid"                : HybridForcePositionWrapper (selection + force only)
+  # "hybrid-vic"            : HybridVICWrapper (full raw gain mats + sel + force)
+  # "ctrl-action-interface" : CtrlActionInterfaceWrapper (different parameterization of hyprid-vic)
+  control_type: ctrl-action-interface
+
+  # ---- formulation selector (the single switch) ----
+  # "constant"          : fixed diagonal K from default_task_prop_gains (K_f from
+  #                       default_task_force_gains); 0 extra action dims.
+  # "variable_diagonal" : per-axis diagonal K, 6 dims, geometric scaling.
+  # "cholesky"          : block-diagonal SPD K = blkdiag(L_pos L_posᵀ, L_rot L_rotᵀ), 12 dims
+  #                       (per block: 3 L-diagonal + 3 L-off-diagonal). D = zeros for now.
+  # "rotated"           : diagonal K (6) + 6-D rotation vector (6) = 12 dims; R applied as
+  #                       blkdiag(R,R) to the full 6x6.
+  gain_mapping: "constant" #variable_diagonal
+  #fixed_rotation_rpy: [0.0, 30.0, 0.0]   # stiffness-frame R; aligned to the 30deg grasp tilt (used only when gain_mapping=rotated)
+
+  # Toggle force control. When false: NO selection/force-target dims, K_f = zeros, and
+  # force_axes MUST be all-zero. When true: force_axes selects eligible axes (adds 2*N dims)
+  # and K_f gets its own gain dims (same formulation as pose K).
+  use_hybrid_force: false
+  force_axes: [0, 0, 0, 0, 0, 0]   # x,y,z force-eligible (must be all-zero when use_hybrid_force=false)
+  async_z_force_bounds: true
+  # ---- shared per-axis bounds [x,y,z,Rx,Ry,Rz], geometric scaling k = lo*(hi/lo)^((a+1)/2) ----
+  # A lower bound < ~1e-6 disables that channel (k=0) instead of producing NaN, so use > 0 for
+  # meaningful variable impedance. Translation and rotation differ ~10x, hence the split values.
+  gain_min: [50, 50, 50, 30, 30, 30] # pose stiffness K (position x3, rotation x3)
+  gain_max: [500, 500, 500, 30, 30, 30] 
+
+  # NOT USED BEFORE
+  force_gain_min: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]        # force stiffness K_f (force x3, torque x3)
+  force_gain_max: [100.0, 100.0, 100.0, 10.0, 10.0, 10.0]
+
+  # Cholesky-only: off-diagonal L entry = chol_offdiag_rho * sqrt(lo*hi) * clamp(a,-1,1).
+  # 0.0 => diagonal-only (equivalent to variable_diagonal but with 12 dims). Increase to
+  # allow within-block (translation- or rotation-) axis coupling.
+  chol_offdiag_rho: 0.9
+
+  # cholesky/rotated only: learn the full 6-DOF gain matrix (position + orientation)
+  # instead of the translational 3x3 block alone. Changes action dim => re-tune
+  # target_entropy if enabled.
+  full_gain_matrix: false
+
+  # Full 3-DOF orientation control: command roll/pitch/yaw as a delta-axis-angle rotation
+  # scaled by rot_action_bounds, instead of the default yaw-only map (roll/pitch forced to 0).
+  # Only affects wrapper control types (no-op for control_type: pose, which uses the base env).
+  full_orientation_control: true
+
+  # Orientation OBSERVATION rep: "6d_rot_mat" feeds the policy/critic the 6-D rotation-matrix
+  # form (first two columns of R) instead of the raw quaternion "quat" — continuous and
+  # sign-unambiguous, avoiding the double-cover / w~=0 conditioning that hurt the full-6-DOF
+  # quaternion obs. Physics/control unchanged. Set "quat" to A/B against the old representation.
+  orientation_obs_mode: "6d_rot_mat"
+
+  # ---- rotation action scaling / per-step clip (Forge defaults) ----
+  # rot_action_bounds: action[3:6] scaled to this (rad); governs the orientation cone when
+  # full_orientation_control is on. rot_action_threshold: per-step clip on the orientation
+  # target change toward the current pose (rad) — becomes env.rot_threshold.
+  rot_action_bounds: [1.0, 1.0, 1.0]            # Forge default
+  rot_action_threshold: [0.097, 0.097, 0.097]   # Forge default (env.rot_threshold)
+  #rot_action_threshold: [0.017, 0.017, 0.017]
+  # ---- hybrid force-control fields (used on force-eligible axes when use_hybrid_force) ----
+  force_action_bounds: [20.0, 20.0, 20.0]
+  torque_action_bounds: [0.25, 0.25, 0.25]
+  force_action_threshold: [2.0, 2.0, 2.0]
+  torque_action_threshold: [0.01, 0.01, 0.01]
+
+  #default_task_prop_gains: [100, 100, 100, 30, 30, 30]
+  #default_task_force_gains: [0.5, 0.5, 0.5, 0.1, 0.1, 0.1]   # K_f diagonal in "constant" mode
+  default_task_force_gains: [2.8, 2.8, 2.8, 0.1, 0.1, 0.1]
+  async_z_force_bounds: true
+  apply_ema_force: false
+  no_sel_ema: true
+  ema_mode: action
+  # NOTE: damping D is derived (2*sqrt(K), or zeros for cholesky), so damping_min/max are
+  # unused here; gain_min/gain_max (pose stiffness) ARE used.
+
+sensor_cfg:
+  contact:
+    enabled: true                  # mount an IsaacLab ContactSensor on the peg, filtered vs the hole
+    contact_force_threshold: 1.0 #TODO   # N; per-axis EE-frame |force| above this => in contact (1.0 matches upstream)
+    log_contact_state: false        # log Contact / In-Contact {X,Y,Z,Any} fractions to TensorBoard
+    append_to_policy_obs: false
+    append_to_critic_state: true

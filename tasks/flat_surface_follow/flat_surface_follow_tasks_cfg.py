@@ -127,6 +127,16 @@ class FlatSurfaceFollowTask(ForgeTask):
     pace_a: float = 20.0                          # squashing steepness over the pace error (m)
     pace_b: float = 0.0
 
+    # Time-to-success bonus: ONE-SHOT, paid on the first step success is reached. value = t* - t_succ
+    # where t* = (first-contact time) + path_length / desired_speed is the ideal completion time and
+    # t_succ is the actual time success is reached; equivalently L/v - (contact->success duration).
+    # squashing_fn peaks (value=0) when success lands exactly at the ideal time, penalizing dawdling
+    # AND cutting the path short. NOTE: this fires once per episode, so to make it count against the
+    # per-step terms (which accumulate over ~hundreds of steps) scale success_time_weight up (10s-100s).
+    success_time_weight: float = 1.0
+    success_time_a: float = 1.0                    # squashing steepness over the time error (SECONDS)
+    success_time_b: float = 0.0
+
     # Action penalties (linear, exactly as in FactoryEnv; NOT squashed) are inherited from
     # FactoryTask: action_penalty_ee_scale and action_grad_penalty_scale, both default 0.0 (off).
     # _get_rewards applies them with negative scales. Raise action_grad_penalty_scale to damp chatter.

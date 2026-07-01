@@ -402,6 +402,25 @@ def build_env(
             z_align_max_deg=runner_cfg.z_align_max_deg,
         )
 
+    # Optional engagement-quality diagnostics (Forge/Factory peg insertion only): publish the
+    # engagement_quality/* metric family (depth-met fraction + centering/orientation/yaw conditioned
+    # on depth) so the engagement bottleneck is visible. Patches FactoryEnv._log_factory_metrics
+    # (composes with the reward patches above, which never touch that method). Must run before
+    # gym.make. Pure diagnostics — never affects the reward or any observation.
+    if runner_cfg.engagement_quality_enabled:
+        if not (runner_cfg.task.startswith("Isaac-Forge-")
+                or runner_cfg.task.startswith("Isaac-Factory-")):
+            raise ValueError(
+                "runner_cfg.engagement_quality_enabled=True requires a Forge/Factory peg-insertion "
+                "task (it patches FactoryEnv._log_factory_metrics), but task is "
+                f"{runner_cfg.task!r}."
+            )
+        from wrappers.scorers.engagement_quality import install_engagement_quality
+        install_engagement_quality(
+            z_align_max_deg=runner_cfg.z_align_max_deg,
+            check_yaw=runner_cfg.engage_check_yaw,
+        )
+
     # Optional rigid peg-gripper weld (Forge/Factory peg_insert only): author a per-env FixedJoint
     # so the peg is mounted to the gripper instead of held by friction. RunnerCfg already enforces
     # grasp_rot_mode=='fixed' (constant grasp); here we also require the peg_insert task and force

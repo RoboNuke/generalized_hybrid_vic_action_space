@@ -131,30 +131,36 @@ class ForgeWrapper(RewardDecompositionWrapper):
     # Reward scale lookup
     # ------------------------------------------------------------------
     def _factory_scales(self) -> dict[str, float]:
-        """Static factory reward scales from cfg_task. Mirrors the rew_scales dict
-        constructed in ``FactoryEnv._get_factory_rew_dict`` (keypoint and engagement
-        terms have scale 1.0; action penalties are negative)."""
+        """Effective factory reward scales. Reads the per-term scales the env ACTUALLY used —
+        ``insertion_reward`` stashes them on the env as ``_reward_term_scales`` after applying the
+        kp_*/curr_* knobs — so Episode_Reward/<term> matches the training reward instead of
+        mirroring stock scales. Falls back to the stock values (kp/engagement 1.0; action penalties
+        from cfg) when no such wrapper is active."""
         cfg = self._unwrapped.cfg_task
+        eff = getattr(self._unwrapped, "_reward_term_scales", None) or {}
+
+        def scale(term, default):
+            return float(eff[term]) if term in eff else float(default)
+
         scales = {
-            "kp_baseline": 1.0,
-            "kp_coarse": 1.0,
-            "kp_fine": 1.0,
-            "action_penalty_ee": -float(cfg.action_penalty_ee_scale),
-            "action_grad_penalty": -float(cfg.action_grad_penalty_scale),
-            "curr_engaged": 1.0,
-            "curr_success": 1.0,
-            # Optional orientation keypoint term (wrappers/scorers/kp_z_align_reward.py); scale 1.0
-            # like the other kp_* terms. Only present in rew_dict when kp_z_align_enabled, so a
-            # static entry is a harmless no-op otherwise.
-            "kp_z_align": 1.0,
+            "kp_baseline": scale("kp_baseline", 1.0),
+            "kp_coarse": scale("kp_coarse", 1.0),
+            "kp_fine": scale("kp_fine", 1.0),
+            "action_penalty_ee": scale("action_penalty_ee", -float(cfg.action_penalty_ee_scale)),
+            "action_grad_penalty": scale("action_grad_penalty", -float(cfg.action_grad_penalty_scale)),
+            "curr_engaged": scale("curr_engaged", 1.0),
+            "curr_success": scale("curr_success", 1.0),
+            # Optional orientation keypoint term (wrappers/scorers/kp_z_align_reward.py); only
+            # present in rew_dict when kp_z_align_enabled, so a static entry is a harmless no-op.
+            "kp_z_align": scale("kp_z_align", 1.0),
         }
         # AutoMate native-reward terms (present only on the AutoMate task cfg, routed via the
         # adapter's _log_factory_metrics). Positive contributions; guarded so native Forge —
         # which lacks these fields — is unaffected. Lets Episode_Reward/<term> scale correctly.
         if hasattr(cfg, "sdf_rwd_scale"):
-            scales["sdf"] = float(cfg.sdf_rwd_scale)
+            scales["sdf"] = scale("sdf", float(cfg.sdf_rwd_scale))
         if hasattr(cfg, "imitation_rwd_scale"):
-            scales["imitation"] = float(cfg.imitation_rwd_scale)
+            scales["imitation"] = scale("imitation", float(cfg.imitation_rwd_scale))
         return scales
 
     def _forge_scales(self) -> dict[str, float]:
@@ -181,9 +187,14 @@ class ForgeWrapper(RewardDecompositionWrapper):
                 continue
             if not isinstance(val, torch.Tensor):
                 continue
+            term_scale = scales.get(term, 0.0)
+            # Disabled terms (zero weight, or absent from the scale map) are NOT published to
+            # Episode_Reward; logs_rew/<term> still carries the raw value for debugging.
+            if term_scale == 0.0:
+                continue
             # rew_dict values can be (num_envs,) or (num_envs, ...) — collapse to (num_envs,)
             v = val.view(num_envs, -1).sum(dim=-1) if val.dim() > 1 else val
-            scaled = v * scales.get(term, 0.0)
+            scaled = v * term_scale
             if term not in self._episode_sums:
                 self._episode_sums[term] = torch.zeros(num_envs, device=device)
             self._episode_sums[term] += scaled

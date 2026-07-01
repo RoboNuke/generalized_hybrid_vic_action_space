@@ -143,6 +143,10 @@ def install_insertion_reward(
         rew_scales["kp_baseline"] = rew_scales.get("kp_baseline", 1.0) * kb
         rew_scales["kp_coarse"] = rew_scales.get("kp_coarse", 1.0) * kc
         rew_scales["kp_fine"] = rew_scales.get("kp_fine", 1.0) * kf
+        # Stash the EFFECTIVE per-term scales (after the kp_*/curr_* knobs) so the reward-
+        # decomposition scorer publishes Episode_Reward/<term> at the SAME scale the training
+        # reward uses — and omits zero-weight terms — instead of mirroring stock 1.0 scales.
+        self._reward_term_scales = rew_scales
         return rew_dict, rew_scales
 
     FactoryEnv._get_factory_rew_dict = _patched_rew_dict

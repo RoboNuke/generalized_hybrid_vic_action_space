@@ -93,22 +93,27 @@ class FactoryWrapper(RewardDecompositionWrapper):
     # Reward scale lookup
     # ------------------------------------------------------------------
     def _factory_scales(self) -> dict[str, float]:
-        """Static factory reward scales from ``cfg_task``. Mirrors the rew_scales
-        dict constructed in ``FactoryEnv._get_factory_rew_dict`` (keypoint and
-        engagement terms have scale 1.0; action penalties are negative)."""
+        """Effective factory reward scales. Reads the per-term scales the env ACTUALLY used —
+        ``insertion_reward`` stashes them on the env as ``_reward_term_scales`` after applying the
+        kp_*/curr_* knobs — so Episode_Reward/<term> matches the training reward. Falls back to the
+        stock values (kp/engagement 1.0; action penalties from cfg) when no such wrapper is active."""
         cfg = self._unwrapped.cfg_task
+        eff = getattr(self._unwrapped, "_reward_term_scales", None) or {}
+
+        def scale(term, default):
+            return float(eff[term]) if term in eff else float(default)
+
         return {
-            "kp_baseline": 1.0,
-            "kp_coarse": 1.0,
-            "kp_fine": 1.0,
-            "action_penalty_ee": -float(cfg.action_penalty_ee_scale),
-            "action_grad_penalty": -float(cfg.action_grad_penalty_scale),
-            "curr_engaged": 1.0,
-            "curr_success": 1.0,
-            # Optional orientation keypoint term (wrappers/scorers/kp_z_align_reward.py); scale 1.0
-            # like the other kp_* terms. Only present in rew_dict when kp_z_align_enabled, so a
-            # static entry is a harmless no-op otherwise.
-            "kp_z_align": 1.0,
+            "kp_baseline": scale("kp_baseline", 1.0),
+            "kp_coarse": scale("kp_coarse", 1.0),
+            "kp_fine": scale("kp_fine", 1.0),
+            "action_penalty_ee": scale("action_penalty_ee", -float(cfg.action_penalty_ee_scale)),
+            "action_grad_penalty": scale("action_grad_penalty", -float(cfg.action_grad_penalty_scale)),
+            "curr_engaged": scale("curr_engaged", 1.0),
+            "curr_success": scale("curr_success", 1.0),
+            # Optional orientation keypoint term (wrappers/scorers/kp_z_align_reward.py); only
+            # present in rew_dict when kp_z_align_enabled, so a static entry is a harmless no-op.
+            "kp_z_align": scale("kp_z_align", 1.0),
         }
 
     def _accumulate_per_env_term(
@@ -120,8 +125,13 @@ class FactoryWrapper(RewardDecompositionWrapper):
         for term, val in rew_dict.items():
             if not isinstance(val, torch.Tensor):
                 continue
+            term_scale = scales.get(term, 0.0)
+            # Disabled terms (zero weight, or absent from the scale map) are NOT published to
+            # Episode_Reward; logs_rew/<term> still carries the raw value for debugging.
+            if term_scale == 0.0:
+                continue
             v = val.view(num_envs, -1).sum(dim=-1) if val.dim() > 1 else val
-            scaled = v * scales.get(term, 0.0)
+            scaled = v * term_scale
             if term not in self._episode_sums:
                 self._episode_sums[term] = torch.zeros(num_envs, device=device)
             self._episode_sums[term] += scaled

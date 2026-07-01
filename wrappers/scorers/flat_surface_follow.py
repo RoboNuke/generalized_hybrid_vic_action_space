@@ -30,4 +30,5 @@ class FlatSurfaceFollowWrapper(FactoryWrapper):
             "pace": float(cfg.pace_weight),
             "action_penalty_ee": -float(cfg.action_penalty_ee_scale),
             "action_grad_penalty": -float(cfg.action_grad_penalty_scale),
+            "success_time": float(cfg.success_time_weight),
         }

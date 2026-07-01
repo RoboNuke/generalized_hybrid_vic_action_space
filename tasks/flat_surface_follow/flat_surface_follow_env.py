@@ -52,6 +52,11 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # Moving setpoint (recomputed each _compute); init for safety before the first reset.
         self.s_ref = torch.zeros((self.num_envs,), device=self.device)
         self.setpoint_pos = torch.zeros((self.num_envs, 3), device=self.device)
+        # Time-to-success bonus state. t_contact: episode time (s) of FIRST contact (+inf until
+        # contact); success_reward_given: whether the one-shot bonus has already been paid this
+        # episode. Both reset each episode in _reset_idx.
+        self.t_contact = torch.full((self.num_envs,), float("inf"), device=self.device)
+        self.success_reward_given = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
 
     # ------------------------------------------------------------------
     # Small geometry helpers
@@ -374,7 +379,8 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         Task terms (force, orientation, straightness, pace) are weight * squashing_fn(raw signed
         REALIZED value, a, b) — computed from measured/physics state only (never control targets),
         peaking at value=0. The two action penalties (action_penalty_ee, action_grad_penalty) are
-        the FactoryEnv linear penalties applied with NEGATIVE scales, both default 0.0 (off). The
+        the FactoryEnv linear penalties applied with NEGATIVE scales, both default 0.0 (off). A
+        one-shot success_time bonus squashes (ideal completion time - actual success time). The
         scorer's _factory_scales must stay in sync with the weights/scales below.
         """
         curr_successes = self._get_curr_successes()
@@ -398,6 +404,28 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         action_penalty_ee = torch.norm(self.actions, p=2)
         action_grad_penalty = torch.norm(self.actions - self.prev_actions, p=2, dim=-1)
 
+        # Time-to-success bonus (ONE-SHOT, paid on the first success step). t_now: episode wall-clock
+        # time (s). Latch t_contact at the FIRST in-contact step; t* (ideal completion time) =
+        # t_contact + L/v_des is the time if, from first contact, the tool traced the whole path L at
+        # the desired speed. The bonus is squashing_fn(t* - t_success): peaks when success lands at
+        # the ideal time, penalizing both dawdling and cutting the path short. Note
+        # t* - t_success = L/v_des - (t_success - t_contact), so it scores the contact->success
+        # DURATION against the ideal L/v_des and is invariant to the absolute clock offset.
+        step_dt = float(getattr(self, "step_dt", self.physics_dt * self.cfg.decimation))
+        t_now = self.episode_length_buf.float() * step_dt                     # (E,) s
+        newly_contacted = self.in_contact_any & torch.isinf(self.t_contact)
+        self.t_contact = torch.where(newly_contacted, t_now, self.t_contact)
+        v_des = float(cfg.desired_speed_cm_s) / 100.0                         # cm/s -> m/s
+        t_star = self.t_contact + self.path_length / max(v_des, 1e-6)         # ideal completion time (s)
+        success_now = curr_successes & (~self.success_reward_given) & torch.isfinite(self.t_contact)
+        success_time_value = t_star - t_now                                  # (E,) ideal - actual, s
+        success_time_reward = torch.where(
+            success_now,
+            factory_utils.squashing_fn(success_time_value, cfg.success_time_a, cfg.success_time_b),
+            torch.zeros_like(t_now),
+        )
+        self.success_reward_given = self.success_reward_given | success_now
+
         rew_dict = {
             "force": factory_utils.squashing_fn(force_value, cfg.force_a, cfg.force_b),
             "orientation": factory_utils.squashing_fn(orn_value, cfg.orientation_a, cfg.orientation_b),
@@ -405,6 +433,7 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "pace": factory_utils.squashing_fn(pace_value, cfg.pace_a, cfg.pace_b),
             "action_penalty_ee": action_penalty_ee,
             "action_grad_penalty": action_grad_penalty,
+            "success_time": success_time_reward,
         }
         rew_scales = {
             "force": float(cfg.force_weight),
@@ -413,13 +442,13 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "pace": float(cfg.pace_weight),
             "action_penalty_ee": -float(cfg.action_penalty_ee_scale),
             "action_grad_penalty": -float(cfg.action_grad_penalty_scale),
+            "success_time": float(cfg.success_time_weight),
         }
         rew_buf = torch.zeros(self.num_envs, device=self.device)
         for name in rew_dict:
             rew_buf = rew_buf + rew_dict[name] * rew_scales[name]
 
         # Advance the pace clock by one env step, ONLY where in contact (tau_{t+1} = tau_t + dt*in_contact).
-        step_dt = float(getattr(self, "step_dt", self.physics_dt * self.cfg.decimation))
         self.pace_tau = self.pace_tau + step_dt * self.in_contact_any.float()
 
         self.prev_actions = self.actions.clone()
@@ -468,6 +497,11 @@ class FlatSurfaceFollowEnv(ForgeEnv):
 
         # Reset the pace schedule clock (the moving along-track setpoint restarts at p0).
         self.pace_tau = torch.zeros((self.num_envs,), device=self.device)
+
+        # Reset the time-to-success bonus state: first-contact clock (+inf = no contact yet) and the
+        # one-shot paid flag.
+        self.t_contact = torch.full((self.num_envs,), float("inf"), device=self.device)
+        self.success_reward_given = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
 
         self.dead_zone_thresholds = (
             torch.rand((self.num_envs, 6), dtype=torch.float32, device=self.device) * self.default_dead_zone
