@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #SBATCH -J HPC_BATCH                       # job name (overridden by sbatch -J from the submitter)
 #SBATCH -A virl-grp                        # sponsored account (overridden by sbatch -A)
-#SBATCH -p dgxh,dgx2,tiamat,gpu,eecs2      # partitions (overridden by sbatch -p)
-#SBATCH --time=0-09:00:00                  # wall-clock limit (overridden by sbatch --time)
+#SBATCH -p tiamat,dgxh,gpu      # partitions (overridden by sbatch -p)
+#SBATCH --time=0-12:00:00                  # wall-clock limit (overridden by sbatch --time)
 #SBATCH --gres=gpu:1                       # GPUs (overridden by sbatch --gres)
-#SBATCH --mem=32G                          # host memory (overridden by sbatch --mem)
+#SBATCH --mem=64G                          # host memory (overridden by sbatch --mem)
 #SBATCH -c 12                              # cores/threads (overridden by sbatch -c)
 #SBATCH --signal=TERM@300                  # SIGTERM 300s before the limit (overridden by sbatch --signal)
 #

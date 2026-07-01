@@ -381,7 +381,9 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         peaking at value=0. The two action penalties (action_penalty_ee, action_grad_penalty) are
         the FactoryEnv linear penalties applied with NEGATIVE scales, both default 0.0 (off). A
         one-shot success_time bonus squashes (ideal completion time - actual success time). The
-        scorer's _factory_scales must stay in sync with the weights/scales below.
+        surface-relative terms (orientation, straightness, pace, success_time) are GATED on contact
+        with the held object — they pay 0 with no contact; force and the action penalties are not
+        gated. The scorer's _factory_scales must stay in sync with the weights/scales below.
         """
         curr_successes = self._get_curr_successes()
         cfg = self.cfg_task
@@ -417,7 +419,12 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.t_contact = torch.where(newly_contacted, t_now, self.t_contact)
         v_des = float(cfg.desired_speed_cm_s) / 100.0                         # cm/s -> m/s
         t_star = self.t_contact + self.path_length / max(v_des, 1e-6)         # ideal completion time (s)
-        success_now = curr_successes & (~self.success_reward_given) & torch.isfinite(self.t_contact)
+        success_now = (
+            curr_successes
+            & self.in_contact_any
+            & (~self.success_reward_given)
+            & torch.isfinite(self.t_contact)
+        )
         success_time_value = t_star - t_now                                  # (E,) ideal - actual, s
         success_time_reward = torch.where(
             success_now,
@@ -426,11 +433,17 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         )
         self.success_reward_given = self.success_reward_given | success_now
 
+        # Contact gate: with NO contact on the held object the surface-relative signals are
+        # meaningless — and would otherwise be farmable by hovering at the start (s_ref frozen at 0,
+        # progress/cross_track ~0) — so orientation / straightness / pace pay 0 off-contact. Force
+        # stays active off-contact (it drives the tool INTO the surface) and the action penalties
+        # always apply. success_time is already gated via success_now (requires in_contact_any).
+        contact = self.in_contact_any.float()
         rew_dict = {
             "force": factory_utils.squashing_fn(force_value, cfg.force_a, cfg.force_b),
-            "orientation": factory_utils.squashing_fn(orn_value, cfg.orientation_a, cfg.orientation_b),
-            "straightness": factory_utils.squashing_fn(straightness_value, cfg.straightness_a, cfg.straightness_b),
-            "pace": factory_utils.squashing_fn(pace_value, cfg.pace_a, cfg.pace_b),
+            "orientation": factory_utils.squashing_fn(orn_value, cfg.orientation_a, cfg.orientation_b) * contact,
+            "straightness": factory_utils.squashing_fn(straightness_value, cfg.straightness_a, cfg.straightness_b) * contact,
+            "pace": factory_utils.squashing_fn(pace_value, cfg.pace_a, cfg.pace_b) * contact,
             "action_penalty_ee": action_penalty_ee,
             "action_grad_penalty": action_grad_penalty,
             "success_time": success_time_reward,
