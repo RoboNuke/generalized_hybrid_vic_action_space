@@ -106,28 +106,33 @@ echo "[hpc-batch-submit] forwarded to worker: ${PASSTHROUGH[*]+${PASSTHROUGH[*]}
 echo ""
 
 # ===== --skip_existing helper (resolve output dir exactly as runner.py does) =====
+# Prints <logdir>/<family>/<exp_name> (with runner.py's legacy collapse). The family is the
+# --experiment_directory override when given — computed in PURE BASH so skip works even if the
+# submit node's python lacks pyyaml. Only when NO override is given do we shell out to python
+# to read sac_cfg.experiment.directory; if THAT fails we return nonzero + warn (never silent).
 resolve_exp_dir() {
-    local config_path="$1" exp_name="$2"
-    "$PYTHON" - "$config_path" "$LOGDIR" "$EXP_DIR_OVERRIDE" "$exp_name" "$PROJECT_ROOT_LOCAL" <<'PY'
-import os, sys, yaml
-config_path, log_root, exp_dir_override, exp_name, project_root = sys.argv[1:6]
-cfg = yaml.safe_load(open(config_path)) or {}
-agent_type = str(cfg.get("runner_cfg", {}).get("agent_type", "sac")).lower()
-cfg_key = "ppo_cfg" if agent_type == "ppo" else "sac_cfg"
-family = (exp_dir_override or "").strip()
-if not family:
-    experiment = (cfg.get(cfg_key) or {}).get("experiment") or {}
-    family = str(experiment.get("directory") or "").strip()
-log_root_basename = os.path.basename(os.path.normpath(log_root)) if log_root else ""
-family_basename = os.path.basename(os.path.normpath(family)) if family else ""
-if not family or family_basename == log_root_basename:
-    final_directory = log_root
-else:
-    final_directory = os.path.join(log_root, family)
-if not os.path.isabs(final_directory):
-    final_directory = os.path.join(project_root, final_directory)
-print(os.path.join(final_directory, exp_name))
+    local config_path="$1" exp_name="$2" family
+    if [[ -n "$EXP_DIR_OVERRIDE" ]]; then
+        family="$EXP_DIR_OVERRIDE"
+    else
+        family="$("$PYTHON" - "$config_path" <<'PY'
+import sys, yaml
+cfg = yaml.safe_load(open(sys.argv[1])) or {}
+key = "ppo_cfg" if str(cfg.get("runner_cfg", {}).get("agent_type", "sac")).lower() == "ppo" else "sac_cfg"
+exp = (cfg.get(key) or {}).get("experiment") or {}
+print(str(exp.get("directory") or "").strip())
 PY
+)" || { echo "[hpc-batch-submit] WARNING: skip-check could not read experiment.directory from $config_path (is '$PYTHON' + pyyaml available?) — will NOT skip $exp_name" >&2; return 1; }
+    fi
+    family="${family%/}"
+    local log_root="${LOGDIR%/}" final_dir
+    if [[ -n "$family" && "$(basename -- "$family")" != "$(basename -- "$log_root")" ]]; then
+        final_dir="$log_root/$family"
+    else
+        final_dir="$log_root"
+    fi
+    [[ "$final_dir" == /* ]] || final_dir="$PROJECT_ROOT_LOCAL/$final_dir"
+    printf '%s\n' "$final_dir/$exp_name"
 }
 
 # ===== Resource flags from hpc_env.bash (override hpc_batch.bash's #SBATCH fallbacks) =====
@@ -155,10 +160,13 @@ for config_path in "${CONFIGS[@]}"; do
 
     if [[ "$SKIP_EXISTING" -eq 1 ]]; then
         exp_dir="$(resolve_exp_dir "$config_path" "$exp_name")" || exp_dir=""
-        if [[ -n "$exp_dir" && -d "$exp_dir" ]] && compgen -G "$exp_dir/*" >/dev/null; then
+        if [[ -n "$exp_dir" && -d "$exp_dir" ]] && compgen -G "$exp_dir/*" >/dev/null 2>&1; then
             echo "[hpc-batch-submit] SKIP (exists): $exp_name -> $exp_dir"
             SKIPPED+=("$exp_name")
             continue
+        else
+            # Transparent about WHY we're not skipping (unresolved path vs missing/empty dir).
+            echo "[hpc-batch-submit] skip-check: $exp_name -> ${exp_dir:-<unresolved>} $([[ -d "$exp_dir" ]] && echo '(dir empty)' || echo '(not present)') — submitting"
         fi
     fi
 
