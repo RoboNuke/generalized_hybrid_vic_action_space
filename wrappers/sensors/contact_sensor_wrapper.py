@@ -214,7 +214,14 @@ class ContactSensorWrapper(gym.Wrapper):
             cv = psv.create_rigid_contact_view(
                 self._peg_glob,
                 filter_patterns=[self._hole_glob],
-                max_contact_data_count=64 * self.num_envs,
+                # Cap on simultaneous peg<->hole contact POINTS PhysX aggregates into the force
+                # matrix each step. The prior 64*num_envs was an untuned over-guess from the
+                # leak-fix rewrite; the native contact-data collection scales with this, and host
+                # RSS leaks ~proportional to actual contacts during insertion. We only threshold
+                # the summed force into a per-axis in_contact BOOLEAN (the FT feedback the policy
+                # uses is Forge's separate wrist force_sensor, not this), so 4/env — IsaacLab's
+                # stock default — is plenty and cannot affect force feedback.
+                max_contact_data_count=4 * self.num_envs,
             )
         except Exception:
             return False  # bodies not resolvable yet — retry next step
