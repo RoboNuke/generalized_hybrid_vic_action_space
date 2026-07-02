@@ -53,6 +53,7 @@ def install_insertion_reward(
     success_check_yaw: bool = False,
     success_check_z_aligned: bool = False,
     z_align_max_deg: float = 15.0,
+    z_cliff_cutoff: bool = False,
 ) -> None:
     """Patch FactoryEnv to rescale and/or alignment-gate the engaged & success bonuses.
 
@@ -161,6 +162,31 @@ def install_insertion_reward(
             check_z_aligned=success_check_z_aligned,
         )
         rew_dict, rew_scales = self._get_factory_rew_dict(curr_successes)
+
+        # ---- z-cliff cutoff: zero the KEYPOINT terms (baseline/coarse/fine) — NOT alignment — for
+        # any env whose peg tip is below the hole mouth but not centered. Removes the "descend
+        # off-center onto the block face" local minimum: no depth credit unless over the bore, so the
+        # only way to earn keypoint reward below the mouth is through the opening (a hard funnel). ----
+        if z_cliff_cutoff:
+            held_base_pos, _ = factory_utils.get_held_base_pose(
+                self.held_pos, self.held_quat, self.cfg_task.name,
+                self.cfg_task.fixed_asset_cfg, self.num_envs, self.device,
+            )
+            target_base_pos, _ = factory_utils.get_target_held_base_pose(
+                self.fixed_pos, self.fixed_quat, self.cfg_task.name,
+                self.cfg_task.fixed_asset_cfg, self.num_envs, self.device,
+            )
+            xy_dist = torch.linalg.vector_norm(
+                target_base_pos[:, 0:2] - held_base_pos[:, 0:2], dim=1
+            )
+            z_disp = held_base_pos[:, 2] - target_base_pos[:, 2]
+            is_centered = xy_dist < 0.0025
+            below_mouth = z_disp < float(self.cfg_task.fixed_asset_cfg.height)  # tip below the hole top
+            allow = (is_centered | ~below_mouth).float()                        # 1 = reward, 0 = dead zone
+            for _k in ("kp_baseline", "kp_coarse", "kp_fine"):
+                if _k in rew_dict:
+                    rew_dict[_k] = rew_dict[_k] * allow
+
         rew_buf = torch.zeros_like(rew_dict["kp_coarse"])
         for rew_name in rew_dict:
             rew_buf += rew_dict[rew_name] * rew_scales[rew_name]
@@ -175,6 +201,6 @@ def install_insertion_reward(
         f"kp_scales(baseline={kb}, coarse={kc}, fine={kf}), "
         f"engage(check_yaw={engage_check_yaw}, check_z_aligned={engage_check_z_aligned}), "
         f"success(check_yaw={success_check_yaw}, check_z_aligned={success_check_z_aligned}), "
-        f"z_align_max_deg={z_max}.",
+        f"z_align_max_deg={z_max}, z_cliff_cutoff={z_cliff_cutoff}.",
         flush=True,
     )

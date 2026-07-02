@@ -431,6 +431,7 @@ def build_env(
             success_check_yaw=runner_cfg.success_check_yaw,
             success_check_z_aligned=runner_cfg.success_check_z_aligned,
             z_align_max_deg=runner_cfg.z_align_max_deg,
+            z_cliff_cutoff=runner_cfg.z_cliff_cutoff_enabled,
         )
 
     # Optional engagement-quality diagnostics (Forge/Factory peg insertion only): publish the

@@ -162,6 +162,13 @@ class RunnerCfg:
     """Max angle (DEGREES) between the held and fixed asset z-axes for the ``check_z_aligned`` gate
     to pass. Shared by the engaged and success z-alignment gates. Only used when one is enabled."""
 
+    z_cliff_cutoff_enabled: bool = False
+    """Zero the KEYPOINT reward terms (baseline/coarse/fine — NOT the alignment term) for any env
+    whose peg tip is below the hole mouth but not centered (``xy_dist >= 0.0025`` and
+    ``z_disp < fixed_asset_cfg.height``). Removes the "descend off-center onto the block face" local
+    minimum by refusing depth credit unless the peg is over the bore — a hard funnel so the only way
+    to earn keypoint reward below the mouth is through the opening. Forge/Factory peg-insert only."""
+
     ee_success_yaw_deg: float | None = None
     """Yaw threshold (DEGREES) for the ``check_yaw`` gate, written to ``env_cfg.task.ee_success_yaw``
     (radians) before ``gym.make``. ``None`` keeps the task default (0.0). Only meaningful when a
