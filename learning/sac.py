@@ -97,6 +97,11 @@ class SAC(BlockAgent):
         self.target_critic_1 = self.models["target_critic_1"]
         self.target_critic_2 = self.models["target_critic_2"]
 
+        # SimBa periodic reset (sac_cfg.periodic_reset_*): the runner attaches a model factory
+        # (agent._model_factory) that rebuilds fresh networks; _periodic_reset() swaps them in.
+        self._model_factory = None
+        self._n_periodic_resets = 0
+
         # checkpointing is handled per-agent by write_checkpoint()/load() — we don't
         # populate self.checkpoint_modules so the base Agent's bundled save path stays out.
 
@@ -324,9 +329,85 @@ class SAC(BlockAgent):
                         "Stats / Algorithm update time (ms)",
                         [timer.elapsed_time_ms] * self.num_agents,
                     )
+            self._maybe_periodic_reset(timestep)
 
         # base.post_interaction handles checkpointing + calls write_tracking_data on interval
         super().post_interaction(timestep=timestep, timesteps=timesteps)
+
+    # --------------------------------------------------------------
+    # SimBa periodic reset (plasticity-loss / primacy-bias mitigation)
+    # --------------------------------------------------------------
+    def _maybe_periodic_reset(self, timestep: int) -> None:
+        """Trigger a hard network reset on the ``periodic_reset_frequency`` env-step boundary,
+        up to ``periodic_reset_max`` times. See :class:`SAC_CFG` ``periodic_reset_*``."""
+        freq = self.cfg.periodic_reset_frequency
+        if not self.cfg.periodic_reset_enabled or freq <= 0 or timestep <= 0:
+            return
+        mx = self.cfg.periodic_reset_max
+        if mx > 0 and self._n_periodic_resets >= mx:
+            return
+        if timestep % freq == 0:
+            self._periodic_reset()
+            self._n_periodic_resets += 1
+            print(f"[sac] periodic reset #{self._n_periodic_resets} at timestep {timestep}", flush=True)
+        # log the running reset count to every per-agent stream (0 until the first reset)
+        self.track_per_agent(
+            "Stats / Periodic resets", [float(self._n_periodic_resets)] * self.num_agents
+        )
+
+    def _periodic_reset(self) -> None:
+        """SimBa-style hard reset: rebuild actor + twin critics (+ targets), their optimizers, and
+        the entropy coefficient from scratch — KEEPING the replay buffer and obs-normalization
+        stats. Mirrors SimBa (arXiv:2410.09754 §7.3): reinitialize the entire network + optimizer."""
+        if self._model_factory is None:
+            raise RuntimeError(
+                "periodic_reset_enabled but no _model_factory attached to the agent "
+                "(runner must set agent._model_factory)."
+            )
+        fresh = self._model_factory()
+        for k in ("policy", "critic_1", "critic_2", "target_critic_1", "target_critic_2"):
+            self.models[k] = fresh[k]
+        self.policy = self.models["policy"]
+        self.critic_1 = self.models["critic_1"]
+        self.critic_2 = self.models["critic_2"]
+        self.target_critic_1 = self.models["target_critic_1"]
+        self.target_critic_2 = self.models["target_critic_2"]
+
+        # targets start equal to the fresh critics (hard copy), frozen — mirrors __init__.
+        self.target_critic_1.freeze_parameters(True)
+        self.target_critic_2.freeze_parameters(True)
+        self.target_critic_1.update_parameters(self.critic_1, polyak=1)
+        self.target_critic_2.update_parameters(self.critic_2, polyak=1)
+
+        # rebuild optimizers (fresh Adam moment state) + schedulers, exactly as in __init__.
+        self.policy_optimizer = torch.optim.AdamW(
+            self.policy.parameters(), lr=self.cfg.actor_lr, weight_decay=self.cfg.weight_decay
+        )
+        self.critic_optimizer = torch.optim.AdamW(
+            itertools.chain(self.critic_1.parameters(), self.critic_2.parameters()),
+            lr=self.cfg.critic_lr,
+            weight_decay=self.cfg.weight_decay,
+        )
+        if self.cfg.learning_rate_scheduler[0] is not None:
+            self.policy_scheduler = self.cfg.learning_rate_scheduler[0](
+                self.policy_optimizer, **self.cfg.learning_rate_scheduler_kwargs[0]
+            )
+        if self.cfg.learning_rate_scheduler[1] is not None:
+            self.critic_scheduler = self.cfg.learning_rate_scheduler[1](
+                self.critic_optimizer, **self.cfg.learning_rate_scheduler_kwargs[1]
+            )
+
+        # reset entropy coefficient + its optimizer (part of "the entire network and optimizer").
+        self._entropy_coefficient = torch.full(
+            (self.num_agents, 1), float(self.cfg.initial_entropy_value), device=self.device
+        )
+        if self.cfg.learn_entropy:
+            self.log_entropy_coefficient = torch.log(
+                self._entropy_coefficient.clone()
+            ).requires_grad_(True)
+            self.entropy_optimizer = torch.optim.AdamW(
+                [self.log_entropy_coefficient], lr=self.cfg.entropy_lr, weight_decay=0.0
+            )
 
     # --------------------------------------------------------------
     # Update

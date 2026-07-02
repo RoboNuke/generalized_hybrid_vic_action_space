@@ -372,64 +372,65 @@ def main(argv: list[str] | None = None) -> None:
     critic_input_space = state_space if state_space is not None else obs_space
 
     # Actor: hybrid control types get the selection-gated HybridControlBlockSimBaActor
-    # (product / match), otherwise the plain squashed-Gaussian actor.
-    if ctrl_wrapper is not None:
-        sel_dims, pos_dims, force_dims = ctrl_wrapper.policy_selection_layout
-        policy = HybridControlBlockSimBaActor(
-            observation_space=obs_space,
-            action_space=act_space,
-            device=device,
-            num_agents=n_agents,
-            selection_dims=sel_dims,
-            pos_component_dims=pos_dims,
-            force_component_dims=force_dims,
-            selection_distribution=selection_distribution,
-            selection_init_bias=selection_init_bias,
-            **actor_kwargs,
-        )
-        print(
-            f"[runner] hybrid actor: style={selection_distribution!r} "
-            f"selection_dims={sel_dims} pos={pos_dims} force={force_dims} "
-            f"selection_init_bias={selection_init_bias} (init p≈{1/(1+2.718281828**(-selection_init_bias)):.3f})"
-        )
-    else:
-        policy = BlockSimBaActor(
-            observation_space=obs_space,
-            action_space=act_space,
-            device=device,
-            num_agents=n_agents,
-            **actor_kwargs,
-        )
+    # (product / match), otherwise the plain squashed-Gaussian actor. Wrapped in a factory so
+    # SimBa periodic resets (sac_cfg.periodic_reset_*) can rebuild fresh, identically-constructed
+    # models mid-training (see learning/sac.py::_periodic_reset).
+    def make_models():
+        if ctrl_wrapper is not None:
+            sel_dims, pos_dims, force_dims = ctrl_wrapper.policy_selection_layout
+            policy = HybridControlBlockSimBaActor(
+                observation_space=obs_space,
+                action_space=act_space,
+                device=device,
+                num_agents=n_agents,
+                selection_dims=sel_dims,
+                pos_component_dims=pos_dims,
+                force_component_dims=force_dims,
+                selection_distribution=selection_distribution,
+                selection_init_bias=selection_init_bias,
+                **actor_kwargs,
+            )
+            print(
+                f"[runner] hybrid actor: style={selection_distribution!r} "
+                f"selection_dims={sel_dims} pos={pos_dims} force={force_dims} "
+                f"selection_init_bias={selection_init_bias} (init p≈{1/(1+2.718281828**(-selection_init_bias)):.3f})"
+            )
+        else:
+            policy = BlockSimBaActor(
+                observation_space=obs_space,
+                action_space=act_space,
+                device=device,
+                num_agents=n_agents,
+                **actor_kwargs,
+            )
 
-    if agent_type == "sac":
-        def make_q():
-            return BlockSimBaQCritic(
+        if agent_type == "sac":
+            def make_q():
+                return BlockSimBaQCritic(
+                    observation_space=critic_input_space,
+                    action_space=act_space,
+                    device=device,
+                    num_agents=n_agents,
+                    **critic_kwargs,
+                )
+            return {
+                "policy": policy,
+                "critic_1": make_q(),
+                "critic_2": make_q(),
+                "target_critic_1": make_q(),
+                "target_critic_2": make_q(),
+            }
+        else:  # ppo — single state-value critic V(s)
+            value = BlockSimBaValueCritic(
                 observation_space=critic_input_space,
                 action_space=act_space,
                 device=device,
                 num_agents=n_agents,
                 **critic_kwargs,
             )
+            return {"policy": policy, "value": value}
 
-        critic_1, critic_2 = make_q(), make_q()
-        target_critic_1, target_critic_2 = make_q(), make_q()
-
-        models = {
-            "policy": policy,
-            "critic_1": critic_1,
-            "critic_2": critic_2,
-            "target_critic_1": target_critic_1,
-            "target_critic_2": target_critic_2,
-        }
-    else:  # ppo — single state-value critic V(s)
-        value = BlockSimBaValueCritic(
-            observation_space=critic_input_space,
-            action_space=act_space,
-            device=device,
-            num_agents=n_agents,
-            **critic_kwargs,
-        )
-        models = {"policy": policy, "value": value}
+    models = make_models()
 
     # ---- memory (per-agent partitioned sampling) ----
     if agent_type == "sac":
@@ -575,6 +576,12 @@ def main(argv: list[str] | None = None) -> None:
         aux_losses=AuxLossManager.from_cfg(loss_cfg),
         contact_axes=contact_axes,
     )
+
+    # SimBa periodic reset: give the agent a factory that rebuilds fresh, identically-constructed
+    # networks (see sac_cfg.periodic_reset_*). Attached unconditionally; the agent only calls it
+    # when periodic_reset_enabled. SAC only (PPO has no reset path).
+    if agent_type == "sac":
+        agent._model_factory = make_models
 
     # ---- per-agent recording mode ----
     # Loads ONE agent's slice (its own policy + twin critics) into this num_agents=1

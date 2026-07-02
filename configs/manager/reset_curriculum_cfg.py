@@ -42,8 +42,12 @@ class ResetCurriculumCfg:
     """Success-EMA below which an agent's ``c`` is lowered (curriculum backs off). Keep < increase."""
 
     min_pos: list[float] = dataclasses.field(default_factory=lambda: [0.0, 0.0, 0.005])
-    """Easy-end (c=0 floor) spawn offsets ``[x, y, z]`` in METERS (same order as ``hand_init_pos_noise``).
-    ``x``/``y`` are lateral-offset magnitudes (applied ±); ``z`` is peg height above the hole tip."""
+    """Easy-end (c=0 floor) spawn offsets ``[x, y, z]`` in METERS. ``x``/``y`` are lateral-offset
+    magnitudes (applied ±). ``z`` is the PEG TIP (held_base) height relative to the TOP of the hole
+    (peg frame, NOT the gripper): 0 = tip at the hole mouth, negative = tip inside the bore, so the
+    hole bottom is ``-fixed_asset_cfg.height``. The wrapper auto-converts to the gripper target using
+    the measured fingertip->peg-tip offset, and still clamps to the never-in-success floor
+    (:attr:`success_margin_z`). E.g. ``0.005 - hole_height`` = tip 5 mm above the hole bottom."""
 
     min_orn: list[float] = dataclasses.field(default_factory=lambda: [0.0, 0.0, 0.0])
     """Easy-end (c=0 floor) peg tilt ``[roll, pitch, yaw]`` in DEGREES (same convention as

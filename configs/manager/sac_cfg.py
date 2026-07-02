@@ -214,6 +214,23 @@ class SAC_CFG(AgentCfg):
     mixed_precision: bool = False
     """Whether to enable automatic mixed precision for higher performance."""
 
+    periodic_reset_enabled: bool = False
+    """SimBa-style periodic parameter reset (primacy-bias / plasticity-loss mitigation). When True,
+    the actor + critic (+ target critic) networks, their optimizers, and the entropy coefficient are
+    reinitialized from scratch every :attr:`periodic_reset_frequency` env steps, up to
+    :attr:`periodic_reset_max` times. The replay buffer and observation-normalization stats are KEPT
+    (only the learners are reset), so learning re-fits fresh networks to the accumulated data —
+    SimBa (arXiv:2410.09754, §7.3) resets "the entire network and optimizer" periodically."""
+
+    periodic_reset_frequency: int = 0
+    """Env steps between periodic resets (see :attr:`periodic_reset_enabled`). ``<= 0`` disables.
+    SimBa uses 500k *gradient* steps on long runs; for a short run pick a value giving a few resets
+    with room to recover after the last (e.g. 5000 over a 20k-step run => resets at 5k/10k/15k)."""
+
+    periodic_reset_max: int = 0
+    """Maximum number of periodic resets over a run. ``<= 0`` => unbounded (reset on every
+    frequency boundary). Cap this so the last reset leaves enough steps to recover."""
+
     recorder: RecorderCfg = dataclasses.field(default_factory=RecorderCfg)
     """Configures the optional ``RecordingWrapper`` (3x4-grid GIFs + TB videos).
     Default is disabled. See :class:`RecorderCfg` and ``wrappers/recording.py``."""

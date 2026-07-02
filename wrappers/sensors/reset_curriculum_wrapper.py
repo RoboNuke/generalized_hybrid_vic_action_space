@@ -90,7 +90,8 @@ def install_reset_curriculum(
     min_orn_rad = [float(torch.deg2rad(torch.tensor(float(v)))) for v in min_orn_deg]
 
     _orig = FactoryEnv.randomize_initial_state
-    state = {"c": None, "succ": None, "epa": None, "z_off": None, "z_floor_succ": None}
+    state = {"c": None, "succ": None, "epa": None, "z_off": None, "z_floor_succ": None,
+             "ftip_minus_pegtip": None}
 
     def _patched(self, env_ids):
         device = self.device
@@ -145,13 +146,35 @@ def install_reset_curriculum(
                 tb, _ = factory_utils.get_target_held_base_pose(
                     self.fixed_pos, self.fixed_quat, self.cfg_task.name,
                     self.cfg_task.fixed_asset_cfg, self.num_envs, self.device)
-                base_zdisp = hb[env_ids, 2] - tb[env_ids, 2]
-                fh = self.fingertip_midpoint_pos[env_ids, 2] - self.fixed_pos_obs_frame[env_ids, 2]
-                offset_c = float((base_zdisp - fh).mean().item())
+                # The held_base->fingertip offset is FIXED in the gripper frame (peg welded to the
+                # gripper). Measure it in the gripper-local frame from the nominal (tilted) reset,
+                # then re-express it for the ALIGNED gripper (peg vertical) — the DEEPEST case, since
+                # the depth-guard forces alignment when deep. This makes both the never-in-success
+                # floor and the peg-tip->fingertip conversion worst-case correct across all tilts.
+                idq = torch.zeros((n, 4), device=device); idq[:, 0] = 1.0
+                zt = torch.zeros((n, 3), device=device)
+                v_world = hb[env_ids] - self.fingertip_midpoint_pos[env_ids]            # (n,3) world
+                _, v_local = torch_utils.tf_combine(
+                    torch_utils.quat_conjugate(self.fingertip_midpoint_quat[env_ids]), zt, idq, v_world)
+                hand0 = torch.tensor(self.cfg_task.hand_init_orn, device=device).unsqueeze(0).repeat(n, 1)
+                hand_q0 = torch_utils.quat_from_euler_xyz(hand0[:, 0], hand0[:, 1], hand0[:, 2])
+                g0 = torch.tensor(grasp_rad, device=device).unsqueeze(0).repeat(n, 1)
+                grasp_q0 = torch_utils.quat_from_euler_xyz(g0[:, 0], g0[:, 1], g0[:, 2])
+                aligned_grip_q = torch_utils.quat_mul(hand_q0, torch_utils.quat_conjugate(grasp_q0))
+                _, v_world_aligned = torch_utils.tf_combine(aligned_grip_q, zt, idq, v_local)
+                drop_aligned = -v_world_aligned[:, 2]                                   # (n,) >0 fingertip->base
+                # base_zdisp(z) = z + offset_aligned, where z = fingertip height above the hole top.
+                offset_aligned = float(
+                    ((self.fixed_pos_obs_frame[env_ids, 2] - tb[env_ids, 2]) - drop_aligned).mean().item())
                 height = float(self.cfg_task.fixed_asset_cfg.height)
                 st = float(self.cfg_task.success_threshold)
-                state["z_floor_succ"] = st * height + success_margin_z - offset_c
-            z_lo = max(min_pos_t[2], state["z_floor_succ"])
+                state["z_floor_succ"] = st * height + success_margin_z - offset_aligned
+                # peg-tip (held_base) -> fingertip offset for the min_pos conversion (aligned = deep).
+                state["ftip_minus_pegtip"] = float(drop_aligned.mean().item())
+            # min_pos[2] (peg-tip above hole top) -> fingertip floor, then clamp to the
+            # never-in-success floor (whichever keeps the peg shallower/safer wins).
+            min_ftip_z = float(min_pos_t[2]) + state["ftip_minus_pegtip"]
+            z_lo = max(min_ftip_z, state["z_floor_succ"])
 
             xmag = sbc(min_pos_t[0], max_x) * torch.sign(torch.rand(n, device=device) - 0.5)
             ymag = sbc(min_pos_t[1], max_y) * torch.sign(torch.rand(n, device=device) - 0.5)
