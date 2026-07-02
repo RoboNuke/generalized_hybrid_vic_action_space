@@ -34,6 +34,11 @@ runner_cfg:
     task.plate_tilt_range_deg: 10.0
     task.inhand_tilt_range_deg: [0.0, 0.0, 0.0]
     task.observe_eef_torque: false
+    # Per-env termination (auto-attaches the efficient-reset wrapper so partial resets teleport,
+    # no sim steps). Lag: end if the tool falls > pace_lag_frac * path_length behind the setpoint.
+    task.terminate_on_lag: true
+    task.terminate_on_success: true
+    task.pace_lag_frac: 0.5
 loss_cfg:
   supervised_selection_enabled: false
   supervised_selection_policy_weight: 1.0

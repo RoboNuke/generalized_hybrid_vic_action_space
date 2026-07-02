@@ -127,9 +127,13 @@ class EfficientResetWrapper(gym.Wrapper):
         u = self.unwrapped
         # Relative scene state so donor poses can be re-based onto a different env origin.
         self._cached_state = u.scene.get_state(is_relative=True)
+        # Tasks may declare extra per-env tensors that their (non-Factory) reset sets and the
+        # DirectRL partial path skips — e.g. the surface task's episode clocks / desired force.
+        # Captured post-full-reset, so a donor copy restores correct fresh-episode values.
+        extra_attrs = tuple(getattr(u, "_efficient_reset_extra_attrs", ()) or ())
         self._cached_attrs = {
             name: getattr(u, name).clone()
-            for name in (*_FACTORY_ATTRS, *_FORGE_ATTRS)
+            for name in (*_FACTORY_ATTRS, *_FORGE_ATTRS, *extra_attrs)
             if hasattr(u, name)
         }
 

@@ -90,6 +90,14 @@ class FlatSurfaceFollowTask(ForgeTask):
     success_pos_tol: float = 0.01                 # cylinder tip within this of the far-edge center
     success_orn_tol_deg: float = 10.0             # |orientation error| (deg) within this of the desired
 
+    # --- Termination (per-env). Both default OFF. When EITHER is on, env_setup auto-attaches the
+    # efficient-reset wrapper so partial resets teleport (no sim steps) instead of running Factory's
+    # all-envs settling reset. terminated (failure/success) is NOT value-bootstrapped; time-out is. ---
+    terminate_on_lag: bool = False                # end if the tool falls too far behind the setpoint
+    terminate_on_success: bool = False            # end the moment success is reached (in contact)
+    pace_lag_frac: float = 0.5                    # max along-track lag before termination, as a
+                                                  # FRACTION of path length L (0.5 => half the path)
+
     # --- Reward terms ---
     # Convention: each term computes a RAW SIGNED value from REALIZED (measured/physics) state —
     # never control targets — and maps it through the keypoint squashing function

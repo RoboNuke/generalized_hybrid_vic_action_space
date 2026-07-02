@@ -57,6 +57,16 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # episode. Both reset each episode in _reset_idx.
         self.t_contact = torch.full((self.num_envs,), float("inf"), device=self.device)
         self.success_reward_given = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        # Per-episode tensors the efficient-reset wrapper must carry across per-env teleport resets.
+        # Their fresh-episode values are captured in the post-full-reset cache (pace_tau=0,
+        # t_contact=+inf, success_reward_given=False, desired_force=sampled), so a donor copy on a
+        # partial reset restores correct fresh values without re-running randomize_initial_state.
+        self._efficient_reset_extra_attrs = (
+            "desired_force",
+            "pace_tau",
+            "t_contact",
+            "success_reward_given",
+        )
 
     # ------------------------------------------------------------------
     # Small geometry helpers
@@ -467,6 +477,37 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.prev_actions = self.actions.clone()
         self._log_factory_metrics(rew_dict, curr_successes)
         return rew_buf
+
+    # ------------------------------------------------------------------
+    # Termination / truncation
+    # ------------------------------------------------------------------
+    def _get_dones(self):
+        """Per-env (terminated, truncated).
+
+        truncated = episode time-out (SAC bootstraps its value). terminated = optional per-env
+        FAILURE/SUCCESS conditions (no bootstrap), each gated by a task toggle (both default off):
+          * terminate_on_lag: the tool fell more than ``pace_lag_frac * L`` behind the moving
+            setpoint (``s_ref - progress``) while in contact — the core "can't keep the commanded
+            pace" failure. Only fires after first contact (``t_contact`` finite); off-contact the
+            setpoint is frozen so lag can't grow, which lets brief bounces recover.
+          * terminate_on_success: success reached while in contact — end immediately (the one-shot
+            success_time bonus has already been paid this step).
+        When EITHER toggle is on the run MUST carry the efficient-reset wrapper (env_setup attaches
+        it automatically for this task) so the resulting partial resets teleport to a cached donor
+        state instead of running Factory's all-envs settling reset. Overrides FactoryEnv._get_dones
+        (which returns all-synced time-outs); still refreshes intermediate values first, as it does.
+        """
+        self._compute_intermediate_values(dt=self.physics_dt)
+        cfg = self.cfg_task
+        time_out = self.episode_length_buf >= self.max_episode_length - 1
+        terminated = torch.zeros_like(time_out)
+        if bool(cfg.terminate_on_lag):
+            lag = self.s_ref - self.progress                          # (E,) m, positive = behind
+            lag_max = float(cfg.pace_lag_frac) * self.path_length     # (E,) m
+            terminated = terminated | ((lag > lag_max) & torch.isfinite(self.t_contact))
+        if bool(cfg.terminate_on_success):
+            terminated = terminated | (self._get_curr_successes() & self.in_contact_any)
+        return terminated, time_out
 
     # ------------------------------------------------------------------
     # Reset: grandparent (Factory) reset + our placement, then Forge dynamics rand
