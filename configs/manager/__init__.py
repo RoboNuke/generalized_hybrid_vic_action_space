@@ -14,6 +14,7 @@ from configs.manager.preprocessor_registry import (
     available_preprocessors,
     resolve_preprocessor,
 )
+from configs.manager.reset_curriculum_cfg import ResetCurriculumCfg
 from configs.manager.runner_cfg import RunnerCfg
 from configs.manager.sac_cfg import SAC_CFG
 from configs.manager.sensor_cfg import ContactCfg, EnergyCfg, SensorCfg
@@ -32,6 +33,7 @@ __all__ = [
     "ContactCfg",
     "EnergyCfg",
     "LossCfg",
+    "ResetCurriculumCfg",
     "resolve_preprocessor",
     "available_preprocessors",
 ]

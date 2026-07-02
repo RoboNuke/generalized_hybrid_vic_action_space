@@ -1,0 +1,150 @@
+# base_combo + Sampling-Based reset Curriculum (SBC). Identical to base_combo.yaml except the
+# reset_curriculum_* block below is enabled: each reset samples per-env, per-axis initial peg pose
+# (x,y,z + roll/pitch/yaw tilt) from [floor, max] with a per-AGENT floor that rises with success.
+# See wrappers/sensors/reset_curriculum_wrapper.py.
+
+runner_cfg:
+  task: Isaac-Forge-PegInsert-Direct-v0
+  disable_success_pred: true
+  kp_z_align_enabled: true                # aligns peg z-axis with socket z-axis
+  kp_z_align_a: 5.0
+  kp_z_align_b: 2
+  engagement_quality_enabled: true        # publish engagement_quality/* diagnostics
+
+  # ---- insertion-reward scales + alignment gates ----
+  curr_engaged_scale: 1.0
+  curr_success_scale: 1.0
+  kp_baseline_scale: 0.0
+  kp_coarse_scale: 1.0
+  kp_fine_scale: 1.0
+  engage_check_yaw: false
+  engage_check_z_aligned: true
+  success_check_yaw: false
+  success_check_z_aligned: true
+  z_align_max_deg: 10.0
+  ee_success_yaw_deg: null
+  agent_type: sac
+  num_envs: 256
+  num_agents: 3
+  total_timesteps: 20_100
+  eval_timesteps: 150
+  memory_size: 1_000_000
+  seed: -1
+  glue_peg_to_gripper: true
+  grasp_rot_mode: fixed
+  rel_grasp_rot_init_deg: [0.0, 30.0, 0.0]   # [roll, pitch, yaw] deg — the fixed grasp = curriculum tilt max
+
+  env_cfg_overrides:
+    task.num_keypoints: 4
+    task.keypoint_scale: 0.15
+    task.keypoint_coef_baseline: [5, 4]
+    task.keypoint_coef_coarse: [50, 2]
+    task.keypoint_coef_fine: [100, 0]
+    task.contact_penalty_scale: 0.0
+    task.action_penalty_ee_scale: 0.0
+    task.action_penalty_asset_scale: 0.001
+    task.action_grad_penalty_scale: 0.1
+
+loss_cfg:
+  supervised_selection_enabled: false
+  supervised_selection_policy_weight: 1.0
+  supervised_selection_critic_weight: 0.0
+
+# ---- Sampling-Based reset Curriculum (SBC) — own config section ----
+reset_curriculum_cfg:
+  enabled: true
+  increase_rate: 0.05
+  decrease_rate: 0.05
+  increase_threshold: 0.5
+  decrease_threshold: 0.2
+  min_pos: [0.0, 0.0, 0.005]   # [x, y, z] m: c=0 floor (x,y lateral mag; z height above hole tip)
+  min_orn: [0.0, 0.0, 0.0]     # [roll, pitch, yaw] deg: c=0 floor (0,0,0 => start aligned)
+  align_below_z: 0.0           # <=0 => auto-derive from grasp offset; peg spawned below hole top => aligned+centered
+  success_margin_z: 0.005      # keep peg base >=5mm above the success depth so it never starts in success
+
+sac_cfg:
+  tensorboard: false        # log ONLY to wandb (requires experiment.wandb: true)
+  gradient_steps: 8
+  batch_size: 1024
+  discount_factor: 0.99
+  polyak: 0.005
+  actor_lr: 1.0e-4
+  critic_lr: 1.0e-4
+  entropy_lr: 3.0e-5
+  weight_decay: 1.0e-2
+  random_timesteps: 0
+  learning_starts: 300
+  learn_entropy: true
+  initial_entropy_value: 0.05
+  target_entropy: -3.5
+  grad_norm_clip: 1.0
+  mixed_precision: false
+  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor_kwargs: {}
+  rewards_shaper_scale: 0.1
+  gripper_action_idx: null
+  phase_split_families: [RotationFrame, Impedance_Stiffness]
+  recorder:
+    enabled: false
+  experiment:
+    directory: glued_peg_debug
+    experiment_name: "curr_base_combo.yaml"
+    write_interval: 150
+    checkpoint_interval: auto
+    wandb: true
+    wandb_kwargs:
+      entity: hur
+
+model_cfg:
+  actor:
+    act_init_std: 1.0
+    selection_distribution: product
+    actor_n: 2
+    actor_latent: 512
+    last_layer_scale: 0.1
+    clip_log_std: true
+    min_log_std: -20.0
+    max_log_std: 2.0
+    reduction: sum
+    use_state_dependent_std: false
+    bernoulli_action_dims: null
+    force_zero_action_dims: null
+    scale_down_action_dims: [0, 1, 2]
+  critic:
+    critic_output_init_mean: 0.0
+    critic_n: 4
+    critic_latent: 1024
+    clip_actions: false
+
+controller_cfg:
+  control_type: ctrl-action-interface
+  gain_mapping: "constant"
+  use_hybrid_force: false
+  force_axes: [0, 0, 0, 0, 0, 0]
+  async_z_force_bounds: true
+  gain_min: [50, 50, 50, 30, 30, 30]
+  gain_max: [500, 500, 500, 30, 30, 30]
+  force_gain_min: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  force_gain_max: [100.0, 100.0, 100.0, 10.0, 10.0, 10.0]
+  chol_offdiag_rho: 0.9
+  full_gain_matrix: false
+  full_orientation_control: true
+  orientation_obs_mode: "6d_rot_mat"
+  rot_action_bounds: [1.0, 1.0, 1.0]
+  rot_action_threshold: [0.097, 0.097, 0.097]
+  force_action_bounds: [20.0, 20.0, 20.0]
+  torque_action_bounds: [0.25, 0.25, 0.25]
+  force_action_threshold: [2.0, 2.0, 2.0]
+  torque_action_threshold: [0.01, 0.01, 0.01]
+  default_task_force_gains: [2.8, 2.8, 2.8, 0.1, 0.1, 0.1]
+  apply_ema_force: false
+  no_sel_ema: true
+  ema_mode: action
+
+sensor_cfg:
+  contact:
+    enabled: true
+    contact_force_threshold: 1.0
+    log_contact_state: false
+    append_to_policy_obs: false
+    append_to_critic_state: true

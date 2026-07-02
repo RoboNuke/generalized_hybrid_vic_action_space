@@ -77,6 +77,7 @@ def build_env(
     sensor_cfg,
     agent_type,
     *,
+    reset_curriculum_cfg=None,
     force_camera: bool = False,
 ):
     """Construct the full wrapped Isaac Lab env exactly as training does.
@@ -341,6 +342,36 @@ def build_env(
         from wrappers.sensors.grasp_tilt_wrapper import install_grasp_rot_randomization
         install_grasp_rot_randomization(runner_cfg.rel_grasp_rot_init_deg, runner_cfg.grasp_rot_mode)
 
+    # Optional Sampling-Based Curriculum on the reset pose (Forge/Factory peg insertion). Patches
+    # FactoryEnv.randomize_initial_state to sample height/lateral/tilt per-env from [floor, max] with
+    # a rising floor (IndustReal/AutoMate SBC). Must run before gym.make. Requires grasp_rot_mode
+    # 'fixed' so the tilt max / glued-weld angle is a constant.
+    if reset_curriculum_cfg is not None and reset_curriculum_cfg.enabled:
+        if not (runner_cfg.task.startswith("Isaac-Forge-")
+                or runner_cfg.task.startswith("Isaac-Factory-")):
+            raise ValueError(
+                "reset_curriculum_cfg.enabled=True requires a Forge/Factory peg-insertion task "
+                f"(it patches FactoryEnv.randomize_initial_state), but task is {runner_cfg.task!r}."
+            )
+        if runner_cfg.grasp_rot_mode != "fixed":
+            raise ValueError(
+                "reset_curriculum_cfg.enabled requires grasp_rot_mode='fixed' (the tilt max / weld "
+                f"angle must be constant), but grasp_rot_mode is {runner_cfg.grasp_rot_mode!r}."
+            )
+        from wrappers.sensors.reset_curriculum_wrapper import install_reset_curriculum
+        install_reset_curriculum(
+            num_agents=runner_cfg.num_agents,
+            min_pos=reset_curriculum_cfg.min_pos,
+            min_orn_deg=reset_curriculum_cfg.min_orn,
+            increase_rate=reset_curriculum_cfg.increase_rate,
+            decrease_rate=reset_curriculum_cfg.decrease_rate,
+            increase_threshold=reset_curriculum_cfg.increase_threshold,
+            decrease_threshold=reset_curriculum_cfg.decrease_threshold,
+            grasp_tilt_deg=runner_cfg.rel_grasp_rot_init_deg,
+            align_below_z=reset_curriculum_cfg.align_below_z,
+            success_margin_z=reset_curriculum_cfg.success_margin_z,
+        )
+
     # Optional orientation keypoint reward (Forge/Factory peg insertion only): patch
     # FactoryEnv._get_factory_rew_dict to add a kp_z_align term that rewards aligning the peg
     # z-axis with the socket z-axis. Must run before gym.make (it patches the env class).
@@ -554,7 +585,14 @@ def build_env(
     # the control wrapper's per-env EMA/VIC reset still runs for broken envs. On a partial
     # reset it teleports broken envs to a cached donor state instead of running Factory's
     # all-envs settling reset. Required whenever fragile pegs are on.
-    if runner_cfg.efficient_reset_enabled:
+    # The surface task also needs it whenever per-env termination (lag/success) is enabled: those
+    # partial resets would otherwise run Factory's all-envs settling reset and corrupt the envs
+    # still mid-episode. Auto-attach so enabling termination in the task cfg "just works".
+    _surface_termination = runner_cfg.task.startswith("Isaac-FlatSurfaceFollow-") and (
+        bool(getattr(getattr(env_cfg, "task", None), "terminate_on_lag", False))
+        or bool(getattr(getattr(env_cfg, "task", None), "terminate_on_success", False))
+    )
+    if runner_cfg.efficient_reset_enabled or _surface_termination:
         from wrappers.sensors.efficient_reset_wrapper import EfficientResetWrapper
         env = EfficientResetWrapper(env)
         print("[runner] efficient-reset wrapper attached (per-env teleport reset).")

@@ -23,6 +23,7 @@ import yaml
 
 from configs.manager.controller_cfg import ControlCfg
 from configs.manager.loss_cfg import LossCfg
+from configs.manager.reset_curriculum_cfg import ResetCurriculumCfg
 from configs.manager.model_cfg import ModelCfg
 from configs.manager.noise_cfg import NoiseCfg
 from configs.manager.ppo_cfg import PPO_CFG
@@ -112,6 +113,7 @@ class ConfigManager:
         "noise_cfg": NoiseCfg,  # observation-noise levels; pushed onto env_cfg.obs_rand
         "sensor_cfg": SensorCfg,
         "loss_cfg": LossCfg,  # auxiliary-loss switches; consumed by learning/losses.py
+        "reset_curriculum_cfg": ResetCurriculumCfg,  # SBC reset curriculum; consumed by env_setup
     }
 
     @classmethod

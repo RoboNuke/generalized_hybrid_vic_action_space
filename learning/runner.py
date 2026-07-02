@@ -244,6 +244,8 @@ def main(argv: list[str] | None = None) -> None:
     # Auxiliary-loss switches (which extra losses are on and their per-target
     # weights). Absent loss_cfg section -> all-off default -> vanilla SAC.
     loss_cfg = loaded["loss_cfg"]
+    # Sampling-Based reset Curriculum (absent -> default-constructed, disabled).
+    reset_curriculum_cfg = loaded["reset_curriculum_cfg"]
 
     # Which learning algorithm to run. ``active_cfg`` supplies the fields the runner
     # plumbs that exist on both SAC_CFG and PPO_CFG (experiment dir, observation
@@ -299,7 +301,8 @@ def main(argv: list[str] | None = None) -> None:
     from learning.env_setup import build_env
 
     env, ctrl_wrapper, is_automate_assembly, env_cfg, total_envs = build_env(
-        args, runner_cfg, sac_cfg, ppo_cfg, controller_cfg, noise_cfg, sensor_cfg, agent_type
+        args, runner_cfg, sac_cfg, ppo_cfg, controller_cfg, noise_cfg, sensor_cfg, agent_type,
+        reset_curriculum_cfg=reset_curriculum_cfg,
     )
 
     device = torch.device(args.device)
