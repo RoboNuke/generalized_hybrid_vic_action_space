@@ -32,7 +32,11 @@ class ResetCurriculumCfg:
     """Per-update step subtracted from ``c`` when its success EMA is below :attr:`decrease_threshold`."""
 
     increase_threshold: float = 0.5
-    """Success-EMA above which an agent's ``c`` is raised (curriculum gets harder)."""
+    """Per-agent per-reset-batch success rate above which ``c`` is raised (curriculum gets harder).
+    The batch rate is a mean over that agent's ~num_envs envs (precise at 512 envs/agent), used raw
+    (no EMA) — it will jitter batch-to-batch and that's fine. Note: at low ``c`` the SBC samples the
+    FULL range, so this gates on full-range success — set it relative to what the policy realistically
+    achieves across the whole task, not the easy end."""
 
     decrease_threshold: float = 0.2
     """Success-EMA below which an agent's ``c`` is lowered (curriculum backs off). Keep < increase."""

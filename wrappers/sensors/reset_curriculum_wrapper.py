@@ -23,16 +23,18 @@ with grasp max 0 stays 0).
 
 PER-AGENT ``c`` (NOT global, NOT per-env): the block-parallel run trains ``num_agents`` policies on
 contiguous env partitions (agent ``a`` owns envs ``[a*epa, (a+1)*epa)``, ``epa = num_envs //
-num_agents`` — matching ``learning/block_agent.py``). Each agent keeps its OWN ``c`` and success
-EMA, updated from ITS OWN envs, and every env in that agent's partition uses that agent's ``c``.
-Per-agent (vs global) so a fast seed can't raise a slow seed's difficulty and freeze it. Published
-per-agent to ``extras['to_log']['ResetCurriculum/c']`` / ``.../success_ema`` (per-env tensors, so
-block_agent's per-agent partitioning logs each agent's own value).
+num_agents`` — matching ``learning/block_agent.py``). Each agent keeps its OWN ``c``, updated from
+ITS OWN envs, and every env in that agent's partition uses that agent's ``c``. Per-agent (vs global)
+so a fast seed can't raise a slow seed's difficulty and freeze it. Published per-agent to
+``extras['to_log']['ResetCurriculum/c']`` / ``.../batch_success`` (per-env tensors, so block_agent's
+per-agent partitioning logs each agent's own value).
 
-``c`` update (per reset batch, per agent, from the just-ended ``ep_succeeded`` latch):
-    ema_a = (1-beta)*ema_a + beta*mean(success over agent a's resetting envs)
-    if ema_a > increase_threshold: c_a = min(1, c_a + increase_rate)
-    elif ema_a < decrease_threshold: c_a = max(0, c_a - decrease_rate)
+``c`` update (per reset batch, per agent, from the RAW just-ended ``ep_succeeded`` batch mean — NO
+EMA; each batch is a precise mean over ~num_envs envs, so it is used directly and is expected to
+jitter batch-to-batch):
+    s_a = mean(ep_succeeded over agent a's resetting envs)
+    if s_a > increase_threshold: c_a = min(1, c_a + increase_rate)
+    elif s_a < decrease_threshold: c_a = max(0, c_a - decrease_rate)
 
 Tilt realisation (GLUED mode): the peg-in-gripper weld is a fixed rotation ``R_grasp`` and cannot
 change per reset. To land the peg at a sampled tilt ``R_samp`` (relative to vertical), pre-rotate the
@@ -68,7 +70,6 @@ def install_reset_curriculum(
     grasp_tilt_deg: Sequence[float],
     align_below_z: float = 0.0,
     success_margin_z: float = 0.005,
-    success_ema_beta: float = 0.05,
     ik_iters: int = 3,
 ) -> None:
     """Patch ``FactoryEnv.randomize_initial_state`` to apply per-agent SBC to the initial peg pose.
@@ -89,28 +90,30 @@ def install_reset_curriculum(
     min_orn_rad = [float(torch.deg2rad(torch.tensor(float(v)))) for v in min_orn_deg]
 
     _orig = FactoryEnv.randomize_initial_state
-    state = {"c": None, "ema": None, "epa": None, "z_off": None, "z_floor_succ": None}
+    state = {"c": None, "succ": None, "epa": None, "z_off": None, "z_floor_succ": None}
 
     def _patched(self, env_ids):
         device = self.device
         if state["c"] is None:
             state["epa"] = max(1, self.num_envs // n_ag)
             state["c"] = [0.0] * n_ag
-            state["ema"] = [0.0] * n_ag
+            state["succ"] = [0.0] * n_ag
         epa = state["epa"]
 
-        # --- (a) per-agent c update from the just-ended episodes (BEFORE stock reset clears them) ---
+        # --- (a) per-agent c update from the RAW just-ended batch success (no EMA; each batch is a
+        # precise mean over ~num_envs envs, so use it directly — it jitters and that's fine). Read
+        # BEFORE the stock reset clears ep_succeeded. ---
         if hasattr(self, "ep_succeeded") and len(env_ids) > 0:
             ag = torch.div(env_ids, epa, rounding_mode="floor").clamp(max=n_ag - 1)
             succ = self.ep_succeeded[env_ids].float()
             for a in range(n_ag):
                 m = ag == a
                 if m.any():
-                    e = (1.0 - success_ema_beta) * state["ema"][a] + success_ema_beta * succ[m].mean().item()
-                    state["ema"][a] = e
-                    if e > increase_threshold:
+                    s = succ[m].mean().item()
+                    state["succ"][a] = s
+                    if s > increase_threshold:
                         state["c"][a] = min(1.0, state["c"][a] + increase_rate)
-                    elif e < decrease_threshold:
+                    elif s < decrease_threshold:
                         state["c"][a] = max(0.0, state["c"][a] - decrease_rate)
 
         # --- (b) run the stock reset (fixed asset randomize, IK to nominal, seat/close/weld) ---
@@ -228,12 +231,12 @@ def install_reset_curriculum(
                     flush=True,
                 )
 
-        # --- (d) publish per-agent c / ema as per-env tensors (block_agent means over each slice) ---
+        # --- (d) publish per-agent c / batch_success as per-env tensors (block_agent means per slice) ---
         all_ag = torch.div(torch.arange(self.num_envs, device=device), epa,
                            rounding_mode="floor").clamp(max=n_ag - 1)
         to_log = self.extras.setdefault("to_log", {})
         to_log["ResetCurriculum/c"] = torch.tensor(state["c"], device=device, dtype=torch.float32)[all_ag]
-        to_log["ResetCurriculum/success_ema"] = torch.tensor(state["ema"], device=device, dtype=torch.float32)[all_ag]
+        to_log["ResetCurriculum/batch_success"] = torch.tensor(state["succ"], device=device, dtype=torch.float32)[all_ag]
         return out
 
     FactoryEnv.randomize_initial_state = _patched
