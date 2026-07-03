@@ -121,6 +121,14 @@ class FlatSurfaceFollowTask(ForgeTask):
     orientation_weight: float = 1.0
     orientation_a: float = 0.1                    # squashing steepness over the angle error (deg)
     orientation_b: float = 0.0
+    # Near-surface gate for the orientation reward: it pays ONLY when the tool tip is within this
+    # height (m) above the contact point (tip_surface_dist < gate; contact/penetration count). Keeps
+    # "hold the commanded angle on final approach" but prevents farming it while hovering high.
+    orientation_gate_dist: float = 0.01           # 1 cm
+
+    # Contact bonus: per-step +1 while the held object is in contact (0 otherwise), scaled by weight.
+    # Direct incentive to make/maintain contact — the lever against the hover-and-orient local optimum.
+    contact_weight: float = 1.0
     # Straightness + pace (both built on the ideal straight path p0->p_g on the plate top surface):
     #   d   = unit start->goal direction; L = |p_g - p0| (path length, m); dp = tip - p0
     #   s     = dp . d            (along-track position, m)

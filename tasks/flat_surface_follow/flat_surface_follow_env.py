@@ -57,6 +57,14 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # episode. Both reset each episode in _reset_idx.
         self.t_contact = torch.full((self.num_envs,), float("inf"), device=self.device)
         self.success_reward_given = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        # Contact-quality accumulators (per episode; reset in _reset_idx). cq_contact: steps in
+        # contact; cq_starts: no-contact->contact transitions (= number of contact runs); cq_breaks:
+        # contact->no-contact transitions (bounces); cq_prev: previous step's contact (for transitions).
+        # Published per episode as contact_quality/{contact_percentage, avg_contact_length, contact_breaks}.
+        self.cq_contact = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        self.cq_starts = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        self.cq_breaks = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        self.cq_prev = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
         # Per-episode tensors the efficient-reset wrapper must carry across per-env teleport resets.
         # Their fresh-episode values are captured in the post-full-reset cache (pace_tau=0,
         # t_contact=+inf, success_reward_given=False, desired_force=sampled), so a donor copy on a
@@ -66,6 +74,10 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "pace_tau",
             "t_contact",
             "success_reward_given",
+            "cq_contact",
+            "cq_starts",
+            "cq_breaks",
+            "cq_prev",
         )
 
     # ------------------------------------------------------------------
@@ -215,6 +227,9 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # contact point; otherwise the nearest surface point, so the local frame is always defined.
         signed_dist = ((self.cyl_tip - start) * plate_normal).sum(-1, keepdim=True)
         self.contact_point = self.cyl_tip - signed_dist * plate_normal
+        # Signed height of the tool tip above the surface (m): >0 above, ~0 in contact, <0 penetrating.
+        # Used by the orientation reward's near-surface gate.
+        self.tip_surface_dist = signed_dist.squeeze(-1)
 
         # LOCAL surface frame AT THE CONTACT POINT — the normal + travel direction the reward and the
         # critic use. General hook: a non-flat surface overrides `_surface_normal_and_dir_at` to
@@ -425,11 +440,12 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         REALIZED value, a, b) — computed from measured/physics state only (never control targets),
         peaking at value=0. The two action penalties (action_penalty_ee, action_grad_penalty) are
         the FactoryEnv linear penalties applied with NEGATIVE scales, both default 0.0 (off). A
-        one-shot success_time bonus squashes (ideal completion time - actual success time). The
-        surface-TRACKING terms (straightness, pace, success_time) are GATED on contact with the held
-        object — they pay 0 with no contact. Orientation is NOT gated (holding the commanded tool-vs-
-        surface angle before contact is the desired approach); force and the action penalties are
-        also ungated. The scorer's _factory_scales must stay in sync with the weights/scales below.
+        one-shot success_time bonus squashes (ideal completion time - actual success time), plus a
+        per-step 'contact' bonus (+contact_weight while in contact). Gating: straightness / pace pay
+        everywhere (air + contact) for a continuous tracking signal (same path d=start->goal, setpoint
+        frozen at start until contact); success_time requires contact; ORIENTATION requires being NEAR
+        the surface (tip within orientation_gate_dist of the contact point); force / contact / action
+        penalties are always evaluated. The scorer's _factory_scales must stay in sync with the below.
         """
         curr_successes = self._get_curr_successes()
         cfg = self.cfg_task
@@ -479,19 +495,23 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         )
         self.success_reward_given = self.success_reward_given | success_now
 
-        # Contact gate: straightness / pace are surface-TRACKING signals that are meaningless (and
-        # farmable by hovering at the start: s_ref frozen at 0, progress/cross_track ~0) without
-        # contact, so they pay 0 off-contact. ORIENTATION is NOT gated — holding the commanded
-        # tool-vs-surface angle BEFORE contact is the desired approach behaviour, and orn_error is
-        # well-defined from the surface plane regardless of contact, so it pays everywhere. Force is
-        # also ungated (it drives the tool INTO the surface); action penalties always apply;
-        # success_time is gated via success_now (requires in_contact_any).
+        # Gating. straightness / pace now pay EVERYWHERE (air + contact) for a CONTINUOUS tracking
+        # signal across touchdown: the path direction (d = start->goal) and the setpoint (frozen at
+        # start, s_ref=0, until contact — advances only in contact) are identical in both phases, so
+        # what the tool tracks in the air is exactly what it tracks the instant it contacts. In air
+        # this rewards being laterally on-line (cross_track->0) and at the start along-track (pace->0),
+        # i.e. lined up to descend. ORIENTATION pays only NEAR the surface (tip within
+        # orientation_gate_dist of the contact point; includes contact/penetration) — holds the angle
+        # on final approach without the "hover high and hold 90deg" farm. force / contact / action
+        # penalties are always evaluated; success_time is gated via success_now (requires contact).
         contact = self.in_contact_any.float()
+        near_surface = (self.tip_surface_dist < float(cfg.orientation_gate_dist)).float()
         rew_dict = {
             "force": factory_utils.squashing_fn(force_value, cfg.force_a, cfg.force_b),
-            "orientation": factory_utils.squashing_fn(orn_value, cfg.orientation_a, cfg.orientation_b),
-            "straightness": factory_utils.squashing_fn(straightness_value, cfg.straightness_a, cfg.straightness_b) * contact,
-            "pace": factory_utils.squashing_fn(pace_value, cfg.pace_a, cfg.pace_b) * contact,
+            "orientation": factory_utils.squashing_fn(orn_value, cfg.orientation_a, cfg.orientation_b) * near_surface,
+            "straightness": factory_utils.squashing_fn(straightness_value, cfg.straightness_a, cfg.straightness_b),
+            "pace": factory_utils.squashing_fn(pace_value, cfg.pace_a, cfg.pace_b),
+            "contact": contact,
             "action_penalty_ee": action_penalty_ee,
             "action_grad_penalty": action_grad_penalty,
             "success_time": success_time_reward,
@@ -501,6 +521,7 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "orientation": float(cfg.orientation_weight),
             "straightness": float(cfg.straightness_weight),
             "pace": float(cfg.pace_weight),
+            "contact": float(cfg.contact_weight),
             "action_penalty_ee": -float(cfg.action_penalty_ee_scale),
             "action_grad_penalty": -float(cfg.action_grad_penalty_scale),
             "success_time": float(cfg.success_time_weight),
@@ -511,6 +532,34 @@ class FlatSurfaceFollowEnv(ForgeEnv):
 
         # Advance the pace clock by one env step, ONLY where in contact (tau_{t+1} = tau_t + dt*in_contact).
         self.pace_tau = self.pace_tau + step_dt * self.in_contact_any.float()
+
+        # --- Contact-quality accumulation + per-episode publish ---
+        c = self.in_contact_any
+        self.cq_contact += c.long()                                   # steps in contact this episode
+        self.cq_starts += (c & ~self.cq_prev).long()                 # no-contact -> contact (run starts)
+        self.cq_breaks += (~c & self.cq_prev).long()                 # contact -> no-contact (bounces)
+        self.cq_prev = c.clone()
+        # Publish per-episode metrics for the envs finishing this step (mask = reset_buf). Snapshots
+        # (new tensors), so the subsequent _reset_idx zeroing the accumulators doesn't affect them.
+        # block_agent means these over the finishing envs per agent -> contact_quality/<metric>.
+        ep_len = self.episode_length_buf.clamp_min(1).float()
+        contacted = self.cq_starts > 0                                # made contact at all this episode
+        nan = torch.full_like(ep_len, float("nan"))
+        first_contact_step = self.t_contact / step_dt                # +inf where never contacted
+        # length of the post-first-contact phase (first-contact step F to end, inclusive = E - F + 1);
+        # >=1 to avoid /0 on a last-step touch. post_contact_% = contact steps / this phase length.
+        post_denom = (ep_len - first_contact_step + 1.0).clamp_min(1.0)
+        self.extras["per_env_contact_quality"] = {
+            "contact_percentage": self.cq_contact.float() / ep_len,                       # steps in contact / episode length
+            "avg_contact_length": self.cq_contact.float() / self.cq_starts.clamp_min(1).float(),  # mean consecutive contact run
+            "contact_breaks": self.cq_breaks.float(),                                    # # of contact->no-contact bounces
+            "made_contact_rate": contacted.float(),                                      # 1 if it touched at all, else 0
+            # Conditional on having touched (NaN otherwise -> block_agent averages only over
+            # rollouts that made contact): approach speed + how well contact is held after touchdown.
+            "steps_to_first_contact": torch.where(contacted, first_contact_step, nan),
+            "post_contact_percentage": torch.where(contacted, self.cq_contact.float() / post_denom, nan),
+        }
+        self.extras["per_env_contact_quality_mask"] = self.reset_buf.clone()
 
         self.prev_actions = self.actions.clone()
         self._log_factory_metrics(rew_dict, curr_successes)
@@ -594,6 +643,12 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # one-shot paid flag.
         self.t_contact = torch.full((self.num_envs,), float("inf"), device=self.device)
         self.success_reward_given = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+
+        # Reset the contact-quality accumulators (new rollout).
+        self.cq_contact = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        self.cq_starts = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        self.cq_breaks = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        self.cq_prev = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
 
         self.dead_zone_thresholds = (
             torch.rand((self.num_envs, 6), dtype=torch.float32, device=self.device) * self.default_dead_zone

@@ -626,6 +626,33 @@ class BlockAgent(Agent):
                             vals = per_env_vals[env_lo:env_hi][agent_mask]
                             self._accum_scalar(i, f"Episode_Reward/{term}", vals.mean())
 
+            # Per-agent contact-quality metrics (surface task): a wrapper publishes per-env
+            # per-EPISODE values in infos["per_env_contact_quality"] + a done mask; we mean over the
+            # finishing envs in each agent's slice -> contact_quality/<metric> (one value per
+            # completed rollout, so it reads as "average over rollouts" like the success rate).
+            if (
+                isinstance(infos, dict)
+                and "per_env_contact_quality" in infos
+                and "per_env_contact_quality_mask" in infos
+            ):
+                cq = infos["per_env_contact_quality"]
+                cqmask = infos["per_env_contact_quality_mask"]
+                if torch.is_tensor(cqmask) and cqmask.any():
+                    for metric, per_env_vals in cq.items():
+                        for i in range(self.num_agents):
+                            env_lo, env_hi = i * epa, (i + 1) * epa
+                            agent_mask = cqmask[env_lo:env_hi]
+                            if not agent_mask.any():
+                                continue
+                            vals = per_env_vals[env_lo:env_hi][agent_mask]
+                            # Drop NaN: metrics that are only defined for rollouts that touched
+                            # (steps_to_first_contact, post_contact_percentage) are NaN otherwise,
+                            # so this yields a conditional "over rollouts that made contact" average.
+                            vals = vals[torch.isfinite(vals)]
+                            if vals.numel() == 0:
+                                continue
+                            self._accum_scalar(i, f"contact_quality/{metric}", vals.mean())
+
             # Per-trajectory forward-distance ingestion (task-specific wrapper).
             # Wrappers like AntSuccessWrapper publish `info["per_env_episode_distance"]`
             # (the final per-env displacement for the just-ended episode) plus a
