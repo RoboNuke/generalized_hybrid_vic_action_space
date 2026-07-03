@@ -24,6 +24,12 @@ answerable on TensorBoard:
                                                (i.e. the would-be engagement rate, restricted to the
                                                depth-met population). A cross-check against
                                                ``Episode / Engagement rate``.
+  * ``engagement_quality/xy_dist_uncentered`` — lateral offset (m, ``_mean`` + ``_std``) of the pegs
+                                               that reach depth but are NOT centered — "how far off is
+                                               the peg when it's stuck", to place the fine-keypoint reach.
+  * ``engagement_quality/angle_unengaged``   — geodesic peg-vs-socket axis angle (deg, ``_mean`` +
+                                               ``_std``) of the pegs that reach depth but do NOT engage —
+                                               whether orientation is still blocking insertion.
 
 The "_g_depth" (given-depth) conditionals are computed by publishing ``NaN`` for every env that does
 NOT meet depth on that step; ``BlockAgent._accum_dist_stat`` drops non-finite samples, so the running
@@ -134,6 +140,22 @@ def install_engagement_quality(
         if want_yaw:
             to_log["engagement_quality/yaw_g_depth (stat)"] = given_depth(yaw_ok)
         to_log["engagement_quality/all_g_depth (stat)"] = given_depth(others)
+
+        # --- reward-shaping diagnostics: for pegs that reach depth but FAIL, quantify HOW they fail
+        # (mean + std via the (stat) suffix). NaN outside each subpopulation so the accumulator
+        # averages over exactly that subset. ---
+        # (1) lateral offset (m) of the depth-met-but-NOT-centered pegs = "how far off-center when
+        #     stuck" — tells us where to place the fine-keypoint reach/weight.
+        uncentered_at_depth = depth & (~centered)
+        to_log["engagement_quality/xy_dist_uncentered (stat)"] = torch.where(
+            uncentered_at_depth, xy_dist, torch.full_like(xy_dist, nan)
+        )
+        # (2) geodesic peg-vs-socket axis angle (deg) of the depth-met-but-NOT-engaged pegs
+        #     ("reach depth but not insertion") — tells us whether orientation is still a blocker.
+        unengaged_at_depth = depth & (~others)
+        to_log["engagement_quality/angle_unengaged (stat)"] = torch.where(
+            unengaged_at_depth, angle_deg, torch.full_like(angle_deg, nan)
+        )
         return out
 
     FactoryEnv._log_factory_metrics = _patched
