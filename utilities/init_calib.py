@@ -50,13 +50,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--settle_seconds", type=float, default=1.0,
                         help="Seconds of sim time to film after each reset (default 1.0). "
                              "Captured one frame per control step.")
-    parser.add_argument("--action_mode", choices=["hold", "zero"], default="hold",
-                        help="hold (default): robot holds its post-reset pose — physics "
-                             "is stepped with NO action applied (step_sim_no_action), so the "
-                             "arm stays put; best for inspecting the initialization. "
-                             "zero: step a zero policy action each step — the arm servos to "
-                             "the controller's zero-action target (for ctrl-action-interface "
-                             "that moves it toward the socket frame).")
+    parser.add_argument("--action_mode", choices=["hold", "zero"], default="zero",
+                        help="zero (default): step a ZERO policy action each step. Under the "
+                             "EEF-relative control convention a zero delta targets the CURRENT "
+                             "pose, so the arm actively servos in place and stays put — the "
+                             "recommended way to inspect initialization. hold: step physics with "
+                             "NO action (step_sim_no_action); for effort/operational-space control "
+                             "this can DIVERGE (the arm drifts off) unless the env actively "
+                             "re-targets, so prefer zero.")
     parser.add_argument("--out", type=str, default="init_calib.mp4",
                         help="Output path. Extension picks the format: .mp4 (default, "
                              "streamed to disk frame-by-frame via ffmpeg — constant memory, "

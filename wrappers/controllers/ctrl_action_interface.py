@@ -378,15 +378,6 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         R_eef = matrix_from_quat(env.fingertip_midpoint_quat)               # (E,3,3) world<-eef
         eef_pos_w = env.fingertip_midpoint_pos + env_origins
 
-        # Peg-tip pose (only the peg-tip marker still needs it). held_base_pos is env-relative.
-        if self._viz_peg_tip:
-            from isaaclab_tasks.direct.factory import factory_utils
-            held_base_pos, held_base_quat = factory_utils.get_held_base_pose(
-                env.held_pos, env.held_quat, env.cfg_task.name,
-                env.cfg_task.fixed_asset_cfg, E, self.device,
-            )
-            tip_pos_w = held_base_pos + env_origins
-
         if show_rotation:
             if self._marker_rotation is None:
                 self._marker_rotation = AxisFrameMarker(
@@ -398,11 +389,20 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
             if self._marker_peg_tip is None:
                 self._marker_peg_tip = AxisFrameMarker(
                     "/World/Visuals/PegTipFrame", self._peg_tip_frame_scale)
-            # The held asset's ACTUAL orientation (carries the grasp tilt). The stiffness R is
-            # anchored to the peg-nominal frame F_flip and the real peg sits at F_flip @ grasp_tilt,
-            # so this frame coincides with the rotated-stiffness frame exactly when
-            # fixed_rotation_rpy == rel_grasp_rot_init_deg — that overlap is the alignment check.
-            self._marker_peg_tip.update(tip_pos_w, held_base_quat)
+            if hasattr(env, "held_end_pos") and hasattr(env, "held_end_quat"):
+                # Surface task: the held cylinder's CONTACT-TIP frame (the un-held tip that traces
+                # the plate). held_end_pos is env-relative like held_pos.
+                self._marker_peg_tip.update(env.held_end_pos + env_origins, env.held_end_quat)
+            else:
+                # Peg tasks: the held asset's geometric base in its ACTUAL orientation (carries the
+                # grasp tilt). Coincides with the rotated-stiffness frame exactly when
+                # fixed_rotation_rpy == rel_grasp_rot_init_deg — that overlap is the alignment check.
+                from isaaclab_tasks.direct.factory import factory_utils
+                held_base_pos, held_base_quat = factory_utils.get_held_base_pose(
+                    env.held_pos, env.held_quat, env.cfg_task.name,
+                    env.cfg_task.fixed_asset_cfg, E, self.device,
+                )
+                self._marker_peg_tip.update(held_base_pos + env_origins, held_base_quat)
 
         if self._viz_eef:
             if self._marker_eef is None:
@@ -419,16 +419,23 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
             if self._marker_hole is None:
                 self._marker_hole = AxisFrameMarker(
                     "/World/Visuals/HoleFrame", self._hole_frame_scale)
-            # The socket insertion-target frame: where the held asset's geometric base must arrive for
-            # success, in the fixed asset's orientation (factory_utils.get_target_held_base_pose bakes
-            # in the task/FORGE fixed-asset offsets). fixed_pos is env-relative (like held_pos), so add
-            # env_origins; the peg-tip frame coincides with this exactly on a successful insertion.
-            from isaaclab_tasks.direct.factory import factory_utils
-            hole_pos, hole_quat = factory_utils.get_target_held_base_pose(
-                env.fixed_pos, env.fixed_quat, env.cfg_task.name,
-                env.cfg_task.fixed_asset_cfg, E, self.device,
-            )
-            self._marker_hole.update(hole_pos + env_origins, hole_quat)
+            if hasattr(env, "goal_world") and hasattr(env, "surface_normal"):
+                # Surface task: the GOAL point drawn in the SURFACE frame — x = path direction
+                # (start->goal), y = in-plane lateral (n x d), z = surface normal. goal_world is
+                # env-relative (like held_pos), so add env_origins.
+                goal_quat = quat_from_matrix(
+                    torch.stack([env.path_dir, env.d_lat, env.surface_normal], dim=-1))
+                self._marker_hole.update(env.goal_world + env_origins, goal_quat)
+            else:
+                # Peg tasks: the socket insertion-target frame (where the held asset's geometric base
+                # must arrive for success), in the fixed asset's orientation. fixed_pos is env-relative;
+                # the peg-tip frame coincides with this exactly on a successful insertion.
+                from isaaclab_tasks.direct.factory import factory_utils
+                hole_pos, hole_quat = factory_utils.get_target_held_base_pose(
+                    env.fixed_pos, env.fixed_quat, env.cfg_task.name,
+                    env.cfg_task.fixed_asset_cfg, E, self.device,
+                )
+                self._marker_hole.update(hole_pos + env_origins, hole_quat)
 
         if self._viz_interaction and hasattr(env, "interaction_pos"):
             if self._marker_interaction is None:

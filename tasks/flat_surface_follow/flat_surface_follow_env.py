@@ -119,6 +119,21 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         cross_dir = torch.cross(normal, path_dir, dim=-1)
         return start, goal, normal, path_dir, cross_dir
 
+    def _surface_normal_and_dir_at(self, query_pos):
+        """Surface normal + travel direction (path tangent) AT a surface query point.
+
+        GENERAL hook for arbitrary (incl. NON-FLAT) surfaces. A curved-surface subclass overrides
+        this to return the LOCAL surface normal (from the surface gradient / SDF / mesh) and the
+        LOCAL travel tangent at ``query_pos`` — so the reward and the critic always see the geometry
+        at the point of contact, which varies across a curved surface. For the flat plate the normal
+        (plate +z) and the near->far travel direction are constant over the surface, so ``query_pos``
+        is unused and the cached plate-frame values are returned.
+
+        Args:  query_pos (E,3): the surface point to evaluate at (the contact point / nearest
+            surface point to the tool tip). Returns (normal (E,3), path_dir (E,3)), unit vectors.
+        """
+        return self._plate_normal, self._plate_path_dir
+
     # ------------------------------------------------------------------
     # Scene: procedural plate (fixed) + cylinder (held)
     # ------------------------------------------------------------------
@@ -174,29 +189,46 @@ class FlatSurfaceFollowEnv(ForgeEnv):
     def _compute_intermediate_values(self, dt):
         super()._compute_intermediate_values(dt)  # ForgeEnv: noise + FT sensing
 
-        start, goal, normal, path_dir, cross_dir = self._surface_frame()
+        # PATH parametrization from the fixed-asset (plate) pose: near/far edge centers on the top
+        # surface. The plate's normal / near->far direction returned here are a BOOTSTRAP, used only
+        # to locate the contact point; the normal + travel direction the reward/critic actually use
+        # are the LOCAL ones queried at the contact point below (general for non-flat surfaces).
+        start, goal, plate_normal, plate_path_dir, _ = self._surface_frame()
         self.start_world = start
         self.goal_world = goal
-        self.surface_normal = normal
-        self.path_dir = path_dir
-        self.cross_dir = cross_dir
+        self._plate_normal = plate_normal
+        self._plate_path_dir = plate_path_dir
 
-        # The procedural cylinder's origin is its CENTER (held_pos), so its two flat
-        # ends are held_pos +/- (H/2)*cyl_axis. The CONTACT tip is the lower end
-        # (smaller projection onto the surface normal) — computed sign-robustly so we
-        # don't depend on which way the grasp leaves the held-frame +z pointing.
+        # The procedural cylinder's origin is its CENTER (held_pos), so its two flat ends are
+        # held_pos +/- (H/2)*cyl_axis. The CONTACT tip is the lower end (smaller projection onto the
+        # plate normal) — sign-robust, independent of which way the grasp leaves held-frame +z.
         self.cyl_axis = self._rotate_vec(self.held_quat, torch.tensor([0.0, 0.0, 1.0], device=self.device))
         half = 0.5 * self.cfg_task.held_asset_cfg.height
         end_plus = self.held_pos + half * self.cyl_axis
         end_minus = self.held_pos - half * self.cyl_axis
-        proj_plus = (end_plus * normal).sum(-1, keepdim=True)
-        proj_minus = (end_minus * normal).sum(-1, keepdim=True)
+        proj_plus = (end_plus * plate_normal).sum(-1, keepdim=True)
+        proj_minus = (end_minus * plate_normal).sum(-1, keepdim=True)
         self.cyl_tip = torch.where(proj_plus < proj_minus, end_plus, end_minus)
 
-        # Ideal straight path p0 -> p_g on the plate top surface. path_dir is d (unit start->goal).
+        # CONTACT POINT ("point of contact if any"): the surface point at/under the tip — the tip
+        # projected onto the surface (plate top plane through `start`). When touching, this IS the
+        # contact point; otherwise the nearest surface point, so the local frame is always defined.
+        signed_dist = ((self.cyl_tip - start) * plate_normal).sum(-1, keepdim=True)
+        self.contact_point = self.cyl_tip - signed_dist * plate_normal
+
+        # LOCAL surface frame AT THE CONTACT POINT — the normal + travel direction the reward and the
+        # critic use. General hook: a non-flat surface overrides `_surface_normal_and_dir_at` to
+        # return the LOCAL normal (surface gradient) + local tangent there. Flat plate => plate
+        # constants, so this is numerically identical to before for the flat surface.
+        normal, path_dir = self._surface_normal_and_dir_at(self.contact_point)
+        self.surface_normal = normal
+        self.path_dir = path_dir
+        self.d_lat = torch.cross(normal, path_dir, dim=-1)                    # d_lat = n x d (in-plane lateral)
+        self.cross_dir = self.d_lat
+
+        # Ideal path p0 -> p_g. path_dir is the (local) travel direction at the contact point.
         rel = self.cyl_tip - start                                            # dp = tip - p0
         self.path_length = torch.linalg.norm(goal - start, dim=-1)            # L = |p_g - p0|
-        self.d_lat = torch.cross(normal, path_dir, dim=-1)                    # d_lat = n x d (in-plane lateral)
         self.progress = (rel * path_dir).sum(-1)                             # s = dp . d (along-track)
         self.cross_track = (rel * self.d_lat).sum(-1)                        # e_perp = dp . d_lat (signed)
         self.v_along = (self.ee_linvel_fd * path_dir).sum(-1)
@@ -336,7 +368,12 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "target_normal_force": tnf,
             "prev_actions": prev_actions,
         }
-        # CRITIC — clean + privileged geometry.
+        # CRITIC — clean + privileged geometry. The contact-frame geometry (surface_normal, path_dir)
+        # is ZEROED out of contact: with no contact point there is no defined surface frame, so the
+        # critic gets a clean "no contact" signal. The INTERNAL self.surface_normal/self.path_dir stay
+        # valid (the setpoint + reward need a direction through brief bounces) — only the observed copy
+        # is gated. Raw plate pose (fixed_pos/fixed_quat) dropped: redundant with these + the setpoint.
+        _contact = self.in_contact_any.float().unsqueeze(-1)
         state_dict = {
             "setpoint_pos_rel": _setpoint_pos_rel(self.fingertip_midpoint_pos, eef_quat),
             "ee_linvel": _to_eef(self.fingertip_midpoint_linvel, eef_quat),
@@ -348,14 +385,12 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "joint_pos": self.joint_pos[:, 0:7],
             "held_pos": self.held_pos,
             "held_quat": self.held_quat,
-            "fixed_pos": self.fixed_pos,
-            "fixed_quat": self.fixed_quat,
             "task_prop_gains": self.task_prop_gains,
             "ema_factor": self.ema_factor,
             "pos_threshold": self.pos_threshold,
             "rot_threshold": self.rot_threshold,
-            "surface_normal": self.surface_normal,
-            "path_dir": self.path_dir,
+            "surface_normal": self.surface_normal * _contact,
+            "path_dir": self.path_dir * _contact,
             "progress": self.progress[:, None],
             "cross_track": self.cross_track[:, None],
             "orn_error": self.orn_error[:, None],
@@ -391,9 +426,10 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         peaking at value=0. The two action penalties (action_penalty_ee, action_grad_penalty) are
         the FactoryEnv linear penalties applied with NEGATIVE scales, both default 0.0 (off). A
         one-shot success_time bonus squashes (ideal completion time - actual success time). The
-        surface-relative terms (orientation, straightness, pace, success_time) are GATED on contact
-        with the held object — they pay 0 with no contact; force and the action penalties are not
-        gated. The scorer's _factory_scales must stay in sync with the weights/scales below.
+        surface-TRACKING terms (straightness, pace, success_time) are GATED on contact with the held
+        object — they pay 0 with no contact. Orientation is NOT gated (holding the commanded tool-vs-
+        surface angle before contact is the desired approach); force and the action penalties are
+        also ungated. The scorer's _factory_scales must stay in sync with the weights/scales below.
         """
         curr_successes = self._get_curr_successes()
         cfg = self.cfg_task
@@ -443,15 +479,17 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         )
         self.success_reward_given = self.success_reward_given | success_now
 
-        # Contact gate: with NO contact on the held object the surface-relative signals are
-        # meaningless — and would otherwise be farmable by hovering at the start (s_ref frozen at 0,
-        # progress/cross_track ~0) — so orientation / straightness / pace pay 0 off-contact. Force
-        # stays active off-contact (it drives the tool INTO the surface) and the action penalties
-        # always apply. success_time is already gated via success_now (requires in_contact_any).
+        # Contact gate: straightness / pace are surface-TRACKING signals that are meaningless (and
+        # farmable by hovering at the start: s_ref frozen at 0, progress/cross_track ~0) without
+        # contact, so they pay 0 off-contact. ORIENTATION is NOT gated — holding the commanded
+        # tool-vs-surface angle BEFORE contact is the desired approach behaviour, and orn_error is
+        # well-defined from the surface plane regardless of contact, so it pays everywhere. Force is
+        # also ungated (it drives the tool INTO the surface); action penalties always apply;
+        # success_time is gated via success_now (requires in_contact_any).
         contact = self.in_contact_any.float()
         rew_dict = {
             "force": factory_utils.squashing_fn(force_value, cfg.force_a, cfg.force_b),
-            "orientation": factory_utils.squashing_fn(orn_value, cfg.orientation_a, cfg.orientation_b) * contact,
+            "orientation": factory_utils.squashing_fn(orn_value, cfg.orientation_a, cfg.orientation_b),
             "straightness": factory_utils.squashing_fn(straightness_value, cfg.straightness_a, cfg.straightness_b) * contact,
             "pace": factory_utils.squashing_fn(pace_value, cfg.pace_a, cfg.pace_b) * contact,
             "action_penalty_ee": action_penalty_ee,

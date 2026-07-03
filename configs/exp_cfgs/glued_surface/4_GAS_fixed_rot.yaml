@@ -1,31 +1,21 @@
-# Forge Peg Insertion + Control Action Interface (ctrl-action-interface).
-# CtrlActionInterfaceWrapper is a HybridVICWrapper whose pose stiffness K, pose damping D, and
-# force stiffness K_f are produced from a CONFIG-SELECTABLE action-space formulation rather than
-# raw 6x6 matrices. Switch formulations by changing `gain_mapping` only. D is always derived from
-# K (never sampled); force control is pure stiffness (K_f, no damping). All formulations assume
-# policy actions in [-1, 1] and scale them internally.
-#
-# Action-dim formula: base 7 + 2*N + pdim + (pdim if use_hybrid_force else 0),
-#   where N = sum(force_axes) and pdim depends on gain_mapping:
-#     constant=0, variable_diagonal=6, cholesky=12, rotated=12.
-#   This config (variable_diagonal, force_axes x,y,z => N=3, hybrid on): 7 + 6 + 6 + 6 = 25.
-# NOTE: target_entropy is a PLACEHOLDER — the action dim changes with gain_mapping/hybrid, so
-# re-tune per formulation; don't read too much into the value.
-# Unknown headers/keys are hard errors; omitted sections/fields fall back to defaults.
+# Surface Path-Following — rotated stiffness frame, FIXED rotation (GAS fixed-rot).
+# Control / SAC / model config MATCHES configs/exp_cfgs/eef_glued_peg/4_GAS_fixed_rot.yaml (same gain_mapping,
+# action-space formulation, SAC hyperparameters incl. target_entropy) so the 5 control methods are
+# compared head-to-head on the surface task. Surface-specific only: task, glue on, surface reward +
+# lag/success termination, and num_agents reduced 5 -> 3. Peg-only knobs (disable_success_pred,
+# kp_z_align, insertion-reward gates, grasp_rot_mode, reset_curriculum) are omitted — not used here.
 
 runner_cfg:
   task: Isaac-FlatSurfaceFollow-Direct-v0
   agent_type: sac
-  num_envs: 256
+  num_envs: 512
   num_agents: 3
   total_timesteps: 20_100
   eval_timesteps: 150
   memory_size: 1_000_000
   seed: -1
-  glue_peg_to_gripper: true   # rigidly weld the held cylinder to the gripper (generalized weld)
-  # Surface-task params set on FlatSurfaceFollowTask via dotted env_cfg overrides.
-  # (No peg/Forge knobs: glue/grasp/disable_success_pred/kp_z_align/insertion-reward
-  # are peg-only and would error on this task.)
+  glue_peg_to_gripper: true              # rigidly weld the held cylinder to the gripper (generalized weld)
+  # Surface-task params on FlatSurfaceFollowTask via dotted env_cfg overrides.
   env_cfg_overrides:
     task.desired_speed_cm_s: 5.0
     task.force_desired_min: 2.0
@@ -34,19 +24,24 @@ runner_cfg:
     task.plate_tilt_range_deg: 10.0
     task.inhand_tilt_range_deg: [0.0, 0.0, 0.0]
     task.observe_eef_torque: false
+    task.terminate_on_lag: true
+    task.terminate_on_success: true
+    task.pace_lag_frac: 0.5
+
 loss_cfg:
   supervised_selection_enabled: false
   supervised_selection_policy_weight: 1.0
   supervised_selection_critic_weight: 0.0
 
 sac_cfg:
-  gradient_steps: 8
-  batch_size: 1024
+  tensorboard: false        # log ONLY to wandb (requires experiment.wandb: true)
+  gradient_steps: 2
+  batch_size: 2048
   discount_factor: 0.99
   polyak: 0.005
   actor_lr: 1.0e-4
   critic_lr: 1.0e-4
-  entropy_lr: 1.0e-5
+  entropy_lr: 3.0e-5
   weight_decay: 1.0e-2
   random_timesteps: 0
   learning_starts: 300
@@ -59,20 +54,22 @@ sac_cfg:
   observation_preprocessor_kwargs: {}
   rewards_shaper_scale: 0.1
   gripper_action_idx: null
-  phase_split_families: []  # surface task has no engagement phases
+  phase_split_families: []        # peg-only (needs per_env_curr_engaged); OFF for surface
   recorder:
     enabled: false
   experiment:
-    directory: glued_surface #sac_forge_pih_v1
+    directory: glued_surface
     experiment_name: "4_GAS_fixed_rot.yaml"
     write_interval: 150
     checkpoint_interval: auto
+    wandb: true
+    wandb_kwargs:
+      entity: hur
 
 model_cfg:
   actor:
     act_init_std: 1.0
-    selection_distribution: product  # hybrid-only: "product" (independent) or "match" (selection-conditioned)
-    selection_init_bias: -2.2         # hybrid-only: sigmoid(-2.2)~=0.10 force prob => ~90% position-dominant at init
+    selection_distribution: product
     actor_n: 2
     actor_latent: 512
     last_layer_scale: 0.1
@@ -82,10 +79,10 @@ model_cfg:
     reduction: sum
     use_state_dependent_std: false
     bernoulli_action_dims: null
-    force_zero_action_dims: null   # dim 6 (success-pred) force-zeroed by runner_cfg.disable_success_pred; full_orientation_control keeps Rx/Ry learnable
+    force_zero_action_dims: null
     scale_down_action_dims: [0, 1, 2]   # apply last_layer_scale to ONLY the 6 pose deltas (3 pos + 3 orient); gain/selection dims stay unshrunk so they explore
   critic:
-    critic_output_init_mean: 0.0 #50 before
+    critic_output_init_mean: 0.0
     critic_n: 4
     critic_latent: 1024
     clip_actions: false
@@ -152,6 +149,7 @@ controller_cfg:
   # When true, also set the actor's force_zero_action_dims=null so Rx/Ry are learnable, and
   # tune rot_action_bounds (it now governs the orientation cone). Wrapper control types only.
   full_orientation_control: true
+  orientation_obs_mode: "6d_rot_mat"   # standardized: same orientation obs across all methods
 
   # ---- rotation action scaling / per-step clip (Forge defaults) ----
   # rot_action_bounds: action[3:6] scaled to this (rad); governs the orientation cone when
@@ -192,8 +190,8 @@ controller_cfg:
 
 sensor_cfg:
   contact:
-    enabled: true                  # mount an IsaacLab ContactSensor on the peg, filtered vs the hole
-    contact_force_threshold: 1.0 #TODO   # N; per-axis EE-frame |force| above this => in contact (1.0 matches upstream)
-    log_contact_state: false        # log Contact / In-Contact {X,Y,Z,Any} fractions to TensorBoard
+    enabled: true
+    contact_force_threshold: 1.0
+    log_contact_state: false
     append_to_policy_obs: false
-    append_to_critic_state: false
+    append_to_critic_state: true

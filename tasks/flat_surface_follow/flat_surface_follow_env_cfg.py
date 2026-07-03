@@ -92,8 +92,8 @@ class FlatSurfaceFollowEnvCfg(ForgeEnvCfg):
         "joint_pos",
         "held_pos",
         "held_quat",
-        "fixed_pos",
-        "fixed_quat",
+        # Raw plate pose (fixed_pos/fixed_quat) intentionally DROPPED: redundant with the
+        # setpoint + the local surface_normal/path_dir (computed at the contact point) below.
         "task_prop_gains",
         "ema_factor",
         "pos_threshold",
