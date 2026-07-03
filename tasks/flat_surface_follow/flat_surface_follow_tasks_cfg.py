@@ -153,9 +153,12 @@ class FlatSurfaceFollowTask(ForgeTask):
     success_time_a: float = 1.0                    # squashing steepness over the time error (SECONDS)
     success_time_b: float = 0.0
 
-    # Action penalties (linear, exactly as in FactoryEnv; NOT squashed) are inherited from
-    # FactoryTask: action_penalty_ee_scale and action_grad_penalty_scale, both default 0.0 (off).
-    # _get_rewards applies them with negative scales. Raise action_grad_penalty_scale to damp chatter.
+    # Action penalties (linear, from FactoryEnv; NOT squashed). NOTE: ForgeTask (our parent) sets
+    # action_grad_penalty_scale=0.1 (peg-tuned), which unfairly penalized the higher action-dim
+    # control methods on the surface — so we EXPLICITLY zero BOTH here: no action punishment.
+    # _get_rewards applies them with negative scales; raise to re-enable.
+    action_penalty_ee_scale: float = 0.0
+    action_grad_penalty_scale: float = 0.0
 
     # --- Procedural primitive spawns ---
     # Plate: kinematic so it never drifts under the cylinder's normal force.
