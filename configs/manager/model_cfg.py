@@ -15,6 +15,18 @@ class ActorCfg:
     """Kwargs forwarded to ``BlockSimBaActor`` (in addition to obs/act/device/num_agents)."""
 
     act_init_std: float = 0.60653066
+    second_act_init_std: float | None = None
+    """Optional SECOND initial action std for a subset of action dims. Every continuous action dim
+    starts its log_std at ``act_init_std``; the env-facing dims listed in
+    :attr:`second_act_init_std_dims` start at this value instead (e.g. a lower std to damp initial
+    exploration on the rotation / gain dims). ``None`` => every dim uses ``act_init_std``."""
+
+    second_act_init_std_dims: list[int] | None = None
+    """Env-facing action-vector indices that use :attr:`second_act_init_std` for their initial
+    log_std instead of ``act_init_std``. Same indexing as ``scale_down_action_dims``. Indices that
+    are Bernoulli/selection or force-zero dims (no continuous σ) are ignored. ``None``/``[]`` => all
+    dims use ``act_init_std``."""
+
     actor_n: int = 2
     actor_latent: int = 512
     last_layer_scale: float = 1.0

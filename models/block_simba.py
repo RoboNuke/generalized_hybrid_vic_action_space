@@ -190,6 +190,8 @@ class BlockSimBaActor(GaussianMixin, Model):
         bernoulli_action_dims: list[int] | None = None,
         force_zero_action_dims: list[int] | None = None,
         scale_down_action_dims: list[int] | None = None,
+        second_act_init_std: float | None = None,
+        second_act_init_std_dims: list[int] | None = None,
     ):
         Model.__init__(
             self,
@@ -265,21 +267,41 @@ class BlockSimBaActor(GaussianMixin, Model):
             use_state_dependent_std=use_state_dependent_std,
         ).to(device)
 
-        # log_std parameters cover ONLY continuous dims (Bernoulli has no σ).
+        # log_std parameters cover ONLY continuous dims (Bernoulli has no σ). Every continuous dim
+        # starts at act_init_std, EXCEPT env-facing dims listed in second_act_init_std_dims, which
+        # start at second_act_init_std instead (e.g. damp initial exploration on the rotation/gain
+        # dims while keeping the pose deltas at the larger default).
+        std_init = torch.full((self.num_continuous,), float(act_init_std), device=device)
+        if second_act_init_std_dims:
+            if second_act_init_std is None:
+                raise ValueError(
+                    "second_act_init_std_dims was given but second_act_init_std is None"
+                )
+            cont_pos = {d: i for i, d in enumerate(self.continuous_dims)}
+            for d in sorted(set(second_act_init_std_dims)):
+                if d < 0 or d >= self.num_actions:
+                    raise ValueError(
+                        f"second_act_init_std_dims index {d} out of range [0, {self.num_actions})"
+                    )
+                pos = cont_pos.get(d)  # None if d is a selection/Bernoulli or force-zero dim (no σ)
+                if pos is not None:
+                    std_init[pos] = float(second_act_init_std)
+        log_std_init = torch.log(std_init)  # (num_continuous,)
+
         if use_state_dependent_std:
             with torch.no_grad():
                 # State-dep std rows live at [act_dim : act_dim + std_out_dim] in the
                 # backbone, where act_dim = _policy_out_dim. We restrict consumption
                 # to the continuous-only slice (self._cont_out_idx) at runtime.
                 self.actor_mean.fc_out.bias[:, self._policy_out_dim:] = math.log(act_init_std)
+                self.actor_mean.fc_out.bias[
+                    :, self._policy_out_dim:self._policy_out_dim + self.num_continuous
+                ] = log_std_init
                 self.actor_mean.fc_out.weight[:, self._policy_out_dim:, :] *= 0.1
             self.actor_logstd = None
         else:
             self.actor_logstd = nn.ParameterList(
-                [
-                    nn.Parameter(torch.ones(1, self.num_continuous) * math.log(act_init_std))
-                    for _ in range(num_agents)
-                ]
+                [nn.Parameter(log_std_init.clone().view(1, -1)) for _ in range(num_agents)]
             ).to(device)
 
         with torch.no_grad():
