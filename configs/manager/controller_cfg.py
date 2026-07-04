@@ -94,6 +94,14 @@ class ControlCfg(ForgeCtrlCfg):
     # stiffness ellipsoid up with the same-valued grasp tilt. This rpy is the orientation in F_flip.
     fixed_rotation_rpy: list | None = None
 
+    # Fixed-rotation variant driven by the ENV's interaction frame instead of a constant rpy. When
+    # True, R is the TRUE rotation from the interaction frame (x = path direction d, z = surface
+    # normal, y = z x x = n x d) into the EEF frame, recomputed per env/step — so it changes with each
+    # plate's orientation. Requires the env to expose interaction_frame_world() (E,3,3, world<-interaction).
+    # Like fixed_rotation_rpy it FIXES R (drops the rot6d action dims); only valid with
+    # gain_mapping='rotated' and mutually exclusive with fixed_rotation_rpy.
+    fixed_rotation_from_interaction: bool = False
+
     # When True, command full 3-DOF orientation (roll/pitch/yaw) via a delta-axis-angle
     # rotation scaled by rot_action_bounds, instead of the default yaw-only map (roll/pitch
     # forced to 0). Also un-zeros the orientation observation channels (AutoMate adapter).
@@ -199,6 +207,17 @@ class ControlCfg(ForgeCtrlCfg):
                 raise ValueError(
                     "ControlCfg.fixed_rotation_rpy must be length 3 [roll, pitch, yaw] (degrees), "
                     f"got {self.fixed_rotation_rpy!r}"
+                )
+        if self.fixed_rotation_from_interaction:
+            if self.gain_mapping != "rotated":
+                raise ValueError(
+                    "ControlCfg.fixed_rotation_from_interaction is only valid with gain_mapping='rotated'; "
+                    f"got gain_mapping={self.gain_mapping!r}."
+                )
+            if self.fixed_rotation_rpy is not None:
+                raise ValueError(
+                    "ControlCfg.fixed_rotation_from_interaction and fixed_rotation_rpy are mutually "
+                    "exclusive (both fix R — pick one)."
                 )
 
         # control_type-specific force_axes consistency (each wrapper also re-checks).

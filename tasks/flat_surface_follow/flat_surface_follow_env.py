@@ -44,6 +44,12 @@ class FlatSurfaceFollowEnv(ForgeEnv):
                 if "ft_torque_eef" not in order:
                     order.append("ft_torque_eef")
         super().__init__(cfg, render_mode, **kwargs)
+        # Interaction-frame axes (recomputed every _compute_intermediate_values). Initialized to a
+        # world-aligned frame (x=+x path, y=+y lateral, z=+z normal) so interaction_frame_world() is
+        # valid before the first _compute (the controller's fixed-rotation variant may read it early).
+        self.path_dir = torch.tensor([1.0, 0.0, 0.0], device=self.device).expand(self.num_envs, 3).clone()
+        self.d_lat = torch.tensor([0.0, 1.0, 0.0], device=self.device).expand(self.num_envs, 3).clone()
+        self.surface_normal = torch.tensor([0.0, 0.0, 1.0], device=self.device).expand(self.num_envs, 3).clone()
         # Per-episode desired normal force (N), sampled in _reset_idx, observed by the policy.
         self.desired_force = torch.zeros((self.num_envs,), device=self.device)
         # Pace schedule clock (s): advances by the env step dt only while in contact; drives the
@@ -145,6 +151,16 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             surface point to the tool tip). Returns (normal (E,3), path_dir (E,3)), unit vectors.
         """
         return self._plate_normal, self._plate_path_dir
+
+    def interaction_frame_world(self):
+        """(E,3,3) world<-interaction rotation — columns are the interaction-frame axes in world:
+        x = path direction d (path_dir), y = n x d (d_lat, in-plane lateral), z = surface normal.
+
+        Consumed by the controller's ``fixed_rotation_from_interaction`` stiffness variant (R =
+        R_eefᵀ @ this = the true interaction->EEF rotation, which changes with each plate's pose).
+        GENERAL across surfaces: path_dir/d_lat/surface_normal are recomputed each step at the
+        contact point via _surface_normal_and_dir_at, so this is the LOCAL frame for curved surfaces too."""
+        return torch.stack([self.path_dir, self.d_lat, self.surface_normal], dim=-1)
 
     # ------------------------------------------------------------------
     # Scene: procedural plate (fixed) + cylinder (held)
@@ -261,10 +277,13 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # frame, NOT world — so rotate it to world (by the sensor body's world quaternion) BEFORE
         # projecting onto the world-frame normal. Dotting the sensor-frame force against the world
         # normal (the old code) is only correct when the tool is axis-aligned with world; it breaks
-        # as soon as the plate/tool tilts. Positive => pressing into the surface (flip if needed).
+        # as soon as the plate/tool tilts. NEGATED so pressing into the surface reads POSITIVE:
+        # verified under contact in surface_baselines-v2 the raw (force_world . outward_normal) is
+        # NEGATIVE when pressing (~-6 N), which made force_value = desired - measured blow up and the
+        # force reward crash exactly as contact increased. The sign flip makes measured ~ +desired.
         sensor_quat = self._robot.data.body_quat_w[:, self.force_sensor_body_idx]
         force_world = quat_apply(sensor_quat, self.force_sensor_world_smooth[:, 0:3])
-        self.measured_normal_force = (force_world * normal).sum(-1)
+        self.measured_normal_force = -(force_world * normal).sum(-1)
 
         # Orientation: angle of the held object's z-axis to the surface PLANE
         # (asin(|axis . normal|); 90deg = perpendicular/tip-down, 0deg = lying in the plane). The

@@ -102,11 +102,16 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         self._mode = cfg.gain_mapping
         self._use_hybrid = cfg.use_hybrid_force
         self._full = bool(cfg.full_gain_matrix)
-        # Fixed-rotation variant of ``rotated``: when fixed_rotation_rpy is supplied the R
-        # frame is constant (config-defined) rather than policy-emitted, so the rot6d action
-        # dims drop out. Only meaningful for gain_mapping="rotated" (validated in the cfg).
-        self._fixed_rpy = cfg.fixed_rotation_rpy if self._mode == "rotated" else None
-        self._fixed_rot = self._fixed_rpy is not None
+        # Fixed-rotation variants of ``rotated`` (R is NOT policy-emitted, so the rot6d dims drop):
+        #   * fixed_rotation_rpy set          -> R = a constant config frame.
+        #   * fixed_rotation_from_interaction -> R = the TRUE interaction->EEF rotation read from the
+        #     env each step (R_eefᵀ @ env.interaction_frame_world()), so it changes with each plate.
+        # Mutually exclusive (validated in cfg); both only meaningful for gain_mapping="rotated".
+        self._fixed_from_interaction = bool(cfg.fixed_rotation_from_interaction) and self._mode == "rotated"
+        self._fixed_rpy = (
+            cfg.fixed_rotation_rpy if (self._mode == "rotated" and not self._fixed_from_interaction) else None
+        )
+        self._fixed_rot = (self._fixed_rpy is not None) or self._fixed_from_interaction
         self._pdim = self._pose_pdim(self._mode, self._full, self._fixed_rot)
 
         super().__init__(env, controller_cfg, num_agents=num_agents)
@@ -119,7 +124,7 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         # roll/pitch/yaw in DEGREES (easier to author); convert to radians here.
         self._R_fixed = (
             euler_xyz_to_matrix(*[math.radians(v) for v in self._fixed_rpy], device=dev)
-            if self._fixed_rot else None
+            if self._fixed_rpy is not None else None
         )
 
         # Held asset's NOMINAL in-hand frame is the EEF flipped 180° about y. This mirrors
@@ -580,6 +585,12 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         ``_log_stiffness_frame_metrics`` still assume world axes — they're corrected in the
         visualization stage (compose with ``R_eef`` for drawing / metrics).
         """
+        if self._fixed_from_interaction:
+            # True interaction->EEF rotation, per env/step: R = R_(eef<-world) @ R_(world<-interaction).
+            env = self.unwrapped
+            R_eef = matrix_from_quat(env.fingertip_midpoint_quat)     # (E,3,3) world<-eef
+            R_int = env.interaction_frame_world()                     # (E,3,3) world<-interaction
+            return R_eef.transpose(1, 2) @ R_int                      # (E,3,3) eef<-interaction
         if self._fixed_rot:
             return self._R_fixed.expand(a.shape[0], 3, 3)
         return rotation_6d_to_matrix(a[:, -6:])
