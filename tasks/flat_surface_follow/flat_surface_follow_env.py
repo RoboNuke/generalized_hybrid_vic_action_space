@@ -277,23 +277,25 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # frame, NOT world — so rotate it to world (by the sensor body's world quaternion) BEFORE
         # projecting onto the world-frame normal. Dotting the sensor-frame force against the world
         # normal (the old code) is only correct when the tool is axis-aligned with world; it breaks
-        # as soon as the plate/tool tilts. NEGATED so pressing into the surface reads POSITIVE:
-        # verified under contact in surface_baselines-v2 the raw (force_world . outward_normal) is
-        # NEGATIVE when pressing (~-6 N), which made force_value = desired - measured blow up and the
-        # force reward crash exactly as contact increased. The sign flip makes measured ~ +desired.
+        # as soon as the plate/tool tilts. NO negation: verified under contact in surface_baselines-v2
+        # (which ran this raw form) that (force_world . outward_normal) reads POSITIVE (~+5.5 N) when
+        # pressing, and force reward = squashing(desired - measured) correctly rose as the press
+        # matched the target (corr +0.94). (An earlier transient -6 N reading was a query artifact.)
         sensor_quat = self._robot.data.body_quat_w[:, self.force_sensor_body_idx]
         force_world = quat_apply(sensor_quat, self.force_sensor_world_smooth[:, 0:3])
-        self.measured_normal_force = -(force_world * normal).sum(-1)
+        self.measured_normal_force = (force_world * normal).sum(-1)
 
-        # Orientation: angle of the held object's z-axis to the surface PLANE
-        # (asin(|axis . normal|); 90deg = perpendicular/tip-down, 0deg = lying in the plane). The
-        # cylinder is axisymmetric, so only this plane angle is constrained (free about the normal).
-        # REALIZED from the physics held orientation. orn_error = desired - actual (signed, degrees)
-        # — the value the orientation reward squashes (and |orn_error| gates success).
-        self.held_angle_to_plane = torch.rad2deg(
-            torch.arcsin((self.cyl_axis * normal).sum(-1).abs().clamp(0.0, 1.0))
-        )
-        self.orn_error = float(self.cfg_task.orientation_desired_angle_deg) - self.held_angle_to_plane
+        # Orientation: angle between the held cylinder's long axis and the surface NORMAL, in RADIANS
+        # (arccos(|axis . normal|); 0 = axis parallel to the normal = tip-down/perpendicular, pi/2 =
+        # axis in the plane = flat). The cylinder is axisymmetric (|.| folds the axis to the acute
+        # angle), so only this axis-vs-normal angle is constrained (free to spin about the normal).
+        # REALIZED from the physics held orientation. orn_error = desired - actual (signed, RADIANS)
+        # — the value the orientation reward squashes (and |orn_error| gates success). The config gives
+        # the desired angle in DEGREES (human-readable); it is converted to radians here.
+        self.angle_from_normal = torch.arccos(
+            (self.cyl_axis * normal).sum(-1).abs().clamp(0.0, 1.0)
+        )                                                                    # rad, 0 = tip-down
+        self.orn_error = float(np.deg2rad(self.cfg_task.orientation_desired_angle_deg)) - self.angle_from_normal
 
         # --- Held-object END frame (the un-held / contact end) ---
         # Canonical "held object frame" = a frame at the un-held tip, oriented so z is the
@@ -339,9 +341,17 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             self.in_contact_any = self.measured_normal_force.abs() > 0.1
         self.interaction_exists = self.in_contact_any
 
-        # Debug series (guarded — extras may not yet have a to_log dict).
+        # Measured normal force, CONTACT-CONDITIONAL: NaN off-contact and tagged "(stat)" so
+        # block_agent's _accum_dist_stat (which drops non-finite values) means ONLY over in-contact
+        # steps. Including free-space ~0 readings pulls the average down by an ill-defined amount
+        # (it scales with the hovering fraction of the episode). Guarded — extras may lack to_log yet.
         if hasattr(self, "extras"):
-            self.extras.setdefault("to_log", {})["Force / Normal Measured"] = self.measured_normal_force.detach()
+            masked_force = torch.where(
+                self.in_contact_any,
+                self.measured_normal_force,
+                torch.full_like(self.measured_normal_force, float("nan")),
+            )
+            self.extras.setdefault("to_log", {})["Force / Normal Measured (stat)"] = masked_force.detach()
 
     # ------------------------------------------------------------------
     # Observations (all EEF-frame): goal-relative pose (sign-aligned) + EEF vel/force
@@ -449,7 +459,7 @@ class FlatSurfaceFollowEnv(ForgeEnv):
     # ------------------------------------------------------------------
     def _get_curr_successes(self, success_threshold=None, check_rot=False):
         at_goal = torch.linalg.norm(self.cyl_tip - self.goal_world, dim=-1) < self.cfg_task.success_pos_tol
-        oriented = self.orn_error.abs() < float(self.cfg_task.success_orn_tol_deg)  # orn_error in degrees
+        oriented = self.orn_error.abs() < float(np.deg2rad(self.cfg_task.success_orn_tol_deg))  # both radians
         return torch.logical_and(at_goal, oriented)
 
     def _get_rewards(self):
@@ -472,8 +482,9 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # Force tracking: desired (sampled, along the surface normal) - measured normal force
         # (world-rotated EEF force projected onto the surface normal, for a same-frame difference).
         force_value = self.desired_force - self.measured_normal_force          # (E,) N, signed
-        # Orientation: desired plane angle - realized plane angle (self.orn_error, deg, signed).
-        orn_value = self.orn_error                                            # (E,) deg, signed
+        # Orientation: desired - realized angle between the tool axis and the surface normal
+        # (self.orn_error, RADIANS, signed; 0 = held exactly at the commanded angle).
+        orn_value = self.orn_error                                            # (E,) rad, signed
         # Straightness: signed cross-track error e_perp = dp . d_lat (computed in _compute).
         straightness_value = self.cross_track                                # (E,) m, signed
         # Pace: along-track error vs the moving setpoint s_ref (computed in _compute from the pace

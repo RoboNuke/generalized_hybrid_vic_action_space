@@ -65,8 +65,8 @@ class FlatSurfaceFollowEnvCfg(ForgeEnvCfg):
     events: FlatSurfaceFollowEventCfg = FlatSurfaceFollowEventCfg()
 
     # Long enough to traverse plate_length (0.20 m) at desired_speed_cm_s (5 cm/s) = 4 s,
-    # with margin for approach + settling.
-    episode_length_s = 15.0
+    # with margin for approach + settling. 10 s = 150 control steps at 15 Hz.
+    episode_length_s = 10.0
 
     # POLICY obs (all EEF-frame): MOVING-SETPOINT pose relative to the tool (sign-aligned) + the
     # scalar s_ref, EEF-frame velocities + force, command setpoints. NO final-goal observation —

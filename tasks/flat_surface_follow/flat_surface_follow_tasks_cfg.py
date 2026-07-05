@@ -25,8 +25,8 @@ _PLATE_LENGTH = 0.20      # extent along the near->far traverse direction (plate
 _PLATE_WIDTH = 0.20       # extent across the path (plate local +y)
 _PLATE_THICKNESS = 0.02   # plate local +z
 _PLATE_CENTER = (0.55, 0.0, 0.10)
-_CYL_LENGTH = 0.10        # cylinder long axis (held local +z)
-_CYL_DIAMETER = 0.012
+_CYL_LENGTH = 0.15        # cylinder long axis (held local +z)
+_CYL_DIAMETER = 0.008
 
 
 @configclass
@@ -102,33 +102,36 @@ class FlatSurfaceFollowTask(ForgeTask):
     # Convention: each term computes a RAW SIGNED value from REALIZED (measured/physics) state —
     # never control targets — and maps it through the keypoint squashing function
     #     r = weight * squashing_fn(value, a, b),   squashing_fn(x,a,b) = 1/(e^{a*x}+b+e^{-a*x})
-    # which peaks at value=0 (perfect match). Each term carries its own weight + (a, b).
+    # which peaks at value=0 (perfect match). Each term carries its own weight + (a, b). With b=-1 the
+    # peak is 1/(2+b)=1, so `weight` IS each term's max per-step contribution (terms balance directly).
     #
     # Force tracking: value = desired_force - (measured EEF force projected onto the surface normal).
     # The desired force acts along the surface-normal (z); it is sampled once per episode in
     # [force_desired_min, force_desired_max] (N), observed by the policy, and the measured EEF force
     # is projected onto the world surface normal for a fair (same-frame) difference.
-    force_desired_min: float = 2.0                # N
+    force_desired_min: float = 10.0               # N (fixed target for training: min == max => no per-run variation)
     force_desired_max: float = 10.0               # N
     force_weight: float = 1.0
-    force_a: float = 0.5                          # squashing steepness over the force error (N)
-    force_b: float = 0.0
-    # Orientation constraint: value = orientation_desired_angle_deg - (angle of the held object's
-    # z-axis to the surface PLANE). Angle-to-plane = asin(|held_z . normal|): 90deg = perpendicular
-    # (tip-down), 0deg = lying in the plane. Free to rotate about the normal (only the plane angle is
-    # constrained). Realized from the physics held-object orientation.
-    orientation_desired_angle_deg: float = 90.0   # desired angle of the tool axis to the surface plane
+    force_a: float = 1.0                          # squashing steepness over the force error (N)
+    force_b: float = -1.0                         # peak = 1
+    # Orientation constraint: value = desired - (angle between the held object's z-axis and the
+    # surface NORMAL), computed in RADIANS. angle-from-normal = arccos(|held_z . normal|): 0 = axis
+    # parallel to the normal (tip-down/perpendicular), pi/2 = axis in the plane (flat). Free to rotate
+    # about the normal (only this angle is constrained). Realized from the physics held orientation.
+    # This field is DEGREES (readable) but the env converts to radians, so orientation_a acts on RAD.
+    orientation_desired_angle_deg: float = 10.0   # desired tool-axis angle OFF the surface normal (deg)
     orientation_weight: float = 1.0
-    orientation_a: float = 0.1                    # squashing steepness over the angle error (deg)
-    orientation_b: float = 0.0
+    orientation_a: float = 5.0                    # squashing steepness over the angle error (RADIANS)
+    orientation_b: float = -1.0                   # peak = 1
     # Near-surface gate for the orientation reward: it pays ONLY when the tool tip is within this
     # height (m) above the contact point (tip_surface_dist < gate; contact/penetration count). Keeps
     # "hold the commanded angle on final approach" but prevents farming it while hovering high.
     orientation_gate_dist: float = 0.01           # 1 cm
 
     # Contact bonus: per-step +1 while the held object is in contact (0 otherwise), scaled by weight.
-    # Direct incentive to make/maintain contact — the lever against the hover-and-orient local optimum.
-    contact_weight: float = 1.0
+    # DISABLED (0.0): with the force reward working, contact is driven by force tracking — no separate
+    # bonus needed, and it was the dominant lingering incentive. Re-enable if contact regresses.
+    contact_weight: float = 0.0
     # Straightness + pace (both built on the ideal straight path p0->p_g on the plate top surface):
     #   d   = unit start->goal direction; L = |p_g - p0| (path length, m); dp = tip - p0
     #   s     = dp . d            (along-track position, m)
@@ -137,11 +140,11 @@ class FlatSurfaceFollowTask(ForgeTask):
     #   e_pace= s - s_ref         (pace error, signed, m)             -> PACE value
     # Tracking s_ref makes the tool reach the surface then trace the line at the desired speed.
     straightness_weight: float = 1.0
-    straightness_a: float = 20.0                  # squashing steepness over the cross-track error (m)
-    straightness_b: float = 0.0
+    straightness_a: float = 100.0                 # squashing steepness over the cross-track error (m)
+    straightness_b: float = -1.0                  # peak = 1
     pace_weight: float = 1.0
-    pace_a: float = 20.0                          # squashing steepness over the pace error (m)
-    pace_b: float = 0.0
+    pace_a: float = 50.0                          # squashing steepness over the pace error (m)
+    pace_b: float = -1.0                          # peak = 1
 
     # Time-to-success bonus: ONE-SHOT, paid on the first step success is reached. value = t* - t_succ
     # where t* = (first-contact time) + path_length / desired_speed is the ideal completion time and
@@ -149,9 +152,11 @@ class FlatSurfaceFollowTask(ForgeTask):
     # squashing_fn peaks (value=0) when success lands exactly at the ideal time, penalizing dawdling
     # AND cutting the path short. NOTE: this fires once per episode, so to make it count against the
     # per-step terms (which accumulate over ~hundreds of steps) scale success_time_weight up (10s-100s).
-    success_time_weight: float = 1.0
+    success_time_weight: float = 600.0             # = max dense reward over a 150-step (10 s) episode
+                                                   # (4 dense terms x peak 1 x 150), so an on-time success is
+                                                   # always >= the full dense sum: it is always best to succeed.
     success_time_a: float = 1.0                    # squashing steepness over the time error (SECONDS)
-    success_time_b: float = 0.0
+    success_time_b: float = -1.0                   # peak = 1
 
     # Action penalties (linear, from FactoryEnv; NOT squashed). NOTE: ForgeTask (our parent) sets
     # action_grad_penalty_scale=0.1 (peg-tuned), which unfairly penalized the higher action-dim
