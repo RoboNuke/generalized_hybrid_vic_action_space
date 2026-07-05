@@ -275,15 +275,15 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # Measured normal force = projection of the FT force onto the true surface normal.
         # The raw smoothed force (force_sensor_world_smooth) is in the force_sensor child-joint
         # frame, NOT world — so rotate it to world (by the sensor body's world quaternion) BEFORE
-        # projecting onto the world-frame normal. Dotting the sensor-frame force against the world
-        # normal (the old code) is only correct when the tool is axis-aligned with world; it breaks
-        # as soon as the plate/tool tilts. NO negation: verified under contact in surface_baselines-v2
-        # (which ran this raw form) that (force_world . outward_normal) reads POSITIVE (~+5.5 N) when
-        # pressing, and force reward = squashing(desired - measured) correctly rose as the press
-        # matched the target (corr +0.94). (An earlier transient -6 N reading was a query artifact.)
-        sensor_quat = self._robot.data.body_quat_w[:, self.force_sensor_body_idx]
-        force_world = quat_apply(sensor_quat, self.force_sensor_world_smooth[:, 0:3])
-        self.measured_normal_force = (force_world * normal).sum(-1)
+        # projecting onto the world-frame normal. force_sensor_world_smooth is ALREADY world (Forge:
+        # get_link_incoming_joint_force, EMA-smoothed; change_FT_frame re-references only the torque
+        # via identity rotation, so the FORCE vector stays world). Project it DIRECTLY onto the world
+        # normal — NO quat_apply. The old quat_apply(sensor_quat, ...) double-rotated a world vector,
+        # making the sign depend on tool orientation (+ tip-down, - when tilted off the normal). Sign
+        # verified by a contact smoke test: this reads POSITIVE when pressing into the surface (matches
+        # desired_force > 0) and is orientation-INDEPENDENT (world force . world normal), so it no
+        # longer flips as the tool tilts.
+        self.measured_normal_force = (self.force_sensor_world_smooth[:, 0:3] * normal).sum(-1)
 
         # Orientation: angle between the held cylinder's long axis and the surface NORMAL, in RADIANS
         # (arccos(|axis . normal|); 0 = axis parallel to the normal = tip-down/perpendicular, pi/2 =
@@ -357,19 +357,24 @@ class FlatSurfaceFollowEnv(ForgeEnv):
     # Observations (all EEF-frame): goal-relative pose (sign-aligned) + EEF vel/force
     # ------------------------------------------------------------------
     def _fingertip_wrench(self):
-        """Clean 6-D wrench (F, T) re-expressed in the fingertip-midpoint frame.
+        """Clean 6-D wrench (F, T) expressed in the fingertip-midpoint (EEF) frame.
 
-        Same sensor->fingertip reframe the control wrapper uses (``change_FT_frame`` with
-        the live sensor + fingertip body poses): rotate F and T into the fingertip frame and
-        re-reference the torque to the fingertip origin. So the observed force/torque is in
-        the same frame the policy acts/controls in.
+        force_sensor_world_smooth is in the WORLD frame (Forge: get_link_incoming_joint_force,
+        EMA-smoothed; its change_FT_frame keeps identity rotation, so the force vector stays world).
+        Express it in the EEF frame the policy acts/controls in: (1) re-reference the torque from the
+        sensor origin to the fingertip origin (add (p_sensor - p_fingertip) x F, world frame), then
+        (2) rotate both F and T by the fingertip's world->local rotation. The result is BODY-FIXED —
+        independent of the randomized world/plate orientation. (The prior version mislabeled the
+        world force as sensor-frame in change_FT_frame, over-rotating it by R_sensor.)
         """
         raw = self.force_sensor_world_smooth
-        bq = self._robot.data.body_quat_w
+        F_w, T_w = raw[:, 0:3], raw[:, 3:6]
         bp = self._robot.data.body_pos_w
-        sframe = (bq[:, self.force_sensor_body_idx], bp[:, self.force_sensor_body_idx])
-        fframe = (bq[:, self.fingertip_body_idx], bp[:, self.fingertip_body_idx])
-        return forge_utils.change_FT_frame(raw[:, 0:3], raw[:, 3:6], sframe, fframe)
+        fq = self._robot.data.body_quat_w[:, self.fingertip_body_idx]           # world<-fingertip
+        r = bp[:, self.force_sensor_body_idx] - bp[:, self.fingertip_body_idx]  # sensor - fingertip (world)
+        T_at_ft_w = T_w + torch.cross(r, F_w, dim=-1)                           # move reference to fingertip origin
+        fq_conj = torch_utils.quat_conjugate(fq)                               # fingertip<-world
+        return quat_apply(fq_conj, F_w), quat_apply(fq_conj, T_at_ft_w)
 
     def _get_observations(self):
         setpoint_pos = self.setpoint_pos
@@ -383,7 +388,7 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         def _to_eef(vec, eef_quat):
             return quat_apply(torch_utils.quat_conjugate(eef_quat), vec)
 
-        F_ft, T_ft = self._fingertip_wrench()  # clean fingertip-frame wrench
+        F_ft, T_ft = self._fingertip_wrench()  # clean EEF-frame wrench
         force_noise = torch.randn((self.num_envs, 3), device=self.device) * float(self.cfg.obs_rand.ft_force)
 
         tnf = self.desired_force[:, None]  # per-episode desired normal force (the force target)
