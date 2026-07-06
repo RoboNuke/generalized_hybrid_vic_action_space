@@ -71,6 +71,20 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.cq_starts = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         self.cq_breaks = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         self.cq_prev = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        # Keypoint gating: keypoints_met = # of checkpoints crossed IN CONTACT, in order; prev_progress
+        # for the from-below crossing test. Reset each episode.
+        self.keypoints_met = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        self.prev_progress = torch.zeros((self.num_envs,), device=self.device)
+        # Derived each _compute from L/(v*dt); placeholder until then (blocks keypoint-gated success).
+        self.keypoint_spacing = 1e-6
+        self.keypoints_total = torch.ones((self.num_envs,), dtype=torch.long, device=self.device)
+        # Drag-performance accumulators over IN-CONTACT steps (running count/sum/sumsq -> per-rollout
+        # mean+std for force / along-speed / perp-speed / theta(deg)). Published as drag_performance/*.
+        self.drag_count = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        self._drag_metrics = ("force", "speed_d", "speed_perp", "theta")
+        for _n in self._drag_metrics:
+            setattr(self, f"drag_sum_{_n}", torch.zeros((self.num_envs,), device=self.device))
+            setattr(self, f"drag_sumsq_{_n}", torch.zeros((self.num_envs,), device=self.device))
         # Per-episode tensors the efficient-reset wrapper must carry across per-env teleport resets.
         # Their fresh-episode values are captured in the post-full-reset cache (pace_tau=0,
         # t_contact=+inf, success_reward_given=False, desired_force=sampled), so a donor copy on a
@@ -84,7 +98,11 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "cq_starts",
             "cq_breaks",
             "cq_prev",
-        )
+            "keypoints_met",
+            "prev_progress",
+            "drag_count",
+        ) + tuple(f"drag_sum_{_n}" for _n in self._drag_metrics) \
+          + tuple(f"drag_sumsq_{_n}" for _n in self._drag_metrics)
 
     # ------------------------------------------------------------------
     # Small geometry helpers
@@ -263,6 +281,7 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.progress = (rel * path_dir).sum(-1)                             # s = dp . d (along-track)
         self.cross_track = (rel * self.d_lat).sum(-1)                        # e_perp = dp . d_lat (signed)
         self.v_along = (self.ee_linvel_fd * path_dir).sum(-1)
+        self.v_perp = (self.ee_linvel_fd * self.d_lat).sum(-1)               # in-plane perp speed (m/s), signed
 
         # Moving along-track setpoint s_ref = clamp(v*tau, 0, L) (tau = pace clock, advanced in
         # _get_rewards). The setpoint POINT is at arc-length s_ref along the path on the surface;
@@ -271,6 +290,13 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         v_des = float(self.cfg_task.desired_speed_cm_s) / 100.0              # cm/s -> m/s
         self.s_ref = (v_des * self.pace_tau).clamp_min(0.0).minimum(self.path_length)
         self.setpoint_pos = start + self.s_ref.unsqueeze(-1) * path_dir
+
+        # Keypoints = the ideal setpoint waypoints, spaced v*dt (setpoint travel per step); their COUNT
+        # is L/(v*dt) = the ideal traversal-step count, NOT a free parameter. To succeed the tool must
+        # reach ALL of them IN CONTACT, in order (frontier logic in _get_rewards).
+        step_dt = float(getattr(self, "step_dt", self.physics_dt * self.cfg.decimation))
+        self.keypoint_spacing = max(v_des * step_dt, 1e-6)
+        self.keypoints_total = torch.floor(self.path_length / self.keypoint_spacing).clamp_min(1.0).long()
 
         # Measured normal force = projection of the FT force onto the true surface normal.
         # The raw smoothed force (force_sensor_world_smooth) is in the force_sensor child-joint
@@ -465,7 +491,11 @@ class FlatSurfaceFollowEnv(ForgeEnv):
     def _get_curr_successes(self, success_threshold=None, check_rot=False):
         at_goal = torch.linalg.norm(self.cyl_tip - self.goal_world, dim=-1) < self.cfg_task.success_pos_tol
         oriented = self.orn_error.abs() < float(np.deg2rad(self.cfg_task.success_orn_tol_deg))  # both radians
-        return torch.logical_and(at_goal, oriented)
+        success = torch.logical_and(at_goal, oriented)
+        if bool(self.cfg_task.require_keypoints_for_success):
+            # Must have DRAGGED through every keypoint in contact (no fly-to-goal shortcut).
+            success = success & (self.keypoints_met >= self.keypoints_total)
+        return success
 
     def _get_rewards(self):
         """Reward = bounded task terms + the Factory action penalties.
@@ -475,11 +505,11 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         peaking at value=0. The two action penalties (action_penalty_ee, action_grad_penalty) are
         the FactoryEnv linear penalties applied with NEGATIVE scales, both default 0.0 (off). A
         one-shot success_time bonus squashes (ideal completion time - actual success time), plus a
-        per-step 'contact' bonus (+contact_weight while in contact). Gating: straightness / pace pay
-        everywhere (air + contact) for a continuous tracking signal (same path d=start->goal, setpoint
-        frozen at start until contact); FORCE and success_time require contact; ORIENTATION requires
-        being NEAR the surface (tip within orientation_gate_dist of the contact point); contact / action
-        penalties are always evaluated. The scorer's _factory_scales must stay in sync with the below.
+        per-step 'contact' bonus (+contact_weight while in contact). Gating: straightness / pace pay in
+        air AND contact for a continuous tracking signal, but the AIR contribution is downweighted to
+        *_air_weight (contact pays the full *_weight); FORCE and success_time require contact; ORIENTATION
+        requires being NEAR the surface (tip within orientation_gate_dist of the contact point); contact /
+        action penalties are always evaluated. The scorer's _factory_scales must stay in sync with below.
         """
         curr_successes = self._get_curr_successes()
         cfg = self.cfg_task
@@ -530,24 +560,26 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         )
         self.success_reward_given = self.success_reward_given | success_now
 
-        # Gating. straightness / pace now pay EVERYWHERE (air + contact) for a CONTINUOUS tracking
-        # signal across touchdown: the path direction (d = start->goal) and the setpoint (frozen at
-        # start, s_ref=0, until contact — advances only in contact) are identical in both phases, so
-        # what the tool tracks in the air is exactly what it tracks the instant it contacts. In air
-        # this rewards being laterally on-line (cross_track->0) and at the start along-track (pace->0),
-        # i.e. lined up to descend. ORIENTATION pays only NEAR the surface (tip within
-        # orientation_gate_dist of the contact point; includes contact/penetration) — holds the angle
-        # on final approach without the "hover high and hold 90deg" farm. FORCE is gated on contact
-        # (no force reward off-contact: off-contact force_value = desired, which with a wide a=0.25
-        # would otherwise pay a farmable ~0.09/step in the air). contact / action penalties are always
-        # evaluated; success_time is gated via success_now (requires contact).
+        # Gating. straightness / pace pay in air AND contact for a CONTINUOUS tracking signal across
+        # touchdown (same path d=start->goal, setpoint frozen at start until contact), BUT the air
+        # contribution is DOWNWEIGHTED to *_air_weight (folded as a per-env factor = air/full weight,
+        # so the scalar scale and scorer stay = *_weight). This keeps a faint gradient for lining up
+        # over the start while making contact strictly more rewarding (kills the hover-and-track farm).
+        # ORIENTATION pays only NEAR the surface (tip within orientation_gate_dist of the contact
+        # point) — holds the angle on final approach without the "hover high and hold 90deg" farm.
+        # FORCE is gated on contact (a=0.25 off-contact would otherwise pay a farmable ~0.09/step in
+        # air). contact / action penalties always evaluate; success_time is gated via success_now.
         contact = self.in_contact_any.float()
         near_surface = (self.tip_surface_dist < float(cfg.orientation_gate_dist)).float()
+        straight_air = float(cfg.straightness_air_weight) / max(float(cfg.straightness_weight), 1e-9)
+        pace_air = float(cfg.pace_air_weight) / max(float(cfg.pace_weight), 1e-9)
+        straight_factor = torch.where(self.in_contact_any, torch.ones_like(contact), torch.full_like(contact, straight_air))
+        pace_factor = torch.where(self.in_contact_any, torch.ones_like(contact), torch.full_like(contact, pace_air))
         rew_dict = {
             "force": factory_utils.squashing_fn(force_value, cfg.force_a, cfg.force_b) * contact,
             "orientation": factory_utils.squashing_fn(orn_value, cfg.orientation_a, cfg.orientation_b) * near_surface,
-            "straightness": factory_utils.squashing_fn(straightness_value, cfg.straightness_a, cfg.straightness_b),
-            "pace": factory_utils.squashing_fn(pace_value, cfg.pace_a, cfg.pace_b),
+            "straightness": factory_utils.squashing_fn(straightness_value, cfg.straightness_a, cfg.straightness_b) * straight_factor,
+            "pace": factory_utils.squashing_fn(pace_value, cfg.pace_a, cfg.pace_b) * pace_factor,
             "contact": contact,
             "action_penalty_ee": action_penalty_ee,
             "action_grad_penalty": action_grad_penalty,
@@ -576,6 +608,27 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.cq_starts += (c & ~self.cq_prev).long()                 # no-contact -> contact (run starts)
         self.cq_breaks += (~c & self.cq_prev).long()                 # contact -> no-contact (bounces)
         self.cq_prev = c.clone()
+
+        # --- Drag-performance accumulation (IN CONTACT) + keypoint (checkpoint) crossing ---
+        cf = c.float()
+        theta_deg = torch.rad2deg(self.angle_from_normal)
+        self.drag_count += c.long()
+        for _n, _v in (("force", self.measured_normal_force), ("speed_d", self.v_along),
+                       ("speed_perp", self.v_perp), ("theta", theta_deg)):
+            getattr(self, f"drag_sum_{_n}").add_(_v * cf)
+            getattr(self, f"drag_sumsq_{_n}").add_(_v * _v * cf)
+        # Keypoint frontier: the keypoint index at an arc-length is floor(progress / keypoint_spacing).
+        # Advance keypoints_met to the CURRENT index only if (a) in contact and (b) the PREVIOUS step's
+        # index equals the current frontier — i.e. the tool was already at the frontier, so it dragged
+        # here rather than skipping ahead in the air (an air jump makes prev-index >> frontier, blocking
+        # the advance until the tool returns and drags through). Can jump multiple keypoints in one step
+        # (fast drag) but never across an air gap. Capped at keypoints_total (~= reaching the goal).
+        Ktot = self.keypoints_total
+        kp_prev = torch.floor(self.prev_progress / self.keypoint_spacing).clamp_min(0).long().minimum(Ktot)
+        kp_curr = torch.floor(self.progress / self.keypoint_spacing).clamp_min(0).long().minimum(Ktot)
+        advance = c & (self.keypoints_met == kp_prev) & (kp_curr > self.keypoints_met)
+        self.keypoints_met = torch.where(advance, kp_curr, self.keypoints_met)
+        self.prev_progress = self.progress.clone()
         # Publish per-episode metrics for the envs finishing this step (mask = reset_buf). Snapshots
         # (new tensors), so the subsequent _reset_idx zeroing the accumulators doesn't affect them.
         # block_agent means these over the finishing envs per agent -> contact_quality/<metric>.
@@ -597,6 +650,23 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "post_contact_percentage": torch.where(contacted, self.cq_contact.float() / post_denom, nan),
         }
         self.extras["per_env_contact_quality_mask"] = self.reset_buf.clone()
+
+        # --- Drag-performance per-episode publish ---
+        # Two-level stats: per rollout compute the mean AND std of each metric over its IN-CONTACT
+        # steps; block_agent then reduces over rollouts, emitting {metric}_mean (avg-of-rollout-means)
+        # and {metric}_std (spread-of-rollout-means), plus {metric}_intra_std_mean (avg within-rollout
+        # std). NaN where a rollout never contacted, so the stat reducer skips it. keypoints_met is a
+        # plain per-rollout count (0 valid).
+        dcnt = self.drag_count.float().clamp_min(1.0)
+        dhas = self.drag_count > 0
+        drag = {"keypoints_met": self.keypoints_met.float()}
+        for _n in self._drag_metrics:
+            _m = getattr(self, f"drag_sum_{_n}") / dcnt
+            _var = (getattr(self, f"drag_sumsq_{_n}") / dcnt - _m * _m).clamp_min(0.0)
+            drag[_n] = torch.where(dhas, _m, nan)                        # per-rollout mean (in contact)
+            drag[f"{_n}_intra_std"] = torch.where(dhas, _var.sqrt(), nan)  # per-rollout within-run std
+        self.extras["per_env_drag"] = drag
+        self.extras["per_env_drag_mask"] = self.reset_buf.clone()
 
         self.prev_actions = self.actions.clone()
         self._log_factory_metrics(rew_dict, curr_successes)
@@ -686,6 +756,14 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.cq_starts = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         self.cq_breaks = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         self.cq_prev = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+
+        # Reset the keypoint + drag-performance accumulators (new rollout).
+        self.keypoints_met = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        self.prev_progress = torch.zeros((self.num_envs,), device=self.device)
+        self.drag_count = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        for _n in self._drag_metrics:
+            setattr(self, f"drag_sum_{_n}", torch.zeros((self.num_envs,), device=self.device))
+            setattr(self, f"drag_sumsq_{_n}", torch.zeros((self.num_envs,), device=self.device))
 
         self.dead_zone_thresholds = (
             torch.rand((self.num_envs, 6), dtype=torch.float32, device=self.device) * self.default_dead_zone

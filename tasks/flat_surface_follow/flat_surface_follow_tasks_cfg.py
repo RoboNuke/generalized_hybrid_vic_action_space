@@ -90,6 +90,13 @@ class FlatSurfaceFollowTask(ForgeTask):
     success_pos_tol: float = 0.01                 # cylinder tip within this of the far-edge center
     success_orn_tol_deg: float = 10.0             # |orientation error| (deg) within this of the desired
 
+    # --- Keypoint (checkpoint) gating: forces ACTUAL dragging, not a fly-to-goal shortcut ---
+    # The checkpoints are the ideal setpoint waypoints — spaced v*dt (the distance the setpoint moves
+    # per step), so their COUNT is L/(v*dt), NOT a free parameter (see keypoints_total in the env). A
+    # checkpoint is "met" only when the tool reaches it IN CONTACT, in order, without skipping ahead in
+    # the air. With require_keypoints_for_success, success needs ALL of them met.
+    require_keypoints_for_success: bool = True
+
     # --- Termination (per-env). Both default OFF. When EITHER is on, env_setup auto-attaches the
     # efficient-reset wrapper so partial resets teleport (no sim steps) instead of running Factory's
     # all-envs settling reset. terminated (failure/success) is NOT value-bootstrapped; time-out is. ---
@@ -147,6 +154,12 @@ class FlatSurfaceFollowTask(ForgeTask):
     pace_weight: float = 1.0
     pace_a: float = 50.0                          # squashing steepness over the pace error (m)
     pace_b: float = -1.0                          # peak = 1
+    # OFF-CONTACT weight for the tracking terms: straightness/pace pay their full *_weight IN CONTACT
+    # but only *_air_weight in the air. Downweighting the air contribution keeps a faint gradient for
+    # lining up over the start, while making contact strictly more rewarding (so the policy can't just
+    # hover-and-track). At 0.1 the whole air-track is at best a tenth of what contact unlocks.
+    straightness_air_weight: float = 0.1
+    pace_air_weight: float = 0.1
 
     # Time-to-success bonus: ONE-SHOT, paid on the first step success is reached. value = t* - t_succ
     # where t* = (first-contact time) + path_length / desired_speed is the ideal completion time and

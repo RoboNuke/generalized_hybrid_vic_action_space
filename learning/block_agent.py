@@ -653,6 +653,32 @@ class BlockAgent(Agent):
                                 continue
                             self._accum_scalar(i, f"contact_quality/{metric}", vals.mean())
 
+            # Per-agent drag-performance (surface task): per-env per-EPISODE rollout stats. For each
+            # key emit BOTH the mean and the std over the finishing envs -> drag_performance/{key}_mean
+            # and {key}_std. So a rollout-mean key X gives X_mean (avg over rollouts, the headline) and
+            # X_std (spread of rollout means); a rollout-std key X_intra_std gives X_intra_std_mean (the
+            # AVERAGE within-rollout std). NaN (no-contact rollouts) skipped.
+            if (
+                isinstance(infos, dict)
+                and "per_env_drag" in infos
+                and "per_env_drag_mask" in infos
+            ):
+                dmask = infos["per_env_drag_mask"]
+                if torch.is_tensor(dmask) and dmask.any():
+                    for metric, per_env_vals in infos["per_env_drag"].items():
+                        for i in range(self.num_agents):
+                            env_lo, env_hi = i * epa, (i + 1) * epa
+                            agent_mask = dmask[env_lo:env_hi]
+                            if not agent_mask.any():
+                                continue
+                            vals = per_env_vals[env_lo:env_hi][agent_mask]
+                            vals = vals[torch.isfinite(vals)]
+                            if vals.numel() == 0:
+                                continue
+                            self._accum_scalar(i, f"drag_performance/{metric}_mean", vals.mean())
+                            if vals.numel() > 1:
+                                self._accum_scalar(i, f"drag_performance/{metric}_std", vals.std())
+
             # Per-trajectory forward-distance ingestion (task-specific wrapper).
             # Wrappers like AntSuccessWrapper publish `info["per_env_episode_distance"]`
             # (the final per-env displacement for the just-ended episode) plus a
