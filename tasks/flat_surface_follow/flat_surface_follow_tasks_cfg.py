@@ -112,7 +112,9 @@ class FlatSurfaceFollowTask(ForgeTask):
     force_desired_min: float = 10.0               # N (fixed target for training: min == max => no per-run variation)
     force_desired_max: float = 10.0               # N
     force_weight: float = 1.0
-    force_a: float = 1.0                          # squashing steepness over the force error (N)
+    force_a: float = 0.25                         # squashing steepness over the force error (N); wide
+                                                  # so there's a MONOTONIC gradient from light contact
+                                                  # up to the target force (gated on contact below)
     force_b: float = -1.0                         # peak = 1
     # Orientation constraint: value = desired - (angle between the held object's z-axis and the
     # surface NORMAL), computed in RADIANS. angle-from-normal = arccos(|held_z . normal|): 0 = axis
@@ -129,8 +131,8 @@ class FlatSurfaceFollowTask(ForgeTask):
     orientation_gate_dist: float = 0.01           # 1 cm
 
     # Contact bonus: per-step +1 while the held object is in contact (0 otherwise), scaled by weight.
-    # DISABLED (0.0): with the force reward working, contact is driven by force tracking — no separate
-    # bonus needed, and it was the dominant lingering incentive. Re-enable if contact regresses.
+    # DISABLED (0.0): the CONTACT pull now comes from the contact-gated force reward (wide a=0.25),
+    # which pays only in contact and is worth up to force_weight there — no separate bonus.
     contact_weight: float = 0.0
     # Straightness + pace (both built on the ideal straight path p0->p_g on the plate top surface):
     #   d   = unit start->goal direction; L = |p_g - p0| (path length, m); dp = tip - p0

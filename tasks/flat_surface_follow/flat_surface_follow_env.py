@@ -477,8 +477,8 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         one-shot success_time bonus squashes (ideal completion time - actual success time), plus a
         per-step 'contact' bonus (+contact_weight while in contact). Gating: straightness / pace pay
         everywhere (air + contact) for a continuous tracking signal (same path d=start->goal, setpoint
-        frozen at start until contact); success_time requires contact; ORIENTATION requires being NEAR
-        the surface (tip within orientation_gate_dist of the contact point); force / contact / action
+        frozen at start until contact); FORCE and success_time require contact; ORIENTATION requires
+        being NEAR the surface (tip within orientation_gate_dist of the contact point); contact / action
         penalties are always evaluated. The scorer's _factory_scales must stay in sync with the below.
         """
         curr_successes = self._get_curr_successes()
@@ -537,12 +537,14 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # this rewards being laterally on-line (cross_track->0) and at the start along-track (pace->0),
         # i.e. lined up to descend. ORIENTATION pays only NEAR the surface (tip within
         # orientation_gate_dist of the contact point; includes contact/penetration) — holds the angle
-        # on final approach without the "hover high and hold 90deg" farm. force / contact / action
-        # penalties are always evaluated; success_time is gated via success_now (requires contact).
+        # on final approach without the "hover high and hold 90deg" farm. FORCE is gated on contact
+        # (no force reward off-contact: off-contact force_value = desired, which with a wide a=0.25
+        # would otherwise pay a farmable ~0.09/step in the air). contact / action penalties are always
+        # evaluated; success_time is gated via success_now (requires contact).
         contact = self.in_contact_any.float()
         near_surface = (self.tip_surface_dist < float(cfg.orientation_gate_dist)).float()
         rew_dict = {
-            "force": factory_utils.squashing_fn(force_value, cfg.force_a, cfg.force_b),
+            "force": factory_utils.squashing_fn(force_value, cfg.force_a, cfg.force_b) * contact,
             "orientation": factory_utils.squashing_fn(orn_value, cfg.orientation_a, cfg.orientation_b) * near_surface,
             "straightness": factory_utils.squashing_fn(straightness_value, cfg.straightness_a, cfg.straightness_b),
             "pace": factory_utils.squashing_fn(pace_value, cfg.pace_a, cfg.pace_b),
