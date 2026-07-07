@@ -10,7 +10,7 @@ runner_cfg:
   agent_type: sac
   num_envs: 512
   num_agents: 3
-  total_timesteps: 20_100
+  total_timesteps: 100_000
   eval_timesteps: 150
   memory_size: 1_000_000
   seed: -1

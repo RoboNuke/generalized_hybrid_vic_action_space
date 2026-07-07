@@ -678,6 +678,11 @@ class BlockAgent(Agent):
                             self._accum_scalar(i, f"drag_performance/{metric}_mean", vals.mean())
                             if vals.numel() > 1:
                                 self._accum_scalar(i, f"drag_performance/{metric}_std", vals.std())
+                            # Frontier: furthest any single rollout dragged (peak over the interval's
+                            # finishing envs). The " (max)" suffix makes write_tracking_data reduce by
+                            # max across the interval, so this is the true best rollout, not an average.
+                            if metric == "keypoints_met":
+                                self._accum_scalar(i, "drag_performance/keypoints_met (max)", vals.max())
 
             # Per-trajectory forward-distance ingestion (task-specific wrapper).
             # Wrappers like AntSuccessWrapper publish `info["per_env_episode_distance"]`
