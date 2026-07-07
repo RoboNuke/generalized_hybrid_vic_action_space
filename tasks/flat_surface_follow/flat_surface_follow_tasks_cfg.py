@@ -130,12 +130,12 @@ class FlatSurfaceFollowTask(ForgeTask):
     # This field is DEGREES (readable) but the env converts to radians, so orientation_a acts on RAD.
     orientation_desired_angle_deg: float = 10.0   # desired tool-axis angle OFF the surface normal (deg)
     orientation_weight: float = 1.0
-    orientation_a: float = 5.0                    # squashing steepness over the angle error (RADIANS)
+    orientation_a: float = 2.0                    # squashing steepness over the angle error (RADIANS)
     orientation_b: float = -1.0                   # peak = 1
     # Near-surface gate for the orientation reward: it pays ONLY when the tool tip is within this
     # height (m) above the contact point (tip_surface_dist < gate; contact/penetration count). Keeps
     # "hold the commanded angle on final approach" but prevents farming it while hovering high.
-    orientation_gate_dist: float = 0.01           # 1 cm
+    orientation_gate_dist: float = 0.1           # 10 cm - user changed to mostly disable this
 
     # Contact bonus: per-step +1 while the held object is in contact (0 otherwise), scaled by weight.
     # DISABLED (0.0): the CONTACT pull now comes from the contact-gated force reward (wide a=0.25),
@@ -170,7 +170,7 @@ class FlatSurfaceFollowTask(ForgeTask):
     success_time_weight: float = 600.0             # = max dense reward over a 150-step (10 s) episode
                                                    # (4 dense terms x peak 1 x 150), so an on-time success is
                                                    # always >= the full dense sum: it is always best to succeed.
-    success_time_a: float = 1.0                    # squashing steepness over the time error (SECONDS)
+    success_time_a: float = 0.25                    # squashing steepness over the time error (SECONDS)
     success_time_b: float = -1.0                   # peak = 1
 
     # Action penalties (linear, from FactoryEnv; NOT squashed). NOTE: ForgeTask (our parent) sets

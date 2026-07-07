@@ -63,6 +63,13 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # episode. Both reset each episode in _reset_idx.
         self.t_contact = torch.full((self.num_envs,), float("inf"), device=self.device)
         self.success_reward_given = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        # Latched at the FIRST success step (0 until then): the step count reached and the scaled
+        # success_time reward actually earned. Published (only for succeeding rollouts) as
+        # Episode / Steps to success and Episode_Reward/success_time_on_success.
+        self.success_step = torch.zeros((self.num_envs,), device=self.device)
+        self.success_time_earned = torch.zeros((self.num_envs,), device=self.device)
+        # This step's lag-termination flag (set in _get_dones), published as the lag-termination rate.
+        self._term_lag = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
         # Contact-quality accumulators (per episode; reset in _reset_idx). cq_contact: steps in
         # contact; cq_starts: no-contact->contact transitions (= number of contact runs); cq_breaks:
         # contact->no-contact transitions (bounces); cq_prev: previous step's contact (for transitions).
@@ -75,6 +82,7 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # for the from-below crossing test. Reset each episode.
         self.keypoints_met = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         self.prev_progress = torch.zeros((self.num_envs,), device=self.device)
+        self.prev_cross_track = torch.zeros((self.num_envs,), device=self.device)
         # Derived each _compute from L/(v*dt); placeholder until then (blocks keypoint-gated success).
         self.keypoint_spacing = 1e-6
         self.keypoints_total = torch.ones((self.num_envs,), dtype=torch.long, device=self.device)
@@ -94,12 +102,15 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "pace_tau",
             "t_contact",
             "success_reward_given",
+            "success_step",
+            "success_time_earned",
             "cq_contact",
             "cq_starts",
             "cq_breaks",
             "cq_prev",
             "keypoints_met",
             "prev_progress",
+            "prev_cross_track",
             "drag_count",
         ) + tuple(f"drag_sum_{_n}" for _n in self._drag_metrics) \
           + tuple(f"drag_sumsq_{_n}" for _n in self._drag_metrics)
@@ -280,8 +291,6 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.path_length = torch.linalg.norm(goal - start, dim=-1)            # L = |p_g - p0|
         self.progress = (rel * path_dir).sum(-1)                             # s = dp . d (along-track)
         self.cross_track = (rel * self.d_lat).sum(-1)                        # e_perp = dp . d_lat (signed)
-        self.v_along = (self.ee_linvel_fd * path_dir).sum(-1)
-        self.v_perp = (self.ee_linvel_fd * self.d_lat).sum(-1)               # in-plane perp speed (m/s), signed
 
         # Moving along-track setpoint s_ref = clamp(v*tau, 0, L) (tau = pace clock, advanced in
         # _get_rewards). The setpoint POINT is at arc-length s_ref along the path on the surface;
@@ -558,6 +567,11 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             factory_utils.squashing_fn(success_time_value, cfg.success_time_a, cfg.success_time_b),
             torch.zeros_like(t_now),
         )
+        # Latch (once, at first success): step reached + the SCALED success_time reward earned.
+        self.success_step = torch.where(success_now, self.episode_length_buf.float(), self.success_step)
+        self.success_time_earned = torch.where(
+            success_now, success_time_reward * float(cfg.success_time_weight), self.success_time_earned
+        )
         self.success_reward_given = self.success_reward_given | success_now
 
         # Gating. straightness / pace pay in air AND contact for a CONTINUOUS tracking signal across
@@ -612,9 +626,16 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # --- Drag-performance accumulation (IN CONTACT) + keypoint (checkpoint) crossing ---
         cf = c.float()
         theta_deg = torch.rad2deg(self.angle_from_normal)
+        # Drag SPEED = the rate the CONTACT POINT moves along d / perp to d, i.e. d(progress)/dt and
+        # d(cross_track)/dt — NOT the EEF finite-diff velocity. The old ee_linvel-based speed decoupled
+        # from the keypoints: the tool advances the tip by PIVOTING (rotation) while the wrist barely
+        # translates, so ee_linvel . d read ~0 even as progress/keypoints climbed. The progress rate is
+        # exactly what the keypoints count, so this speed is consistent with them.
+        v_along_prog = (self.progress - self.prev_progress) / step_dt
+        v_perp_prog = (self.cross_track - self.prev_cross_track) / step_dt
         self.drag_count += c.long()
-        for _n, _v in (("force", self.measured_normal_force), ("speed_d", self.v_along),
-                       ("speed_perp", self.v_perp), ("theta", theta_deg)):
+        for _n, _v in (("force", self.measured_normal_force), ("speed_d", v_along_prog),
+                       ("speed_perp", v_perp_prog), ("theta", theta_deg)):
             getattr(self, f"drag_sum_{_n}").add_(_v * cf)
             getattr(self, f"drag_sumsq_{_n}").add_(_v * _v * cf)
         # Keypoint frontier: the keypoint index at an arc-length is floor(progress / keypoint_spacing).
@@ -629,6 +650,7 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         advance = c & (self.keypoints_met == kp_prev) & (kp_curr > self.keypoints_met)
         self.keypoints_met = torch.where(advance, kp_curr, self.keypoints_met)
         self.prev_progress = self.progress.clone()
+        self.prev_cross_track = self.cross_track.clone()
         # Publish per-episode metrics for the envs finishing this step (mask = reset_buf). Snapshots
         # (new tensors), so the subsequent _reset_idx zeroing the accumulators doesn't affect them.
         # block_agent means these over the finishing envs per agent -> contact_quality/<metric>.
@@ -668,6 +690,18 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.extras["per_env_drag"] = drag
         self.extras["per_env_drag_mask"] = self.reset_buf.clone()
 
+        # Success-conditional per-episode stats (NaN for rollouts that did NOT succeed, so block_agent
+        # averages ONLY over successful trajectories). Full tag names -> logged verbatim.
+        succeeded = self.success_reward_given
+        self.extras["per_env_episode_stat"] = {
+            "Episode / Steps to success": torch.where(succeeded, self.success_step, nan),
+            "Episode_Reward/success_time_on_success": torch.where(succeeded, self.success_time_earned, nan),
+            # Fraction of FINISHING rollouts ending because of lag (0/1, so it averages over ALL of
+            # them, not just successes) -> lag-termination rate.
+            "Episode / Lag termination rate": self._term_lag.float(),
+        }
+        self.extras["per_env_episode_stat_mask"] = self.reset_buf.clone()
+
         self.prev_actions = self.actions.clone()
         self._log_factory_metrics(rew_dict, curr_successes)
         return rew_buf
@@ -695,10 +729,12 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         cfg = self.cfg_task
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         terminated = torch.zeros_like(time_out)
+        self._term_lag = torch.zeros_like(time_out)   # this step's lag-termination flag (for the metric)
         if bool(cfg.terminate_on_lag):
             lag = self.s_ref - self.progress                          # (E,) m, positive = behind
             lag_max = float(cfg.pace_lag_frac) * self.path_length     # (E,) m
-            terminated = terminated | ((lag > lag_max) & torch.isfinite(self.t_contact))
+            self._term_lag = (lag > lag_max) & torch.isfinite(self.t_contact)
+            terminated = terminated | self._term_lag
         if bool(cfg.terminate_on_success):
             terminated = terminated | (self._get_curr_successes() & self.in_contact_any)
         return terminated, time_out
@@ -747,9 +783,11 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.pace_tau = torch.zeros((self.num_envs,), device=self.device)
 
         # Reset the time-to-success bonus state: first-contact clock (+inf = no contact yet) and the
-        # one-shot paid flag.
+        # one-shot paid flag, plus the success step / earned-reward latches.
         self.t_contact = torch.full((self.num_envs,), float("inf"), device=self.device)
         self.success_reward_given = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        self.success_step = torch.zeros((self.num_envs,), device=self.device)
+        self.success_time_earned = torch.zeros((self.num_envs,), device=self.device)
 
         # Reset the contact-quality accumulators (new rollout).
         self.cq_contact = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
@@ -760,6 +798,7 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # Reset the keypoint + drag-performance accumulators (new rollout).
         self.keypoints_met = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         self.prev_progress = torch.zeros((self.num_envs,), device=self.device)
+        self.prev_cross_track = torch.zeros((self.num_envs,), device=self.device)
         self.drag_count = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         for _n in self._drag_metrics:
             setattr(self, f"drag_sum_{_n}", torch.zeros((self.num_envs,), device=self.device))

@@ -68,6 +68,15 @@ def build_parser() -> argparse.ArgumentParser:
              "places without editing the YAML.",
     )
     parser.add_argument(
+        "--wandb_tag",
+        type=str,
+        action="append",
+        default=None,
+        help="Append a tag to every wandb run created this launch (repeatable: "
+             "--wandb_tag a --wandb_tag b). Merged with any experiment.wandb_kwargs.tags "
+             "from the config. Makes runs easy to filter in the wandb UI.",
+    )
+    parser.add_argument(
         "--logdir",
         type=str,
         default=None,
@@ -489,6 +498,17 @@ def main(argv: list[str] | None = None) -> None:
     # without touching the YAML.
     if args.experiment_directory is not None:
         cfg.experiment.directory = args.experiment_directory
+
+    # --wandb_tag: APPEND to experiment.wandb_kwargs["tags"] (deduped, order preserved) so
+    # make_wandb_run passes them straight to wandb.init(tags=...). Merges with any config tags.
+    if getattr(args, "wandb_tag", None):
+        wk = dict(getattr(cfg.experiment, "wandb_kwargs", {}) or {})
+        tags = list(wk.get("tags") or [])
+        for t in args.wandb_tag:
+            if t and t not in tags:
+                tags.append(t)
+        wk["tags"] = tags
+        cfg.experiment.wandb_kwargs = wk
 
     # Final per-run output dir = <log_root>/<family>/<experiment_name>
     #   * log_root: --logdir CLI (e.g. "runs/", or absolute), default "runs/".

@@ -145,11 +145,10 @@ controller_cfg:
   full_orientation_control: true
   orientation_obs_mode: "6d_rot_mat"   # standardized: same orientation obs across all methods
 
-  # ---- rotation action scaling / per-step clip (Forge defaults) ----
-  # rot_action_bounds: action[3:6] scaled to this (rad); governs the orientation cone when
-  # full_orientation_control is on. rot_action_threshold: per-step clip on the orientation
-  # target change toward the current pose (rad) — becomes env.rot_threshold.
-  rot_action_bounds: [1.0, 1.0, 1.0]            # Forge default
+  # ---- rotation action scaling (rot_action_bounds REMOVED) ----
+  # EEF-relative control scales action[3:6] in [-1,1] DIRECTLY by rot_action_threshold, so it maps
+  # linearly to +/- that (rad) with no separate bound (which used to saturate the range). This value
+  # also caps the per-step change and becomes env.rot_threshold.
   rot_action_threshold: [0.097, 0.097, 0.097]   # Forge default (env.rot_threshold)
 
   # ---- hybrid force-control fields (used on force-eligible axes when use_hybrid_force) ----

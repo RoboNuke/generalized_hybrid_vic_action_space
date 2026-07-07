@@ -290,11 +290,12 @@ def compute_ctrl_targets(env, actions):
     (EEF) frame, applied to the current fingertip pose.
 
     This is the new global convention (replacing FORGE's bolt-relative, upright-locked,
-    joint-limit-yaw-wrapped scheme): ``actions[:, 0:3]`` is a Δposition (scaled by
-    ``pos_action_bounds``) expressed in the EEF frame, and ``actions[:, 3:6]`` is a Δrotation
-    (axis-angle, scaled by ``rot_action_bounds``) about the EEF axes. Both deltas are clipped
-    per-axis by ``pos_threshold`` / ``rot_threshold`` (per-step limits) and composed onto the
-    live pose:
+    joint-limit-yaw-wrapped scheme): ``actions[:, 0:3]`` is a Δposition and ``actions[:, 3:6]`` a
+    Δrotation (axis-angle) in the EEF frame, each scaled DIRECTLY by the per-step threshold
+    (``pos_threshold`` / ``rot_threshold``), so ``[-1,1]`` maps linearly to ``±threshold`` with no
+    saturation. (The old ``*_action_bounds`` scale is dropped here; it saturated the action range and
+    its goal-relative role belongs to the base Factory action, not this EEF-relative path.) The deltas
+    are composed onto the live pose:
 
         ``target_pos  = eef_pos  + R_eef · Δpos``           (Δpos rotated EEF→world)
         ``target_quat = eef_quat ∘ Δquat``                  (body-frame compose, right-mul)
@@ -307,17 +308,15 @@ def compute_ctrl_targets(env, actions):
     eef_pos = env.fingertip_midpoint_pos
     eef_quat = env.fingertip_midpoint_quat
 
-    # Scale pose actions to EEF-frame deltas: position (m) and rotation (axis-angle, rad).
-    pos_delta_eef = actions[:, 0:3] @ torch.diag(
-        torch.tensor(env.cfg.ctrl.pos_action_bounds, device=device)
-    )
-    rot_delta_eef = actions[:, 3:6] @ torch.diag(
-        torch.tensor(env.cfg.ctrl.rot_action_bounds, device=device)
-    )
-
-    # Per-step clip in the EEF frame (pos_threshold / rot_threshold are per-axis (E,3)).
-    pos_delta_eef = torch.clip(pos_delta_eef, -env.pos_threshold, env.pos_threshold)
-    rot_delta_eef = torch.clip(rot_delta_eef, -env.rot_threshold, env.rot_threshold)
+    # Scale the [-1,1] action DIRECTLY by the per-step threshold (env.pos_threshold / env.rot_threshold,
+    # per-axis (E,3), domain-randomized at reset) -> LINEAR proportional control with no dead zone:
+    # |action|<=1 maps to |delta|<=threshold. This REPLACES the old "scale by *_action_bounds, then clip
+    # to *_threshold" scheme, where bounds >> threshold (rot 1.0 vs 0.097, pos 0.05 vs 0.02) saturated
+    # most of the action range into bang-bang. *_action_bounds is no longer used on this EEF-relative
+    # delta path (its goal-relative "keep setpoints near the insertion frame" role lives in the base
+    # Factory action, not here). The clip is kept only as a no-op safety for |action|>1.
+    pos_delta_eef = torch.clip(actions[:, 0:3] * env.pos_threshold, -env.pos_threshold, env.pos_threshold)
+    rot_delta_eef = torch.clip(actions[:, 3:6] * env.rot_threshold, -env.rot_threshold, env.rot_threshold)
 
     # Position target: current + (Δpos rotated from EEF into world).
     delta_pos_world = quat_apply(eef_quat, pos_delta_eef)

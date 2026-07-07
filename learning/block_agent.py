@@ -684,6 +684,28 @@ class BlockAgent(Agent):
                             if metric == "keypoints_met":
                                 self._accum_scalar(i, "drag_performance/keypoints_met (max)", vals.max())
 
+            # Success-conditional per-episode stats: the dict key IS the full tag (e.g.
+            # "Episode / Steps to success"); mean over finishing envs per agent, NaN-skipped so only
+            # trajectories that actually succeeded (non-NaN) contribute to the average.
+            if (
+                isinstance(infos, dict)
+                and "per_env_episode_stat" in infos
+                and "per_env_episode_stat_mask" in infos
+            ):
+                emask = infos["per_env_episode_stat_mask"]
+                if torch.is_tensor(emask) and emask.any():
+                    for tag, per_env_vals in infos["per_env_episode_stat"].items():
+                        for i in range(self.num_agents):
+                            env_lo, env_hi = i * epa, (i + 1) * epa
+                            agent_mask = emask[env_lo:env_hi]
+                            if not agent_mask.any():
+                                continue
+                            vals = per_env_vals[env_lo:env_hi][agent_mask]
+                            vals = vals[torch.isfinite(vals)]
+                            if vals.numel() == 0:
+                                continue
+                            self._accum_scalar(i, tag, vals.mean())
+
             # Per-trajectory forward-distance ingestion (task-specific wrapper).
             # Wrappers like AntSuccessWrapper publish `info["per_env_episode_distance"]`
             # (the final per-env displacement for the just-ended episode) plus a

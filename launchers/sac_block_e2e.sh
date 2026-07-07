@@ -39,12 +39,16 @@ RUN_EVAL=1
 EXPERIMENT_DIRECTORY=""
 RECORD=0
 RECORD_CONFIG=""
+WANDB_TAG_FLAGS=()   # collected --wandb_tag flags, forwarded verbatim to runner.py
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --no_eval) RUN_EVAL=0 ;;
         --experiment_directory)
             [[ $# -ge 2 ]] || { echo "[launcher] --experiment_directory requires a value" >&2; exit 2; }
             EXPERIMENT_DIRECTORY="$2"; shift ;;
+        --wandb_tag)
+            [[ $# -ge 2 ]] || { echo "[launcher] --wandb_tag requires a value" >&2; exit 2; }
+            WANDB_TAG_FLAGS+=("--wandb_tag" "$2"); shift ;;
         --record) RECORD=1 ;;
         --record_config)
             [[ $# -ge 2 ]] || { echo "[launcher] --record_config requires a value" >&2; exit 2; }
@@ -135,6 +139,7 @@ TRAIN_RC=0
     --experiment_name "$EXPERIMENT_NAME" \
     --logdir "$LOGDIR" \
     "${EXP_DIR_FLAG[@]}" \
+    "${WANDB_TAG_FLAGS[@]}" \
     --mode train \
     --headless || TRAIN_RC=$?
 
@@ -177,6 +182,7 @@ if [[ "$TRAIN_HARD_FAIL" -eq 0 ]]; then
             --experiment_name "$EVAL_EXP_NAME" \
             --logdir "$LOGDIR" \
             "${EXP_DIR_FLAG[@]}" \
+            "${WANDB_TAG_FLAGS[@]}" \
             --checkpoint "$EXP_DIR" \
             --mode eval \
             --headless
