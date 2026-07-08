@@ -662,14 +662,15 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # >=1 to avoid /0 on a last-step touch. post_contact_% = contact steps / this phase length.
         post_denom = (ep_len - first_contact_step + 1.0).clamp_min(1.0)
         self.extras["per_env_contact_quality"] = {
+            # Over ALL rollouts (a no-contact rollout is a meaningful 0 here):
             "contact_percentage": self.cq_contact.float() / ep_len,                       # steps in contact / episode length
-            "avg_contact_length": self.cq_contact.float() / self.cq_starts.clamp_min(1).float(),  # mean consecutive contact run
-            "contact_breaks": self.cq_breaks.float(),                                    # # of contact->no-contact bounces
             "made_contact_rate": contacted.float(),                                      # 1 if it touched at all, else 0
-            # Conditional on having touched (NaN otherwise -> block_agent averages only over
-            # rollouts that made contact): approach speed + how well contact is held after touchdown.
-            "steps_to_first_contact": torch.where(contacted, first_contact_step, nan),
-            "post_contact_percentage": torch.where(contacted, self.cq_contact.float() / post_denom, nan),
+            # Conditional on having touched (NaN otherwise -> block_agent averages ONLY over rollouts
+            # that made contact, so a no-contact rollout doesn't drag these toward 0):
+            "avg_contact_length": torch.where(contacted, self.cq_contact.float() / self.cq_starts.clamp_min(1).float(), nan),  # mean consecutive contact run
+            "contact_breaks": torch.where(contacted, self.cq_breaks.float(), nan),        # # of contact->no-contact bounces
+            "steps_to_first_contact": torch.where(contacted, first_contact_step, nan),    # approach speed
+            "post_contact_percentage": torch.where(contacted, self.cq_contact.float() / post_denom, nan),  # contact held after touchdown
         }
         self.extras["per_env_contact_quality_mask"] = self.reset_buf.clone()
 
@@ -894,9 +895,11 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             # -normal), plus the commanded axis tilt (pitch) and free yaw noise.
             local_euler = torch.zeros((n_bad, 3), device=self.device)
             local_euler[:, 0] = np.pi
-            # Hand pitch from straight-down = the tool axis's angle to the surface NORMAL =
-            # 90 - (desired angle to the surface PLANE), so the cylinder spawns at the desired tilt.
-            local_euler[:, 1] = float(np.deg2rad(90.0 - self.cfg_task.orientation_desired_angle_deg))
+            # Hand pitch from straight-down = the tool axis's angle OFF the surface NORMAL, which IS
+            # orientation_desired_angle_deg under the current convention (0 = tip-down). So the cylinder
+            # spawns exactly at the commanded angle. (Was 90 - desired, a leftover of the old angle-to-
+            # PLANE convention, which spawned the tool ~80deg off-normal — nearly sideways.)
+            local_euler[:, 1] = float(np.deg2rad(self.cfg_task.orientation_desired_angle_deg))
             yaw_noise = (2.0 * (torch.rand((n_bad,), device=self.device) - 0.5)) * float(
                 self.cfg_task.hand_init_orn_noise[2]
             )
