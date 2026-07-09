@@ -27,7 +27,7 @@ controller_cfg:
   visualize_eef_frame: false             # actual fingertip (EEF) orientation, at the robot EEF
   eef_frame_axis_scale: 0.02
 
-  visualize_stiffness_ellipsoid: true   # translational stiffness ellipsoid (eigendecomp of K_pos)
+  visualize_stiffness_ellipsoid: false   # translational stiffness ellipsoid (eigendecomp of K_pos)
   stiffness_ellipsoid_min_scale: 0.001  # 0.2 cm semi-axis at the min gain
   stiffness_ellipsoid_max_scale: 0.01   # 2 cm   semi-axis at the max gain
   stiffness_ellipsoid_compliance: false # false=stiffness (stiff=long), true=compliance (stiff=short)
@@ -41,7 +41,7 @@ runner_cfg:
   # envs, since num_agents=1). 12 keeps the per-step GPU/camera load modest while
   # still filling the 3x4 grid from a single episode. Raise for more parallelism
   # (fewer episodes) at the cost of more simultaneous camera tiles.
-  num_envs: 24
+  num_envs: 48
   # Eval never samples the replay buffer, so keep it tiny.
   memory_size: 50_000
 
@@ -54,9 +54,9 @@ sac_cfg:
     # num_envs) full episodes (here 24/24 = 1) and selects 12 from the 24 collected.
     # All collected frame buffers are held in host RAM, so this scales memory linearly;
     # 24 keeps it safe at the larger tiles. Raise only with memory headroom.
-    num_trajectories: 24
-    width: 480                      # per-tile RGB width  (2.5x of 240, 4:3 preserved)
-    height: 360                     # per-tile RGB height (2.5x of 180, 4:3 preserved)
+    num_trajectories: 48
+    width: 560                      # per-tile RGB width  (2.5x of 240, 4:3 preserved)
+    height: 720                     # per-tile RGB height (2.5x of 180, 4:3 preserved)
     camera_pos: [1.0, 0.0, 0.35]
     camera_quat: [-0.3535534, 0.6123724, 0.6123724, -0.3535534]
     focal_length: 24.0
