@@ -90,12 +90,13 @@ class FlatSurfaceFollowTask(ForgeTask):
     success_pos_tol: float = 0.01                 # cylinder tip within this of the far-edge center
     success_orn_tol_deg: float = 10.0             # |orientation error| (deg) within this of the desired
 
-    # --- Keypoint (checkpoint) gating: forces ACTUAL dragging, not a fly-to-goal shortcut ---
-    # The checkpoints are the ideal setpoint waypoints — spaced v*dt (the distance the setpoint moves
-    # per step), so their COUNT is L/(v*dt), NOT a free parameter (see keypoints_total in the env). A
-    # checkpoint is "met" only when the tool reaches it IN CONTACT, in order, without skipping ahead in
-    # the air. With require_keypoints_for_success, success needs ALL of them met.
-    require_keypoints_for_success: bool = True
+    # --- Keypoints (checkpoints): reward the ACTUAL drag, not a fly-to-goal shortcut ---
+    # The checkpoints are evenly spaced arc-length points on the ideal path — spacing v*dt, so their
+    # COUNT is L/(v*dt), NOT a free parameter (see keypoints_total in the env). A keypoint is ACHIEVED
+    # when the tool crosses it IN CONTACT with exactly one keypoint crossed that step (a clean drag);
+    # the success reward is then weighted by achieved/total (partial credit). require_keypoints_for_
+    # success is an OPTIONAL hard gate (default off) that instead demands EVERY keypoint be achieved.
+    require_keypoints_for_success: bool = False
 
     # --- Termination (per-env). Both default OFF. When EITHER is on, env_setup auto-attaches the
     # efficient-reset wrapper so partial resets teleport (no sim steps) instead of running Factory's
@@ -116,8 +117,8 @@ class FlatSurfaceFollowTask(ForgeTask):
     # The desired force acts along the surface-normal (z); it is sampled once per episode in
     # [force_desired_min, force_desired_max] (N), observed by the policy, and the measured EEF force
     # is projected onto the world surface normal for a fair (same-frame) difference.
-    force_desired_min: float = 10.0               # N (fixed target for training: min == max => no per-run variation)
-    force_desired_max: float = 10.0               # N
+    force_desired_min: float = 5.0                # N (fixed target for training: min == max => no per-run variation)
+    force_desired_max: float = 5.0                # N
     force_weight: float = 1.0
     force_a: float = 0.25                         # squashing steepness over the force error (N); wide
                                                   # so there's a MONOTONIC gradient from light contact

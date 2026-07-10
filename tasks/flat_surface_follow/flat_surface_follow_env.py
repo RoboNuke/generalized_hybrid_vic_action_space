@@ -52,8 +52,9 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.surface_normal = torch.tensor([0.0, 0.0, 1.0], device=self.device).expand(self.num_envs, 3).clone()
         # Per-episode desired normal force (N), sampled in _reset_idx, observed by the policy.
         self.desired_force = torch.zeros((self.num_envs,), device=self.device)
-        # Pace schedule clock (s): advances by the env step dt only while in contact; drives the
-        # moving along-track setpoint s_ref. Reset to 0 each episode.
+        # Pace schedule clock (s): TIME since first contact — advances by the env step dt every step
+        # once contact has been made (NOT gated on staying in contact), driving the time-based pace
+        # setpoint s_ref = v*pace_tau used ONLY by the pace reward. Reset to 0 each episode.
         self.pace_tau = torch.zeros((self.num_envs,), device=self.device)
         # Moving setpoint (recomputed each _compute); init for safety before the first reset.
         self.s_ref = torch.zeros((self.num_envs,), device=self.device)
@@ -78,12 +79,22 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.cq_starts = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         self.cq_breaks = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         self.cq_prev = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
-        # Keypoint gating: keypoints_met = # of checkpoints crossed IN CONTACT, in order; prev_progress
-        # for the from-below crossing test. Reset each episode.
-        self.keypoints_met = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        # Keypoint accounting (all progress-projection based; see _get_rewards):
+        #  * keypoints_achieved: # crossed IN CONTACT with EXACTLY ONE keypoint crossed that step (a
+        #    clean single-keypoint drag; that one is necessarily the current setpoint). Sum -> the
+        #    success reward is weighted by achieved/total. A multi-keypoint jump achieves none.
+        #  * keypoints_passed: running-max keypoint index the projected progress has reached (crossed),
+        #    contact or not, clean or not — a pure "how far along d did we get" frontier. passed >>
+        #    achieved reveals progress-without-clean-contact vs. genuinely stalling.
+        #  * setpoint_kp_idx: the current TARGET keypoint (next one ahead of projected progress); drives
+        #    the OBSERVATION setpoint and the keypoint-ball colouring.
+        # prev_progress carries last step's progress for the per-step crossing test. Reset each episode.
+        self.keypoints_achieved = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        self.keypoints_passed = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        self.setpoint_kp_idx = torch.ones((self.num_envs,), dtype=torch.long, device=self.device)
         self.prev_progress = torch.zeros((self.num_envs,), device=self.device)
         self.prev_cross_track = torch.zeros((self.num_envs,), device=self.device)
-        # Derived each _compute from L/(v*dt); placeholder until then (blocks keypoint-gated success).
+        # Derived each _compute from L/(v*dt); placeholder until then.
         self.keypoint_spacing = 1e-6
         self.keypoints_total = torch.ones((self.num_envs,), dtype=torch.long, device=self.device)
         # Drag-performance accumulators over IN-CONTACT steps (running count/sum/sumsq -> per-rollout
@@ -108,7 +119,9 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "cq_starts",
             "cq_breaks",
             "cq_prev",
-            "keypoints_met",
+            "keypoints_achieved",
+            "keypoints_passed",
+            "setpoint_kp_idx",
             "prev_progress",
             "prev_cross_track",
             "drag_count",
@@ -292,20 +305,32 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.progress = (rel * path_dir).sum(-1)                             # s = dp . d (along-track)
         self.cross_track = (rel * self.d_lat).sum(-1)                        # e_perp = dp . d_lat (signed)
 
-        # Moving along-track setpoint s_ref = clamp(v*tau, 0, L) (tau = pace clock, advanced in
-        # _get_rewards). The setpoint POINT is at arc-length s_ref along the path on the surface;
-        # the policy/critic track this instead of the final goal, so the same interface generalizes
-        # to non-straight paths.
+        # TIME-BASED pace setpoint s_ref = clamp(v * pace_tau, 0, L), pace_tau = time since first
+        # contact (advanced every step once contacted, in _get_rewards). Drives ONLY the pace reward
+        # (progress - s_ref): the ideal keeps moving with time even off-contact, so drifting off just
+        # costs pace reward and never rewards turning around. This is NOT the observation setpoint.
         v_des = float(self.cfg_task.desired_speed_cm_s) / 100.0              # cm/s -> m/s
         self.s_ref = (v_des * self.pace_tau).clamp_min(0.0).minimum(self.path_length)
-        self.setpoint_pos = start + self.s_ref.unsqueeze(-1) * path_dir
 
-        # Keypoints = the ideal setpoint waypoints, spaced v*dt (setpoint travel per step); their COUNT
-        # is L/(v*dt) = the ideal traversal-step count, NOT a free parameter. To succeed the tool must
-        # reach ALL of them IN CONTACT, in order (frontier logic in _get_rewards).
+        # Keypoints = evenly spaced arc-length checkpoints on the ideal path p0->p_g, spacing v*dt;
+        # COUNT = L/(v*dt), NOT a free parameter. Achievement/passed accounting is in _get_rewards.
         step_dt = float(getattr(self, "step_dt", self.physics_dt * self.cfg.decimation))
         self.keypoint_spacing = max(v_des * step_dt, 1e-6)
         self.keypoints_total = torch.floor(self.path_length / self.keypoint_spacing).clamp_min(1.0).long()
+
+        # OBSERVATION setpoint = the NEXT keypoint ahead of the projected progress (contact-independent):
+        # setpoint index = floor(progress/spacing) + 1, clamped to [1, total]. Advancing purely on the
+        # along-track projection means coming off the surface and drifting along d still advances it
+        # (no turn-around incentive), and its LATERAL offset from the tip carries the "off the line"
+        # error. The policy/critic track this local keypoint instead of the far goal.
+        kp_passed_now = torch.floor(self.progress / self.keypoint_spacing).clamp_min(0).long()
+        new_setpoint = (kp_passed_now + 1).minimum(self.keypoints_total).clamp_min(1)
+        # RATCHET: the observation setpoint only ever advances. Moving backward (progress dropping)
+        # does NOT pull the target back — it stays at the furthest keypoint reached this episode.
+        # Reset to 1 in _reset_idx (and carried by the efficient-reset cache).
+        self.setpoint_kp_idx = torch.maximum(self.setpoint_kp_idx, new_setpoint)
+        setpoint_arclen = (self.setpoint_kp_idx.float() * self.keypoint_spacing).minimum(self.path_length)
+        self.setpoint_pos = start + setpoint_arclen.unsqueeze(-1) * path_dir
 
         # Measured normal force = projection of the FT force onto the true surface normal.
         # The raw smoothed force (force_sensor_world_smooth) is in the force_sensor child-joint
@@ -501,10 +526,49 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         at_goal = torch.linalg.norm(self.cyl_tip - self.goal_world, dim=-1) < self.cfg_task.success_pos_tol
         oriented = self.orn_error.abs() < float(np.deg2rad(self.cfg_task.success_orn_tol_deg))  # both radians
         success = torch.logical_and(at_goal, oriented)
+        # Keypoints no longer HARD-gate success — the success reward is instead weighted by
+        # achieved/total in _get_rewards (partial credit for the drag). The optional flag is kept
+        # (default off) for A/B tests; when on it still requires every keypoint cleanly achieved.
         if bool(self.cfg_task.require_keypoints_for_success):
-            # Must have DRAGGED through every keypoint in contact (no fly-to-goal shortcut).
-            success = success & (self.keypoints_met >= self.keypoints_total)
+            success = success & (self.keypoints_achieved >= self.keypoints_total)
         return success
+
+    def viz_snapshot(self) -> dict:
+        """Per-env quantities for the surface recorder overlays (keypoint balls, force/orientation
+        gauges, top-down path inset). Call AFTER _compute_intermediate_values has run for the step
+        (the recorder calls it right after env.step). All CPU tensors; viz-only, no training effect.
+
+        force_squash / orn_squash are the SAME squashing_fn values the reward uses (in [0, 1], 1 =
+        perfect), so the gauges read exactly what the force / orientation reward terms pay.
+        """
+        cfg = self.cfg_task
+        force_squash = factory_utils.squashing_fn(
+            self.desired_force - self.measured_normal_force, cfg.force_a, cfg.force_b
+        )
+        orn_squash = factory_utils.squashing_fn(self.orn_error, cfg.orientation_a, cfg.orientation_b)
+        # Physical read-outs for the gauges: measured normal force (N), and the tool-axis angle
+        # relative to the DESIRED angle-off-normal (deg, signed: + = more tilted than commanded).
+        angle_dev_deg = torch.rad2deg(self.angle_from_normal) - float(cfg.orientation_desired_angle_deg)
+        return {
+            "start_w": self.start_world.detach().cpu(),          # (E,3) near-edge center (path p0)
+            "goal_w": self.goal_world.detach().cpu(),            # (E,3) far-edge center (goal)
+            "path_dir": self.path_dir.detach().cpu(),            # (E,3) along-track unit dir d
+            "d_lat": self.d_lat.detach().cpu(),                  # (E,3) in-plane lateral unit dir
+            "surface_normal": self.surface_normal.detach().cpu(),# (E,3) surface normal
+            "tip_w": self.contact_point.detach().cpu(),          # (E,3) tip projected onto the surface
+            "path_length": self.path_length.detach().cpu(),      # (E,) L
+            "keypoints_total": self.keypoints_total.detach().cpu(),  # (E,) count
+            "keypoint_spacing": float(self.keypoint_spacing),    # scalar (m)
+            "progress": self.progress.detach().cpu(),            # (E,) along-track arc length
+            "s_ref": self.s_ref.detach().cpu(),                  # (E,) time-based PACE setpoint arc length
+            "in_contact": self.in_contact_any.detach().cpu().bool(),  # (E,)
+            "force_squash": force_squash.detach().cpu(),         # (E,) in [0,1] (gauge fill/colour)
+            "orn_squash": orn_squash.detach().cpu(),             # (E,) in [0,1] (gauge fill/colour)
+            "force_N": self.measured_normal_force.detach().cpu(),        # (E,) measured normal force, N
+            "desired_force_N": self.desired_force.detach().cpu(),        # (E,) target force, N
+            "angle_dev_deg": angle_dev_deg.detach().cpu(),              # (E,) deg off the desired angle
+            "tip_surface_dist": self.tip_surface_dist.detach().cpu(),  # (E,) signed height above surface
+        }
 
     def _get_rewards(self):
         """Reward = bounded task terms + the Factory action penalties.
@@ -522,6 +586,24 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         """
         curr_successes = self._get_curr_successes()
         cfg = self.cfg_task
+
+        # --- Keypoint accounting (progress-projection based; drives the success weight) ---
+        # kp index at an arc-length = floor(progress / spacing). ACHIEVED: in contact AND EXACTLY ONE
+        # keypoint crossed this step (a clean single-keypoint drag; that one is necessarily the current
+        # setpoint). A multi-keypoint jump (overshoot / fly-ahead) crosses >1 and achieves NONE, but
+        # the new setpoint still moves on to after the last one passed (via setpoint_kp_idx in
+        # _compute). PASSED: running-max keypoint index the projection has reached, achieved or not (a
+        # pure progress frontier). prev_progress is last step's value (updated at the end of this
+        # method), so this must run before that update.
+        Ktot = self.keypoints_total
+        kp_prev = torch.floor(self.prev_progress / self.keypoint_spacing).clamp_min(0).long().minimum(Ktot)
+        kp_curr = torch.floor(self.progress / self.keypoint_spacing).clamp_min(0).long().minimum(Ktot)
+        crossed = (kp_curr - kp_prev).clamp_min(0)                            # keypoints crossed forward this step
+        clean = self.in_contact_any & (crossed == 1)                         # exactly one, in contact -> achieved
+        self.keypoints_achieved = (self.keypoints_achieved + clean.long()).minimum(Ktot)
+        self.keypoints_passed = torch.maximum(self.keypoints_passed, kp_curr)
+        # Success reward weight = fraction of keypoints cleanly achieved (partial credit for the drag).
+        success_frac = self.keypoints_achieved.float() / self.keypoints_total.clamp_min(1).float()
 
         # Force tracking: desired (sampled, along the surface normal) - measured normal force
         # (world-rotated EEF force projected onto the surface normal, for a same-frame difference).
@@ -562,9 +644,12 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             & torch.isfinite(self.t_contact)
         )
         success_time_value = t_star - t_now                                  # (E,) ideal - actual, s
+        # Success reward = weight * squashing(time error) * (achieved/total). BOTH the completion-time
+        # squashing and the keypoint-achieved fraction scale the same weight, so a fast finish that
+        # skipped keypoints is discounted in proportion to how much of the path it actually dragged.
         success_time_reward = torch.where(
             success_now,
-            factory_utils.squashing_fn(success_time_value, cfg.success_time_a, cfg.success_time_b),
+            factory_utils.squashing_fn(success_time_value, cfg.success_time_a, cfg.success_time_b) * success_frac,
             torch.zeros_like(t_now),
         )
         # Latch (once, at first success): step reached + the SCALED success_time reward earned.
@@ -613,8 +698,9 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         for name in rew_dict:
             rew_buf = rew_buf + rew_dict[name] * rew_scales[name]
 
-        # Advance the pace clock by one env step, ONLY where in contact (tau_{t+1} = tau_t + dt*in_contact).
-        self.pace_tau = self.pace_tau + step_dt * self.in_contact_any.float()
+        # Advance the pace clock by one env step once FIRST contact has happened (time-based, NOT gated
+        # on staying in contact) so s_ref = v*(t - t_contact) keeps moving through a bounce.
+        self.pace_tau = self.pace_tau + step_dt * torch.isfinite(self.t_contact).float()
 
         # --- Contact-quality accumulation + per-episode publish ---
         c = self.in_contact_any
@@ -638,17 +724,9 @@ class FlatSurfaceFollowEnv(ForgeEnv):
                        ("speed_perp", v_perp_prog), ("theta", theta_deg)):
             getattr(self, f"drag_sum_{_n}").add_(_v * cf)
             getattr(self, f"drag_sumsq_{_n}").add_(_v * _v * cf)
-        # Keypoint frontier: the keypoint index at an arc-length is floor(progress / keypoint_spacing).
-        # Advance keypoints_met to the CURRENT index only if (a) in contact and (b) the PREVIOUS step's
-        # index equals the current frontier — i.e. the tool was already at the frontier, so it dragged
-        # here rather than skipping ahead in the air (an air jump makes prev-index >> frontier, blocking
-        # the advance until the tool returns and drags through). Can jump multiple keypoints in one step
-        # (fast drag) but never across an air gap. Capped at keypoints_total (~= reaching the goal).
-        Ktot = self.keypoints_total
-        kp_prev = torch.floor(self.prev_progress / self.keypoint_spacing).clamp_min(0).long().minimum(Ktot)
-        kp_curr = torch.floor(self.progress / self.keypoint_spacing).clamp_min(0).long().minimum(Ktot)
-        advance = c & (self.keypoints_met == kp_prev) & (kp_curr > self.keypoints_met)
-        self.keypoints_met = torch.where(advance, kp_curr, self.keypoints_met)
+        # (keypoint achievement/passed were computed earlier, before the success bonus, so it could be
+        # weighted by achieved/total.) Roll the per-step history forward for the next step's crossing
+        # test and drag-speed finite differences.
         self.prev_progress = self.progress.clone()
         self.prev_cross_track = self.cross_track.clone()
         # Publish per-episode metrics for the envs finishing this step (mask = reset_buf). Snapshots
@@ -678,11 +756,15 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # Two-level stats: per rollout compute the mean AND std of each metric over its IN-CONTACT
         # steps; block_agent then reduces over rollouts, emitting {metric}_mean (avg-of-rollout-means)
         # and {metric}_std (spread-of-rollout-means), plus {metric}_intra_std_mean (avg within-rollout
-        # std). NaN where a rollout never contacted, so the stat reducer skips it. keypoints_met is a
-        # plain per-rollout count (0 valid).
+        # std). NaN where a rollout never contacted, so the stat reducer skips it. keypoints_achieved /
+        # keypoints_passed are plain per-rollout counts (0 valid); block_agent also emits each as a
+        # "(max)" frontier over the interval.
         dcnt = self.drag_count.float().clamp_min(1.0)
         dhas = self.drag_count > 0
-        drag = {"keypoints_met": self.keypoints_met.float()}
+        drag = {
+            "keypoints_achieved": self.keypoints_achieved.float(),
+            "keypoints_passed": self.keypoints_passed.float(),
+        }
         for _n in self._drag_metrics:
             _m = getattr(self, f"drag_sum_{_n}") / dcnt
             _var = (getattr(self, f"drag_sumsq_{_n}") / dcnt - _m * _m).clamp_min(0.0)
@@ -797,7 +879,9 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.cq_prev = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
 
         # Reset the keypoint + drag-performance accumulators (new rollout).
-        self.keypoints_met = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        self.keypoints_achieved = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        self.keypoints_passed = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        self.setpoint_kp_idx = torch.ones((self.num_envs,), dtype=torch.long, device=self.device)
         self.prev_progress = torch.zeros((self.num_envs,), device=self.device)
         self.prev_cross_track = torch.zeros((self.num_envs,), device=self.device)
         self.drag_count = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)

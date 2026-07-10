@@ -23,6 +23,7 @@ import math
 import os
 from typing import Any, Callable
 
+import numpy as np
 import torch
 
 from wrappers.recording import _coerce_done, _unpack_act
@@ -237,4 +238,213 @@ def collect_and_record(
             image_writer, tag="Video / grid_3x4", grid=grid,
             fps=int(recorder_cfg.fps), global_step=int(global_step),
         )
+    return out_path
+
+
+def collect_stills_grid(
+    *,
+    env: Any,
+    agent: Any,
+    recorder_cfg: Any,
+    camera: Any,
+    max_episode_length: int,
+    output_dir: str,
+    out_name: str = "surface_stills.png",
+) -> str:
+    """Surface-task recorder: run ONE rollout and write a rows x cols PNG montage of annotated
+    still frames (one env per tile) with keypoint balls (in-scene), force + orientation gauges, and
+    a top-down path inset. Requires the env to expose ``viz_snapshot()`` (FlatSurfaceFollowEnv)."""
+    from learning import surface_viz as sv
+    from PIL import Image
+
+    uenv = env.unwrapped
+    if not hasattr(uenv, "viz_snapshot"):
+        raise RuntimeError("stills_grid requires FlatSurfaceFollowEnv (env.viz_snapshot missing).")
+
+    rows, cols = int(recorder_cfg.grid_rows), int(recorder_cfg.grid_cols)
+    overlays = bool(getattr(recorder_cfg, "surface_overlays", True))
+    n_tiles = rows * cols
+    num_envs = int(env.num_envs)
+    if num_envs < n_tiles:
+        print(f"[record] WARNING: num_envs={num_envs} < grid {rows}x{cols}={n_tiles}; "
+              f"tiling only {num_envs} envs.", flush=True)
+        n_tiles = num_envs
+    H, W = int(recorder_cfg.height), int(recorder_cfg.width)
+    T = int(max_episode_length)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Per-step captures (kept for every env; we display each env's last-alive frame).
+    frames = torch.zeros((num_envs, T, H, W, 3), dtype=torch.uint8)
+    force_sq = np.zeros((num_envs, T), dtype=np.float32)      # gauge fill/colour (reward closeness)
+    orn_sq = np.zeros((num_envs, T), dtype=np.float32)
+    force_N = np.zeros((num_envs, T), dtype=np.float32)       # gauge read-out: measured force (N)
+    angle_dev = np.zeros((num_envs, T), dtype=np.float32)     # gauge read-out: deg off desired angle
+    tr_u = np.zeros((num_envs, T), dtype=np.float32)
+    tr_v = np.zeros((num_envs, T), dtype=np.float32)
+    tr_c = np.zeros((num_envs, T), dtype=bool)
+    tr_o = np.zeros((num_envs, T), dtype=bool)
+    term_step = np.full(num_envs, T - 1, dtype=np.int64)
+    success = np.zeros(num_envs, dtype=bool)
+    env_done = np.zeros(num_envs, dtype=bool)
+
+    markers = None
+    tracker = None
+    const = {}  # per-env plate constants for the inset (filled at t=0)
+    cur_s_ref = np.zeros(num_envs, dtype=np.float32)  # latest time-based pace arc length (for pace marker)
+
+    set_camera_active(camera, True)
+    obs, _ = env.reset()
+    state = _resolve_state(env, obs)
+    try:
+        for t in range(T):
+            if markers is not None:                                  # colour balls from status so far
+                markers.update(tracker.marker_indices())
+                gidx = np.clip(tracker.setpoint_idx - 1, 0, k - 1)   # current goal keypoint per env
+                goal_marker.update(base[np.arange(num_envs), gidx] + goal_lift)
+                pace_marker.update(start_w_env + cur_s_ref[:, None] * path_dir_np + goal_lift)
+            actions, _ = agent.act(obs, state, timestep=10**9, timesteps=10**9)
+            obs, reward, terminated, truncated, info = env.step(actions)
+            rgb = read_camera_rgb(camera)                            # (num_envs,H,W,3)
+            snap = uenv.viz_snapshot()
+
+            if t == 0:
+                spacing = float(snap["keypoint_spacing"])
+                k = int(snap["keypoints_total"].min().item())
+                # Ball diameter is a fraction of the keypoint spacing (spec 0.5; enlarged for
+                # legibility). start_world/path_dir are ENV-LOCAL (like env.goal_world in the control
+                # wrapper, which adds env_origins) so shift into world frame; lift onto the surface.
+                ball_frac = float(getattr(recorder_cfg, "ball_diameter_frac", 1.6))
+                radius = spacing * ball_frac / 2.0
+                normal = snap["surface_normal"].numpy()                       # (E,3)
+                env_origins = uenv.scene.env_origins.detach().cpu().numpy()   # (E,3)
+                base = sv.keypoint_world_positions(snap["start_w"], snap["path_dir"], spacing, k)
+                base = base + env_origins[:, None, :]                         # (E,k,3) env-world, on surface
+                markers = sv.KeypointBallMarkers("/World/Visuals/surface_keypoints", radius=radius)
+                markers.set_positions((base + normal[:, None, :] * radius).reshape(-1, 3))
+                # Separate, exaggerated (4x) moving marker for the CURRENT goal keypoint.
+                goal_radius = radius * 4.0
+                goal_lift = normal * goal_radius                             # (E,3)
+                goal_marker = sv.GoalMarker("/World/Visuals/surface_goal", radius=goal_radius)
+                # Same big purple sphere, slightly transparent, for the TIME-BASED pace setpoint.
+                pace_marker = sv.GoalMarker("/World/Visuals/surface_pace", radius=goal_radius, opacity=0.4)
+                start_w_env = snap["start_w"].numpy() + env_origins          # (E,3) path start, on surface
+                path_dir_np = snap["path_dir"].numpy()                       # (E,3)
+                tracker = sv.KeypointStatusTracker(num_envs, k, spacing)
+                des_force = np.maximum(snap["desired_force_N"].numpy(), 1e-6)  # (E,) force-gauge scale
+                # Plate frame per env for the top-down inset.
+                start_w = snap["start_w"].numpy(); goal_w = snap["goal_w"].numpy()
+                u_dir = snap["path_dir"].numpy(); v_dir = snap["d_lat"].numpy()
+                center = 0.5 * (start_w + goal_w)
+                su, svv = sv.project_uv(start_w, center, u_dir, v_dir)
+                gu, gvv = sv.project_uv(goal_w, center, u_dir, v_dir)
+                half = 0.5 * snap["path_length"].numpy()             # square plate: half_u == half_v
+                const = dict(center=center, u=u_dir, v=v_dir, start_uv=np.stack([su, svv], 1),
+                             goal_uv=np.stack([gu, gvv], 1), half=half)
+
+            # tip projection for the inset trace
+            tu, tv = sv.project_uv(snap["tip_w"].numpy(), const["center"], const["u"], const["v"])
+            over = (np.abs(tu) <= const["half"]) & (np.abs(tv) <= const["half"])
+            alive = ~env_done
+            force_sq[alive, t] = snap["force_squash"].numpy()[alive]
+            orn_sq[alive, t] = snap["orn_squash"].numpy()[alive]
+            force_N[alive, t] = snap["force_N"].numpy()[alive]
+            angle_dev[alive, t] = snap["angle_dev_deg"].numpy()[alive]
+            tr_u[alive, t] = tu[alive]; tr_v[alive, t] = tv[alive]
+            tr_c[alive, t] = snap["in_contact"].numpy()[alive]
+            tr_o[alive, t] = over[alive]
+            alive_idx = np.nonzero(alive)[0]
+            if alive_idx.size:
+                frames[torch.from_numpy(alive_idx), t] = rgb[torch.from_numpy(alive_idx)]
+
+            cur_s_ref = snap["s_ref"].numpy()                        # for next step's pace-marker update
+            tracker.update(snap["progress"].numpy(), snap["in_contact"].numpy())
+
+            term_now = _coerce_done(terminated).cpu().numpy()
+            trunc_now = _coerce_done(truncated).cpu().numpy()
+            new_done = (term_now | trunc_now) & alive
+            if new_done.any():
+                idx = np.nonzero(new_done)[0]
+                term_step[idx] = t
+                succ = info.get("is_success", None)
+                if isinstance(succ, torch.Tensor):
+                    success[idx] = succ.view(-1).bool().cpu().numpy()[idx]
+                env_done[idx] = True
+            state = _resolve_state(env, obs)
+            if env_done.all():
+                break
+    finally:
+        set_camera_active(camera, False)
+
+    # Compose one annotated tile per env (its last-alive frame), then montage.
+    tiles = []
+    for e in range(n_tiles):
+        di = int(term_step[e])
+        frame = frames[e, di].numpy()
+        inset = None
+        if overlays:
+            inset = sv.topdown_inset(
+                tr_u[e, : di + 1], tr_v[e, : di + 1], tr_c[e, : di + 1], tr_o[e, : di + 1],
+                const["start_uv"][e], const["goal_uv"][e], float(const["half"][e]), float(const["half"][e]),
+            )
+        border = (45, 200, 95) if success[e] else None
+        if overlays:
+            tiles.append(sv.compose_tile(
+                frame, float(force_sq[e, di]), float(orn_sq[e, di]), inset, border,
+                force_text=f"{force_N[e, di]:.1f}N", orn_text=f"{angle_dev[e, di]:+.0f}°",
+                force_fill=float(force_N[e, di] / (2.0 * des_force[e])),
+                orn_fill=float(angle_dev[e, di] / 30.0)))
+        else:
+            tiles.append(frame if border is None else sv.compose_tile(frame, 0, 0, None, border))
+
+    grid = sv.montage(tiles, rows, cols)
+    out_path = os.path.join(output_dir, out_name)
+    Image.fromarray(grid).save(out_path)
+    print(f"[record] wrote stills grid {out_path} "
+          f"({rows}x{cols} tiles, {int(success.sum())}/{n_tiles} succeeded)", flush=True)
+
+    # Optional full mp4 of the SAME rollout: per-frame gauges + a top-down path that grows over time
+    # (the in-scene keypoint balls animate for free in the captured frames). The matplotlib inset is
+    # cached at a stride so we render ~T/K of them per env instead of one per frame.
+    if bool(getattr(recorder_cfg, "stills_grid_video", False)):
+        from wrappers.recording_grid import write_video
+
+        K = 3
+        Tmax = int(term_step[:n_tiles].max()) + 1
+        inset_cache = []  # per env: inset image at times 0, K, 2K, ... (path up to that time)
+        for e in range(n_tiles):
+            di = int(term_step[e])
+            cache = []
+            if overlays:
+                for tt in range(0, di + 1, K):
+                    cache.append(sv.topdown_inset(
+                        tr_u[e, : tt + 1], tr_v[e, : tt + 1], tr_c[e, : tt + 1], tr_o[e, : tt + 1],
+                        const["start_uv"][e], const["goal_uv"][e],
+                        float(const["half"][e]), float(const["half"][e])))
+            inset_cache.append(cache or [None])
+
+        video = None
+        for t in range(Tmax):
+            tiles_t = []
+            for e in range(n_tiles):
+                di = int(term_step[e])
+                q = min(t, di)                                  # freeze finished envs on their last frame
+                frame = frames[e, q].numpy()
+                border = (45, 200, 95) if (success[e] and t >= di) else None
+                if overlays:
+                    ins = inset_cache[e][min(q // K, len(inset_cache[e]) - 1)]
+                    tiles_t.append(sv.compose_tile(
+                        frame, float(force_sq[e, q]), float(orn_sq[e, q]), ins, border,
+                        force_text=f"{force_N[e, q]:.1f}N", orn_text=f"{angle_dev[e, q]:+.0f}°",
+                        force_fill=float(force_N[e, q] / (2.0 * des_force[e])),
+                        orn_fill=float(angle_dev[e, q] / 30.0)))
+                else:
+                    tiles_t.append(frame if border is None else sv.compose_tile(frame, 0, 0, None, border))
+            gframe = sv.montage(tiles_t, rows, cols)
+            if video is None:
+                video = np.zeros((Tmax,) + gframe.shape, dtype=np.uint8)
+            video[t] = gframe
+        vid_base = os.path.join(output_dir, os.path.splitext(out_name)[0])
+        vid_path = write_video(video, vid_base, fps=int(recorder_cfg.fps), fmt="mp4")
+        print(f"[record] wrote stills video {vid_path} ({Tmax} frames)", flush=True)
+
     return out_path

@@ -77,6 +77,31 @@ class RecorderCfg:
     output_subdir: str = "videos"
     """Subdirectory under the SAC experiment dir where GIFs are written."""
 
+    stills_grid: bool = False
+    """Surface-task only. When True, ``learning/record.py`` runs ONE rollout and writes a single
+    ``grid_rows x grid_cols`` PNG montage of annotated still frames (one env per tile) instead of the
+    best/median/worst grid video. Each tile carries the surface overlays (keypoint balls in-scene,
+    a force gauge, an orientation gauge, and a matplotlib top-down path inset). num_envs should be
+    >= grid_rows*grid_cols so every tile is a distinct env."""
+
+    grid_rows: int = 4
+    grid_cols: int = 4
+    """Montage layout for ``stills_grid`` (rows x cols tiles)."""
+
+    stills_grid_video: bool = False
+    """When ``stills_grid`` is on, ALSO write a full mp4 of the same rollout (per-frame gauges +
+    a growing top-down path; the in-scene keypoint balls animate in the captured frames)."""
+
+    surface_overlays: bool = True
+    """When ``stills_grid`` is on, draw the surface-follow overlays (force/orientation gauges +
+    top-down path inset) on each tile. The in-scene keypoint balls are added separately by the
+    recorder regardless. Turn off to get plain frames."""
+
+    ball_diameter_frac: float = 1.6
+    """Keypoint-ball diameter as a fraction of the keypoint spacing. The spec value 0.5 renders ~1.6
+    mm balls that are near-invisible from the recorder camera; the default here is enlarged for
+    legibility. Lower it toward 0.5 for a physically faithful size."""
+
 
 @dataclasses.dataclass(kw_only=True)
 class SAC_CFG(AgentCfg):
