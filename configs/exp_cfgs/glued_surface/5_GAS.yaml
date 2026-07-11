@@ -27,6 +27,7 @@ runner_cfg:
     task.terminate_on_lag: false
     task.terminate_on_success: true
     task.pace_lag_frac: 0.5
+    task.keypoint_reward_weight: 1.5
 
 loss_cfg:
   supervised_selection_enabled: false

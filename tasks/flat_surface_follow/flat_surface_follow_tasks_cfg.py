@@ -98,6 +98,11 @@ class FlatSurfaceFollowTask(ForgeTask):
     # success is an OPTIONAL hard gate (default off) that instead demands EVERY keypoint be achieved.
     require_keypoints_for_success: bool = False
 
+    # Fixed reward paid ONCE per keypoint, the first time it is cleanly ACHIEVED (crossed in contact,
+    # one at a time, advancing the achieved frontier). A dense forward-progress signal that — unlike
+    # the goal-gated success bonus — pays during the drag. Value = reward per keypoint (0 disables).
+    keypoint_reward_weight: float = 1.0
+
     # --- Termination (per-env). Both default OFF. When EITHER is on, env_setup auto-attaches the
     # efficient-reset wrapper so partial resets teleport (no sim steps) instead of running Factory's
     # all-envs settling reset. terminated (failure/success) is NOT value-bootstrapped; time-out is. ---

@@ -91,6 +91,8 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # prev_progress carries last step's progress for the per-step crossing test. Reset each episode.
         self.keypoints_achieved = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         self.keypoints_passed = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        # Furthest keypoint index cleanly achieved; gates the once-per-keypoint reward (see _get_rewards).
+        self.kp_ach_frontier = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         self.setpoint_kp_idx = torch.ones((self.num_envs,), dtype=torch.long, device=self.device)
         self.prev_progress = torch.zeros((self.num_envs,), device=self.device)
         self.prev_cross_track = torch.zeros((self.num_envs,), device=self.device)
@@ -121,6 +123,7 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "cq_prev",
             "keypoints_achieved",
             "keypoints_passed",
+            "kp_ach_frontier",
             "setpoint_kp_idx",
             "prev_progress",
             "prev_cross_track",
@@ -600,7 +603,12 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         kp_curr = torch.floor(self.progress / self.keypoint_spacing).clamp_min(0).long().minimum(Ktot)
         crossed = (kp_curr - kp_prev).clamp_min(0)                            # keypoints crossed forward this step
         clean = self.in_contact_any & (crossed == 1)                         # exactly one, in contact -> achieved
-        self.keypoints_achieved = (self.keypoints_achieved + clean.long()).minimum(Ktot)
+        # Count/reward each keypoint ONCE: only a clean achievement that advances the frontier past the
+        # furthest keypoint already achieved. Without this a peg jittering across one boundary in
+        # contact would re-collect the same keypoint every step.
+        newly_achieved = clean & (kp_curr > self.kp_ach_frontier)            # (E,) bool: first time for this kp
+        self.kp_ach_frontier = torch.where(newly_achieved, kp_curr, self.kp_ach_frontier)
+        self.keypoints_achieved = (self.keypoints_achieved + newly_achieved.long()).minimum(Ktot)
         self.keypoints_passed = torch.maximum(self.keypoints_passed, kp_curr)
         # Success reward weight = fraction of keypoints cleanly achieved (partial credit for the drag).
         success_frac = self.keypoints_achieved.float() / self.keypoints_total.clamp_min(1).float()
@@ -679,6 +687,8 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "orientation": factory_utils.squashing_fn(orn_value, cfg.orientation_a, cfg.orientation_b) * near_surface,
             "straightness": factory_utils.squashing_fn(straightness_value, cfg.straightness_a, cfg.straightness_b) * straight_factor,
             "pace": factory_utils.squashing_fn(pace_value, cfg.pace_a, cfg.pace_b) * pace_factor,
+            # Fixed bonus paid ONCE per keypoint the first time it is cleanly achieved (0/1 this step).
+            "keypoint": newly_achieved.float(),
             "contact": contact,
             "action_penalty_ee": action_penalty_ee,
             "action_grad_penalty": action_grad_penalty,
@@ -689,6 +699,7 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "orientation": float(cfg.orientation_weight),
             "straightness": float(cfg.straightness_weight),
             "pace": float(cfg.pace_weight),
+            "keypoint": float(cfg.keypoint_reward_weight),
             "contact": float(cfg.contact_weight),
             "action_penalty_ee": -float(cfg.action_penalty_ee_scale),
             "action_grad_penalty": -float(cfg.action_grad_penalty_scale),
@@ -881,6 +892,7 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # Reset the keypoint + drag-performance accumulators (new rollout).
         self.keypoints_achieved = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         self.keypoints_passed = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        self.kp_ach_frontier = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         self.setpoint_kp_idx = torch.ones((self.num_envs,), dtype=torch.long, device=self.device)
         self.prev_progress = torch.zeros((self.num_envs,), device=self.device)
         self.prev_cross_track = torch.zeros((self.num_envs,), device=self.device)
