@@ -14,8 +14,11 @@ is in the run's Files. Camera rendering must run from the ``general`` env (isaac
 this whole script with that interpreter, e.g.:
 
     /home/hunter/miniconda3/envs/general/bin/python learning/record_from_wandb.py \
-        --project surface_baselines --entity hur --tag keypoint-rework \
+        --tag keypoint-rework \
         --record_config configs/exp_cfgs/glued_surface/_record_stills.yaml
+
+(--project defaults to surface_baselines and --entity to hur, so in practice you only set --tag and
+--record_config; override --project/--entity for other projects.)
 
 Add ``--download_only`` to just fetch the tree (skip rendering). Anything after ``--`` is forwarded
 verbatim to ``learning/record.py`` (via record_group.bash), e.g. ``-- --num_trajectories 24``.
@@ -33,9 +36,10 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--project", required=True,
-                   help="wandb project, or 'entity/project'. e.g. surface_baselines")
-    p.add_argument("--entity", default=None, help="wandb entity (e.g. hur); omit if given in --project.")
+    p.add_argument("--project", default="surface_baselines",
+                   help="wandb project, or 'entity/project'. Default: surface_baselines")
+    p.add_argument("--entity", default="hur",
+                   help="wandb entity. Default: hur (ignored if --project is 'entity/project').")
     p.add_argument("--tag", required=True, help="Only runs carrying this wandb tag. e.g. keypoint-rework")
     p.add_argument("--record_config", default=None,
                    help="Record overlay YAML passed to record_group.bash (required unless --download_only). "
