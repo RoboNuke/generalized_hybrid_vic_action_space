@@ -383,17 +383,11 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         downhill = torch.where(perp_norm > 1e-6, perp / perp_norm.clamp_min(1e-6), torch.zeros_like(perp))
         self.interaction_pos = self.cyl_tip + radius * downhill
 
-        # Orientation: z = surface normal; x = tangential motion direction (else toward goal,
-        # else the path direction); y = z × x. Orthonormalized against the normal.
-        vel_t = self.ee_linvel_fd - (self.ee_linvel_fd * normal).sum(-1, keepdim=True) * normal
-        goal_dir = self.goal_world - self.interaction_pos
-        goal_t = goal_dir - (goal_dir * normal).sum(-1, keepdim=True) * normal
-        x_dir = torch.where(torch.linalg.norm(vel_t, dim=-1, keepdim=True) > 1e-4, vel_t, goal_t)
-        x_dir = x_dir - (x_dir * normal).sum(-1, keepdim=True) * normal
-        x_norm = torch.linalg.norm(x_dir, dim=-1, keepdim=True)
-        x_axis = torch.where(x_norm > 1e-6, x_dir / x_norm.clamp_min(1e-6), path_dir)
-        y_axis = torch.cross(normal, x_axis, dim=-1)
-        self.interaction_quat = quat_from_matrix(torch.stack([x_axis, y_axis, normal], dim=2))
+        # Orientation = the SAME [path_dir, d_lat, surface_normal] frame the controller's fixed-rot
+        # stiffness and the impedance metrics consume (interaction_frame_world()), so the viz marker
+        # matches what control actually uses — one source of truth. (Previously x tracked the
+        # instantaneous velocity direction, which diverged from the path frame: a viz-only mismatch.)
+        self.interaction_quat = quat_from_matrix(self.interaction_frame_world())
         # In-contact bool (drives the interaction frame + the pace schedule clock). Prefer the
         # contact-sensor wrapper's per-axis state; fall back to a small normal-force threshold when
         # the contact sensor is disabled, so the env stays self-contained.
