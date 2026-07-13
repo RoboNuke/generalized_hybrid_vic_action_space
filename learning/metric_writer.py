@@ -58,6 +58,21 @@ class MetricWriter:
         self._config_path = config_path
         self._pending: dict[str, float] = {}
         self._pending_step: int | None = None
+        self._live_files: set[str] = set()
+
+    def save_file_live(self, path: str) -> None:
+        """Back up ``path`` to the wandb run's Files as a plain file (NOT an artifact), live-watched
+        so every overwrite re-uploads. Registered once per path; wandb re-syncs on change thereafter.
+        Uses the file in place (symlinked into the run dir, no copy) so a large checkpoint isn't
+        duplicated on disk. No-op without a wandb run; never raises (a backup must not abort training)."""
+        if self._wandb_run is None or not os.path.isfile(path) or path in self._live_files:
+            return
+        try:
+            # base_path = the file's dir -> it lands in the run Files under its bare name.
+            self._wandb_run.save(path, base_path=os.path.dirname(path), policy="live")
+            self._live_files.add(path)
+        except Exception as e:  # never let a backup extra abort training
+            print(f"[metric_writer] wandb save_file_live({path}) failed: {e!r}", flush=True)
 
     def add_scalar(self, *, tag: str, value: float, timestep: int) -> None:
         if self._tb is not None:

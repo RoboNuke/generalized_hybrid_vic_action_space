@@ -1275,7 +1275,14 @@ class BlockAgent(Agent):
         os.makedirs(ckpt_dir, exist_ok=True)
         ckpt = self._build_per_agent_checkpoint(i, timestep)
         ckpt["best_success_rate"] = float(success_rate)
-        torch.save(ckpt, os.path.join(ckpt_dir, "ckpt_best.pt"))
+        best_path = os.path.join(ckpt_dir, "ckpt_best.pt")
+        torch.save(ckpt, best_path)
+        # Back up ONLY the best checkpoint to this agent's wandb run's Files (plain file, not an
+        # artifact), live-watched so each improvement re-uploads. Guarded: only when a MetricWriter
+        # with a wandb run exists for this agent (no-op for TB-only / record mode).
+        w = self.per_agent_writers[i] if i < len(self.per_agent_writers) else None
+        if isinstance(w, MetricWriter):
+            w.save_file_live(best_path)
 
     # --- load helpers ---
     @staticmethod
