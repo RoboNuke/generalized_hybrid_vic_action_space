@@ -21,7 +21,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-from isaaclab.utils.math import quat_apply, quat_from_matrix
+from isaaclab.utils.math import matrix_from_quat, quat_apply, quat_from_matrix
 
 from isaaclab_tasks.direct.factory import factory_utils
 from isaaclab_tasks.direct.factory.factory_env import FactoryEnv
@@ -209,22 +209,23 @@ class FlatSurfaceFollowEnv(ForgeEnv):
           * "dynamic": z = direction of the measured contact reaction (force_sensor_world_smooth, clean
             & EMA-smoothed; peg gravity is disabled so it's contact-only), which tilts off the normal
             by the friction angle. x = path_dir projected ⊥ z (along-track), y = z × x (cross-track).
-            Falls back to the geometric frame per-env where ‖force‖ < interaction_frame_min_force
-            (direction undefined off-contact)."""
-        geo = torch.stack([self.path_dir, self.d_lat, self.surface_normal], dim=-1)   # (E,3,3)
-        if getattr(self.cfg_task, "interaction_frame_mode", "geometric") != "dynamic":
-            return geo
-        # Dynamic: z along the (clean, smoothed) world contact reaction force.
+
+        OFF-CONTACT (‖force‖ < interaction_frame_min_force), BOTH modes return R_eef (world<-eef), so
+        the controller's R = R_eefᵀ·this = IDENTITY — with no surface to interact with, the stiffness
+        is applied in the control (EEF) frame, not a surface/reaction frame."""
         f = self.force_sensor_world_smooth[:, 0:3]                                    # (E,3) world reaction
         fmag = torch.linalg.norm(f, dim=-1, keepdim=True)                             # (E,1)
-        z = f / fmag.clamp_min(1e-6)                                                  # (E,3)
-        x = self.path_dir - (self.path_dir * z).sum(-1, keepdim=True) * z             # along-track ⊥ z
-        x = x / torch.linalg.norm(x, dim=-1, keepdim=True).clamp_min(1e-6)
-        y = torch.cross(z, x, dim=-1)                                                 # cross-track
-        dyn = torch.stack([x, y, z], dim=-1)                                          # (E,3,3)
-        # Off-contact the force direction is undefined -> use the geometric frame there.
-        valid = fmag.squeeze(-1) > float(self.cfg_task.interaction_frame_min_force)   # (E,)
-        return torch.where(valid[:, None, None], dyn, geo)
+        in_contact = fmag.squeeze(-1) > float(self.cfg_task.interaction_frame_min_force)   # (E,)
+        if getattr(self.cfg_task, "interaction_frame_mode", "geometric") == "dynamic":
+            z = f / fmag.clamp_min(1e-6)                                              # z along the reaction
+            x = self.path_dir - (self.path_dir * z).sum(-1, keepdim=True) * z         # along-track ⊥ z
+            x = x / torch.linalg.norm(x, dim=-1, keepdim=True).clamp_min(1e-6)
+            frame = torch.stack([x, torch.cross(z, x, dim=-1), z], dim=-1)            # (E,3,3)
+        else:
+            frame = torch.stack([self.path_dir, self.d_lat, self.surface_normal], dim=-1)  # (E,3,3)
+        # Off-contact -> R_eef so the stiffness rotation collapses to identity (stiffness in the EEF frame).
+        R_eef = matrix_from_quat(self.fingertip_midpoint_quat)                        # (E,3,3) world<-eef
+        return torch.where(in_contact[:, None, None], frame, R_eef)
 
     # ------------------------------------------------------------------
     # Scene: procedural plate (fixed) + cylinder (held)

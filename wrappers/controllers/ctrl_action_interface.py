@@ -373,13 +373,15 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
             for i, nm in enumerate(("x", "y", "z")):
                 to_log[f"Impedance_Stiffness/principal_{nm} (dist)"] = kn[:, i]
 
-        # (2) APPLES-TO-APPLES: the stiffness the APPLIED K presents along the task directions
-        #     (along-track / cross-track / normal), obtained by projecting world-frame K onto the
-        #     interaction axes: diag(R_intᵀ K R_int). Same reference for EVERY method, so VICES (whose
-        #     principal axes are the peg frame) and the rotated methods can be compared directly.
-        if hasattr(env, "interaction_frame_world"):
-            R_int = env.interaction_frame_world()                       # (E,3,3) cols [along-track, cross, normal]
-            k_dir = (R_int.transpose(1, 2) @ K @ R_int).diagonal(dim1=-2, dim2=-1)  # (E,3)
+        # (2) APPLES-TO-APPLES: the stiffness the APPLIED K presents along the true SURFACE directions
+        #     (along-track / cross-track / normal), via diag(R_surfᵀ K R_surf). We use the GEOMETRIC
+        #     surface frame [path_dir, d_lat, surface_normal] directly (NOT interaction_frame_world(),
+        #     which is the control frame — it goes identity off-contact and reaction-tilted in dynamic
+        #     mode), so this is the SAME physical reference for every method/mode and always means the
+        #     surface directions. Valid for any method whose env exposes the surface frame.
+        if hasattr(env, "surface_normal") and hasattr(env, "path_dir"):
+            R_surf = torch.stack([env.path_dir, env.d_lat, env.surface_normal], dim=-1)  # cols [along, cross, normal]
+            k_dir = (R_surf.transpose(1, 2) @ K @ R_surf).diagonal(dim1=-2, dim2=-1)  # (E,3)
             to_log["Impedance_Stiffness/k_along_track (dist)"] = k_dir[:, 0]
             to_log["Impedance_Stiffness/k_cross_track (dist)"] = k_dir[:, 1]
             to_log["Impedance_Stiffness/k_normal (dist)"] = k_dir[:, 2]
