@@ -175,6 +175,10 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         self._marker_hole = None
         self._marker_interaction = None
         self._R_frame = None
+        # Native per-axis PRINCIPAL stiffness the method commands (position block, pre-rotation):
+        # EEF-frame axes for diagonal modes, interaction-frame axes [along-track, cross, normal] for
+        # rotated. Cached in _build_pose_KD, logged in _log_stiffness_frame_metrics.
+        self._k_native = None
 
         # Translational stiffness ellipsoid. Eigenvalues of the position 3x3 block of K are linearly
         # mapped from the scalar position-gain range [lo, hi] to a semi-axis length in [min, max] m.
@@ -359,6 +363,27 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         peg_socket_angle = torch.rad2deg(torch.acos(cos_ps))           # (E,)
         to_log["RotationFrame/peg_socket_angle (stat)"] = peg_socket_angle
 
+        # --- Impedance_Stiffness family: two complementary views -------------------------------
+        # (1) PRINCIPAL stiffness the METHOD commands, in its own authoring frame (EEF axes for the
+        #     diagonal modes, interaction axes [along-track, cross, normal] for rotated). This is the
+        #     raw commanded diagonal (== eigenvalues of K for diagonal/rotated), NOT the misleading
+        #     EEF-frame diagonal of the ROTATED matrix that pos_X/Y/Z logs.
+        if self._k_native is not None:
+            kn = self._k_native
+            for i, nm in enumerate(("x", "y", "z")):
+                to_log[f"Impedance_Stiffness/principal_{nm} (dist)"] = kn[:, i]
+
+        # (2) APPLES-TO-APPLES: the stiffness the APPLIED K presents along the task directions
+        #     (along-track / cross-track / normal), obtained by projecting world-frame K onto the
+        #     interaction axes: diag(R_intᵀ K R_int). Same reference for EVERY method, so VICES (whose
+        #     principal axes are the peg frame) and the rotated methods can be compared directly.
+        if hasattr(env, "interaction_frame_world"):
+            R_int = env.interaction_frame_world()                       # (E,3,3) cols [along-track, cross, normal]
+            k_dir = (R_int.transpose(1, 2) @ K @ R_int).diagonal(dim1=-2, dim2=-1)  # (E,3)
+            to_log["Impedance_Stiffness/k_along_track (dist)"] = k_dir[:, 0]
+            to_log["Impedance_Stiffness/k_cross_track (dist)"] = k_dir[:, 1]
+            to_log["Impedance_Stiffness/k_normal (dist)"] = k_dir[:, 2]
+
     def _update_frame_viz(self):
         """Draw the enabled eval-recording axis frames at the peg tip / EEF.
 
@@ -497,10 +522,12 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         E = self.num_envs
         if self._mode == "constant":
             kdiag = self._k_const.unsqueeze(0).expand(E, 6)
+            self._k_native = kdiag[:, 0:3]
             return torch.diag_embed(kdiag), torch.diag_embed(self._crit_damp(kdiag))
 
         if self._mode == "variable_diagonal":
             kdiag = geom_scale(a, self._k_lo, self._k_hi)
+            self._k_native = kdiag[:, 0:3]
             return torch.diag_embed(kdiag), torch.diag_embed(self._crit_damp(kdiag))
 
         if self._mode == "rotated":
@@ -519,16 +546,21 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
                 kpos = geom_scale(a[:, 0:3], self._k_lo[:, 0:3], self._k_hi[:, 0:3])  # (E,3)
                 krot = self._k_const[3:6].unsqueeze(0).expand(E, 3)                   # (E,3)
                 kdiag = torch.cat((kpos, krot), dim=1)                                # (E,6)
+            # Native principal gains are the interaction-frame diagonal (pre-rotation R).
+            self._k_native = kdiag[:, 0:3]
             K = self._rotate_blockdiag(R, kdiag)
             D = self._rotate_blockdiag(R, self._crit_damp(kdiag))
             return K, D
 
         # cholesky: full SPD K with matrix critical damping. Full mode builds the whole 6x6;
-        # otherwise the policy sets the position 3x3 and the rotation block is constant.
+        # otherwise the policy sets the position 3x3 and the rotation block is constant. No natural
+        # diagonal, so the principal gains are the eigenvalues of the position block.
         if self._full:
             K = self._build_cholesky_block(a, self._k_lo, self._k_hi)
+            self._k_native = torch.linalg.eigvalsh(K[:, :3, :3])
             return K, self._crit_damp_matrix(K)
         Kpos = self._build_cholesky_block(a, self._k_lo[:, 0:3], self._k_hi[:, 0:3])
+        self._k_native = torch.linalg.eigvalsh(Kpos)
         Krot, Drot = self._const_rot_block(self._k_const, E)
         return block_diag_2(Kpos, Krot), block_diag_2(self._crit_damp_matrix(Kpos), Drot)
 
