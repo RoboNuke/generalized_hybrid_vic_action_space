@@ -198,14 +198,33 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         return self._plate_normal, self._plate_path_dir
 
     def interaction_frame_world(self):
-        """(E,3,3) world<-interaction rotation — columns are the interaction-frame axes in world:
-        x = path direction d (path_dir), y = n x d (d_lat, in-plane lateral), z = surface normal.
-
+        """(E,3,3) world<-interaction rotation — columns are the interaction-frame axes in world.
         Consumed by the controller's ``fixed_rotation_from_interaction`` stiffness variant (R =
-        R_eefᵀ @ this = the true interaction->EEF rotation, which changes with each plate's pose).
-        GENERAL across surfaces: path_dir/d_lat/surface_normal are recomputed each step at the
-        contact point via _surface_normal_and_dir_at, so this is the LOCAL frame for curved surfaces too."""
-        return torch.stack([self.path_dir, self.d_lat, self.surface_normal], dim=-1)
+        R_eefᵀ @ this = the true interaction->EEF rotation), the impedance metrics, and the viz marker.
+
+        ``interaction_frame_mode`` (task cfg):
+          * "geometric" (default): x = path_dir (along-track), y = d_lat (cross-track), z = surface
+            normal — the pure surface frame. Recomputed each step at the contact point, so it's the
+            LOCAL frame for curved surfaces too.
+          * "dynamic": z = direction of the measured contact reaction (force_sensor_world_smooth, clean
+            & EMA-smoothed; peg gravity is disabled so it's contact-only), which tilts off the normal
+            by the friction angle. x = path_dir projected ⊥ z (along-track), y = z × x (cross-track).
+            Falls back to the geometric frame per-env where ‖force‖ < interaction_frame_min_force
+            (direction undefined off-contact)."""
+        geo = torch.stack([self.path_dir, self.d_lat, self.surface_normal], dim=-1)   # (E,3,3)
+        if getattr(self.cfg_task, "interaction_frame_mode", "geometric") != "dynamic":
+            return geo
+        # Dynamic: z along the (clean, smoothed) world contact reaction force.
+        f = self.force_sensor_world_smooth[:, 0:3]                                    # (E,3) world reaction
+        fmag = torch.linalg.norm(f, dim=-1, keepdim=True)                             # (E,1)
+        z = f / fmag.clamp_min(1e-6)                                                  # (E,3)
+        x = self.path_dir - (self.path_dir * z).sum(-1, keepdim=True) * z             # along-track ⊥ z
+        x = x / torch.linalg.norm(x, dim=-1, keepdim=True).clamp_min(1e-6)
+        y = torch.cross(z, x, dim=-1)                                                 # cross-track
+        dyn = torch.stack([x, y, z], dim=-1)                                          # (E,3,3)
+        # Off-contact the force direction is undefined -> use the geometric frame there.
+        valid = fmag.squeeze(-1) > float(self.cfg_task.interaction_frame_min_force)   # (E,)
+        return torch.where(valid[:, None, None], dyn, geo)
 
     # ------------------------------------------------------------------
     # Scene: procedural plate (fixed) + cylinder (held)
