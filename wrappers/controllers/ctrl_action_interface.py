@@ -179,6 +179,15 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         # EEF-frame axes for diagonal modes, interaction-frame axes [along-track, cross, normal] for
         # rotated. Cached in _build_pose_KD, logged in _log_stiffness_frame_metrics.
         self._k_native = None
+        # rot6d action slice (lo, hi) = the trailing 6 of the pose-gain block, present ONLY when the
+        # rotation is LEARNED (rotated mode, R from the policy — not fixed_rot). Exposed on the
+        # unwrapped env so the runner can hand it to the supervised-rotation loss; None otherwise.
+        if self._mode == "rotated" and not self._fixed_rot:
+            _hi = self._base_n + 2 * self.N + self._pdim
+            self._rot6d_action_slice = (_hi - 6, _hi)
+        else:
+            self._rot6d_action_slice = None
+        self.unwrapped._rot6d_action_slice = self._rot6d_action_slice
 
         # Translational stiffness ellipsoid. Eigenvalues of the position 3x3 block of K are linearly
         # mapped from the scalar position-gain range [lo, hi] to a semi-axis length in [min, max] m.

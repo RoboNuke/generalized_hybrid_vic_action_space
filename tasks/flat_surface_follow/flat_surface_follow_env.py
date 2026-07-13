@@ -50,6 +50,9 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.path_dir = torch.tensor([1.0, 0.0, 0.0], device=self.device).expand(self.num_envs, 3).clone()
         self.d_lat = torch.tensor([0.0, 1.0, 0.0], device=self.device).expand(self.num_envs, 3).clone()
         self.surface_normal = torch.tensor([0.0, 0.0, 1.0], device=self.device).expand(self.num_envs, 3).clone()
+        # Contact flag (set each _compute); init here so interaction_frame_world() is safe if the
+        # controller queries the stiffness frame before the first _compute.
+        self.in_contact_any = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
         # Per-episode desired normal force (N), sampled in _reset_idx, observed by the policy.
         self.desired_force = torch.zeros((self.num_envs,), device=self.device)
         # Pace schedule clock (s): TIME since first contact — advances by the env step dt every step
@@ -402,20 +405,29 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         downhill = torch.where(perp_norm > 1e-6, perp / perp_norm.clamp_min(1e-6), torch.zeros_like(perp))
         self.interaction_pos = self.cyl_tip + radius * downhill
 
-        # Orientation = the SAME [path_dir, d_lat, surface_normal] frame the controller's fixed-rot
-        # stiffness and the impedance metrics consume (interaction_frame_world()), so the viz marker
-        # matches what control actually uses — one source of truth. (Previously x tracked the
-        # instantaneous velocity direction, which diverged from the path frame: a viz-only mismatch.)
-        self.interaction_quat = quat_from_matrix(self.interaction_frame_world())
         # In-contact bool (drives the interaction frame + the pace schedule clock). Prefer the
         # contact-sensor wrapper's per-axis state; fall back to a small normal-force threshold when
-        # the contact sensor is disabled, so the env stays self-contained.
+        # the contact sensor is disabled, so the env stays self-contained. Computed BEFORE the
+        # interaction frame below, which now consumes it (off-contact -> identity/EEF frame).
         cw = getattr(self, "in_contact", None)
         if torch.is_tensor(cw):
             self.in_contact_any = cw.any(dim=1)
         else:
             self.in_contact_any = self.measured_normal_force.abs() > 0.1
         self.interaction_exists = self.in_contact_any
+
+        # Orientation = the SAME [path_dir, d_lat, surface_normal] frame the controller's fixed-rot
+        # stiffness and the impedance metrics consume (interaction_frame_world()), so the viz marker
+        # matches what control actually uses — one source of truth. (Previously x tracked the
+        # instantaneous velocity direction, which diverged from the path frame: a viz-only mismatch.)
+        R_int = self.interaction_frame_world()                                        # (E,3,3) world<-interaction (control frame)
+        self.interaction_quat = quat_from_matrix(R_int)
+        # Ground-truth rotation TARGET for the supervised-rotation loss: exactly the eef<-interaction
+        # rotation a fixed-rot controller would use (R_eefᵀ·interaction_frame_world()); noise-free,
+        # respects the mode (geometric/dynamic) and is identity off-contact. Published for the memory
+        # buffer to pick up (flattened (E,9)); harmless when the loss is off.
+        R_eef = matrix_from_quat(self.fingertip_midpoint_quat)                        # (E,3,3) world<-eef
+        self.extras["gt_interaction_rot"] = (R_eef.transpose(1, 2) @ R_int).reshape(self.num_envs, 9)
 
         # Measured normal force, CONTACT-CONDITIONAL: NaN off-contact and tagged "(stat)" so
         # block_agent's _accum_dist_stat (which drops non-finite values) means ONLY over in-contact

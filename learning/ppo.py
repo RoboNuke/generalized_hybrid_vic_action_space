@@ -99,6 +99,7 @@ class PPO(BlockAgent):
         num_agents: int = 1,
         aux_losses: "AuxLossManager | None" = None,
         contact_axes: list[int] | None = None,
+        rot6d_slice: tuple[int, int] | None = None,
     ) -> None:
         """Proximal Policy Optimization (PPO) with per-agent block-parallel independence.
 
@@ -122,6 +123,7 @@ class PPO(BlockAgent):
             cfg=PPO_CFG(**cfg) if isinstance(cfg, dict) else cfg,
             num_agents=num_agents,
             contact_axes=contact_axes,
+            rot6d_slice=rot6d_slice,
         )
 
         self.state_space = state_space
@@ -235,6 +237,7 @@ class PPO(BlockAgent):
 
             # Optional ground-truth contact tensor for the supervised-selection loss.
             self._maybe_create_contact_tensor()
+            self._maybe_create_rot_target_tensor()
 
     # --------------------------------------------------------------
     # Checkpoint hooks (BlockAgent does the slicing/stitching)
@@ -344,6 +347,10 @@ class PPO(BlockAgent):
                 add_kwargs["states"] = states
             # One-step-aligned contact ground truth for the SSL (no-op unless contact_axes).
             self._buffer_contact_for_write(
+                terminated=terminated, truncated=truncated, infos=infos, add_kwargs=add_kwargs
+            )
+            # One-step-aligned rotation-frame target for the supervised-rotation loss (no-op unless rot6d_slice).
+            self._buffer_rot_target_for_write(
                 terminated=terminated, truncated=truncated, infos=infos, add_kwargs=add_kwargs
             )
             self.memory.add_samples(**add_kwargs)

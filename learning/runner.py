@@ -578,6 +578,21 @@ def main(argv: list[str] | None = None) -> None:
         print(f"[runner] supervised selection loss: contact_axes={contact_axes} "
               f"(force-eligible x/y/z; contact_dim={len(contact_axes)})")
 
+    # supervised-rotation loss: supervise the GAS policy's LEARNED rotation frame toward the
+    # ground-truth interaction frame (what a fixed-rot controller would use). Needs a learned
+    # rotation; the control wrapper exposes env.unwrapped._rot6d_action_slice (None otherwise).
+    rot6d_slice = None
+    if loss_cfg.supervised_rotation_enabled:
+        rot6d_slice = getattr(env.unwrapped, "_rot6d_action_slice", None)
+        if rot6d_slice is None:
+            raise ValueError(
+                "loss_cfg.supervised_rotation_enabled=True requires a LEARNED rotation frame "
+                "(controller_cfg.gain_mapping='rotated' WITHOUT fixed_rotation_from_interaction/rpy); "
+                "the controller exposed no rot6d action slice (env._rot6d_action_slice is None)."
+            )
+        print(f"[runner] supervised rotation loss: rot6d_slice={rot6d_slice} "
+              "(GAS rotation dims supervised toward the ground-truth interaction frame)")
+
     # ---- agent ----
     agent_cls = SAC if agent_type == "sac" else PPO
     agent = agent_cls(
@@ -595,6 +610,7 @@ def main(argv: list[str] | None = None) -> None:
         # PPO accept and apply this.
         aux_losses=AuxLossManager.from_cfg(loss_cfg),
         contact_axes=contact_axes,
+        rot6d_slice=rot6d_slice,
     )
 
     # SimBa periodic reset: give the agent a factory that rebuilds fresh, identically-constructed

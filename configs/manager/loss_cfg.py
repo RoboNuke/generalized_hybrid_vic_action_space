@@ -48,3 +48,17 @@ class LossCfg:
     supervised_selection_critic_weight: float = 0.0
     """Weight applied to the SSL on the critic optimizer. The SSL is policy-only, so a
     nonzero value here is rejected at build time — keep it 0.0."""
+
+    # ---- supervised_rotation: chordal(GAS learned rotation, ground-truth interaction frame) (policy-only) ----
+    supervised_rotation_enabled: bool = False
+    """Enable the supervised rotation loss: chordal distance between the GAS policy's LEARNED
+    rotation frame and the ground-truth interaction frame (what a fixed-rot controller would use).
+    Requires gain_mapping='rotated' with a learned rotation (the runner validates + buffers the
+    target). No effect for fixed-rot / non-rotated control."""
+
+    supervised_rotation_policy_weight: float = 0.0
+    """Weight applied to the supervised-rotation loss on the policy (actor) optimizer."""
+
+    supervised_rotation_critic_weight: float = 0.0
+    """Weight applied to the supervised-rotation loss on the critic optimizer. Policy-only, so a
+    nonzero value here is rejected at build time — keep it 0.0."""

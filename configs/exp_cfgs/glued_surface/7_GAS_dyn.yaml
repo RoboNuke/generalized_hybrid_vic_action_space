@@ -1,0 +1,182 @@
+# Surface Path-Following — LEARNED rotation (GAS) + SUPERVISED-ROTATION loss toward the DYNAMIC interaction frame.
+# Identical to 5_GAS EXCEPT: task.interaction_frame_mode=dynamic and loss_cfg.supervised_rotation_enabled=true
+# (chordal supervision of the policy's learned rot6d frame toward R_eefᵀ·interaction_frame_world, the
+# noise-free target a fixed-rot controller would use). Tests whether an explicit signal makes GAS learn
+# to align its stiffness frame to the dynamic interaction frame. num_agents=3 for head-to-head comparison.
+
+runner_cfg:
+  task: Isaac-FlatSurfaceFollow-Direct-v0
+  agent_type: sac
+  num_envs: 512
+  num_agents: 3
+  total_timesteps: 100_000
+  eval_timesteps: 150
+  memory_size: 1_000_000
+  seed: -1
+  glue_peg_to_gripper: true              # rigidly weld the held cylinder to the gripper (generalized weld)
+  # Surface-task params on FlatSurfaceFollowTask via dotted env_cfg overrides.
+  env_cfg_overrides:
+    task.desired_speed_cm_s: 5.0
+    task.force_desired_min: 5.0
+    task.force_desired_max: 5.0
+    task.orientation_desired_angle_deg: 10.0
+    task.plate_tilt_range_deg: 10.0
+    task.inhand_tilt_range_deg: [0.0, 0.0, 0.0]
+    task.observe_eef_torque: false
+    task.terminate_on_lag: false
+    task.terminate_on_success: true
+    task.pace_lag_frac: 0.5
+    task.keypoint_reward_weight: 1.5
+    task.interaction_frame_mode: dynamic
+
+loss_cfg:
+  supervised_selection_enabled: false
+  supervised_selection_policy_weight: 1.0
+  supervised_selection_critic_weight: 0.0
+  supervised_rotation_enabled: true
+  supervised_rotation_policy_weight: 1.0   # tune on HPC (chordal loss in [0,8])
+  supervised_rotation_critic_weight: 0.0
+
+sac_cfg:
+  tensorboard: false        # log ONLY to wandb (requires experiment.wandb: true)
+  gradient_steps: 2
+  batch_size: 2048
+  discount_factor: 0.99
+  polyak: 0.005
+  actor_lr: 1.0e-4
+  critic_lr: 1.0e-4
+  entropy_lr: 3.0e-5
+  weight_decay: 1.0e-2
+  random_timesteps: 0
+  learning_starts: 300
+  learn_entropy: true
+  initial_entropy_value: 0.05
+  target_entropy: -9.5            # = -|continuous|/2 = -19/2 (7 base + 12 rotated gains (6 diag + 6D rot, full))
+  grad_norm_clip: 1.0
+  mixed_precision: false
+  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor_kwargs: {}
+  rewards_shaper_scale: 0.1
+  gripper_action_idx: null
+  phase_split_families: []        # peg-only (needs per_env_curr_engaged); OFF for surface
+  recorder:
+    enabled: false
+  experiment:
+    directory: glued_surface
+    experiment_name: "7_GAS_dyn.yaml"
+    write_interval: 150
+    checkpoint_interval: auto
+    wandb: true
+    wandb_kwargs:
+      entity: hur
+
+model_cfg:
+  actor:
+    act_init_std: 1.0
+    second_act_init_std: 0.6
+    second_act_init_std_dims: [12, 13, 14, 15, 16, 17]   # 6D rotation dims (shifted -1 vs peg: surface action has no success-pred dim, so gain block starts at 6 not 7)
+    selection_distribution: product
+    actor_n: 2
+    actor_latent: 512
+    last_layer_scale: 0.1
+    clip_log_std: true
+    min_log_std: -20.0
+    max_log_std: 2.0
+    reduction: sum
+    use_state_dependent_std: false
+    bernoulli_action_dims: null
+    force_zero_action_dims: null
+    scale_down_action_dims: [0, 1, 2, 12, 13, 14, 15, 16, 17]   # pose deltas (0-2) + the 6D rotation dims (12-17, shifted -1 vs peg's 13-18: no success-pred dim on the surface)
+  critic:
+    critic_output_init_mean: 0.0
+    critic_n: 4
+    critic_latent: 1024
+    clip_actions: false
+
+controller_cfg:
+  # ---- control type selector (the single switch) ----
+  # "pose"                  : No wrapper
+  # "pose-VICES"            : Applies VICPoseWrapper (diagonal vic only)
+  # "hybrid"                : HybridForcePositionWrapper (selection + force only)
+  # "hybrid-vic"            : HybridVICWrapper (full raw gain mats + sel + force)
+  # "ctrl-action-interface" : CtrlActionInterfaceWrapper (different parameterization of hyprid-vic)
+  control_type: ctrl-action-interface
+
+  # ---- formulation selector (the single switch) ----
+  # "constant"          : fixed diagonal K from default_task_prop_gains (K_f from
+  #                       default_task_force_gains); 0 extra action dims.
+  # "variable_diagonal" : per-axis diagonal K, 6 dims, geometric scaling.
+  # "cholesky"          : block-diagonal SPD K = blkdiag(L_pos L_posᵀ, L_rot L_rotᵀ), 12 dims
+  #                       (per block: 3 L-diagonal + 3 L-off-diagonal). D = zeros for now.
+  # "rotated"           : diagonal K (6) + 6-D rotation vector (6) = 12 dims; R applied as
+  #                       blkdiag(R,R) to the full 6x6.
+  gain_mapping: rotated #"constant" #
+  #fixed_rotation_rpy: [0.0, 30.0, 0.0]   # stiffness-frame R; aligned to the 30deg grasp tilt (used only when gain_mapping=rotated)
+
+  # Toggle force control. When false: NO selection/force-target dims, K_f = zeros, and
+  # force_axes MUST be all-zero. When true: force_axes selects eligible axes (adds 2*N dims)
+  # and K_f gets its own gain dims (same formulation as pose K).
+  use_hybrid_force: false
+  force_axes: [0, 0, 0, 0, 0, 0]   # x,y,z force-eligible (must be all-zero when use_hybrid_force=false)
+  async_z_force_bounds: true
+  # ---- shared per-axis bounds [x,y,z,Rx,Ry,Rz], geometric scaling k = lo*(hi/lo)^((a+1)/2) ----
+  # A lower bound < ~1e-6 disables that channel (k=0) instead of producing NaN, so use > 0 for
+  # meaningful variable impedance. Translation and rotation differ ~10x, hence the split values.
+  gain_min: [400, 400, 400, 20, 20, 20] # pose stiffness K (position x3, rotation x3)
+  gain_max: [800, 800, 800, 40, 40, 40] 
+
+  # Policy commands the pose stiffness directly, so disable the base Forge env's per-reset
+  # multiplicative gain randomization (default [0.41]x6) to avoid randomizing on top of the
+  # commanded gains. Constant-mode configs keep the base default so their fixed gains stay randomized.
+  task_prop_gains_noise_level: [0, 0, 0, 0, 0, 0]
+
+  # NOT USED BEFORE
+  force_gain_min: [0.35, 0.35, 0.35, 0.07, 0.07, 0.07]  # force stiffness K_f (force x3, torque x3)
+  force_gain_max: [0.705, 0.705, 0.705, 0.141, 0.141, 0.141]
+
+  # Cholesky-only: off-diagonal L entry = chol_offdiag_rho * sqrt(lo*hi) * clamp(a,-1,1).
+  # 0.0 => diagonal-only (equivalent to variable_diagonal but with 12 dims). Increase to
+  # allow within-block (translation- or rotation-) axis coupling.
+  chol_offdiag_rho: 0.9
+
+  # cholesky/rotated only: learn the full 6-DOF gain matrix (position + orientation)
+  # instead of the translational 3x3 block alone. Changes action dim => re-tune
+  # target_entropy if enabled.
+  full_gain_matrix: true
+
+  # Full 3-DOF orientation control: command roll/pitch/yaw as a delta-axis-angle rotation
+  # scaled by rot_action_bounds, instead of the default yaw-only map (roll/pitch forced to 0).
+  # When true, also set the actor's force_zero_action_dims=null so Rx/Ry are learnable, and
+  # tune rot_action_bounds (it now governs the orientation cone). Wrapper control types only.
+  full_orientation_control: true
+  orientation_obs_mode: "6d_rot_mat"   # standardized: same orientation obs across all methods
+
+  # ---- rotation action scaling (rot_action_bounds REMOVED) ----
+  # EEF-relative control scales action[3:6] in [-1,1] DIRECTLY by rot_action_threshold, so it maps
+  # linearly to +/- that (rad) with no separate bound (which used to saturate the range). This value
+  # also caps the per-step change and becomes env.rot_threshold.
+  rot_action_threshold: [0.097, 0.097, 0.097]   # Forge default (env.rot_threshold)
+
+  # ---- hybrid force-control fields (used on force-eligible axes when use_hybrid_force) ----
+  force_action_bounds: [20.0, 20.0, 20.0]
+  torque_action_bounds: [0.25, 0.25, 0.25]
+  force_action_threshold: [2.0, 2.0, 2.0]
+  torque_action_threshold: [0.01, 0.01, 0.01]
+
+  #default_task_prop_gains: [100, 100, 100, 30, 30, 30]
+  default_task_force_gains: [0.5, 0.5, 0.5, 0.1, 0.1, 0.1]   # K_f diagonal in "constant" mode
+  #default_task_force_gains: [2.8, 2.8, 2.8, 0.1, 0.1, 0.1]
+  async_z_force_bounds: true
+  apply_ema_force: false
+  no_sel_ema: true
+  ema_mode: action
+  # NOTE: damping D is derived (2*sqrt(K), or zeros for cholesky), so damping_min/max are
+  # unused here; gain_min/gain_max (pose stiffness) ARE used.
+
+sensor_cfg:
+  contact:
+    enabled: true
+    contact_force_threshold: 1.0
+    log_contact_state: false
+    append_to_policy_obs: false
+    append_to_critic_state: true

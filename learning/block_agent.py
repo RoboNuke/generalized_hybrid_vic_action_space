@@ -65,6 +65,7 @@ class BlockAgent(Agent):
         cfg=None,
         num_agents: int = 1,
         contact_axes: list[int] | None = None,
+        rot6d_slice: tuple[int, int] | None = None,
     ) -> None:
         super().__init__(
             models=models,
@@ -88,6 +89,13 @@ class BlockAgent(Agent):
         self._contact_dim = len(contact_axes) if contact_axes else 0
         # One-step buffer: the contact the policy SAW at obs(t), written with transition t.
         self._pending_contact: torch.Tensor | None = None
+
+        # Optional ground-truth rotation-frame buffering for the supervised-rotation loss.
+        # ``rot6d_slice`` = (lo, hi) into the action = the policy's rot6d dims (learned rotation);
+        # None disables both the memory target and the loss. When set, the 9-vector eef<-interaction
+        # target env.extras["gt_interaction_rot"] is buffered (one-step aligned, like contact).
+        self._rot6d_slice = tuple(rot6d_slice) if rot6d_slice is not None else None
+        self._pending_rot_target: torch.Tensor | None = None
 
         # per-agent tracking buffers (writers created in init() once experiment_dir is set)
         # Per-agent scalar sink: a raw skrl SummaryWriter, or (when experiment.wandb
@@ -1185,6 +1193,37 @@ class BlockAgent(Agent):
         done = (terminated + truncated).bool().view(-1)
         nxt[done] = 0.0
         self._pending_contact = nxt
+
+    # --------------------------------------------------------------
+    # Ground-truth rotation-frame buffering (supervised-rotation loss)
+    # --------------------------------------------------------------
+    def _maybe_create_rot_target_tensor(self) -> None:
+        """When ``rot6d_slice`` is set, create the 9-wide ``gt_interaction_rot`` memory tensor
+        (flattened eef<-interaction 3x3) and add it to ``self._tensors_names`` so it is returned in
+        the sampled minibatch. Call at the end of each subclass ``_create_memory_tensors``."""
+        if self._rot6d_slice is not None and self.memory is not None:
+            self.memory.create_tensor(name="gt_interaction_rot", size=9, dtype=torch.float32)
+            self._tensors_names.append("gt_interaction_rot")
+
+    def _buffer_rot_target_for_write(
+        self, *, terminated: torch.Tensor, truncated: torch.Tensor, infos: Any, add_kwargs: dict
+    ) -> None:
+        """One-step-aligned ground-truth rotation target (mirror of ``_buffer_contact_for_write``).
+        Injects the target the policy's rotation at obs(t) should match (= the interaction frame from
+        the previous step's post-step state), then refreshes the pending buffer from this step's
+        ``infos["gt_interaction_rot"]``, resetting finished envs to IDENTITY (a fresh episode's first
+        frame is recomputed). No-op when ``rot6d_slice`` is None."""
+        if self._rot6d_slice is None:
+            return
+        n_envs = terminated.shape[0]
+        eye9 = torch.eye(3, device=self.device).reshape(9)
+        if self._pending_rot_target is None:
+            self._pending_rot_target = eye9.unsqueeze(0).repeat(n_envs, 1)
+        add_kwargs["gt_interaction_rot"] = self._pending_rot_target
+        raw = infos.get("gt_interaction_rot") if isinstance(infos, dict) else None
+        nxt = raw.to(self.device).float().clone() if raw is not None else eye9.unsqueeze(0).repeat(n_envs, 1)
+        nxt[(terminated + truncated).bool().view(-1)] = eye9
+        self._pending_rot_target = nxt
 
     # --------------------------------------------------------------
     # Per-agent checkpoint save/load (generic; specialized via hooks)

@@ -164,6 +164,43 @@ class SupervisedSelectionLoss(AuxLoss):
         return bce.mean(dim=-1).view(ctx.agent.num_agents, -1).mean(dim=1)
 
 
+@register_loss
+class SupervisedRotationLoss(AuxLoss):
+    """Chordal supervision of the GAS policy's LEARNED rotation frame toward the ground-truth
+    interaction frame (exactly what a fixed-rot controller would use).
+
+    Policy-only. Decodes the policy's rotation ``R_pi = rotation_6d_to_matrix(actions[:, rot6d_slice])``
+    from the freshly re-sampled ``ctx.actions`` (grad-carrying) and compares it to the buffered
+    noise-free target ``R_tgt = ctx.sampled["gt_interaction_rot"]`` (eef<-interaction, ``(N*B, 9)``)
+    with the chordal / Frobenius distance ``||R_pi - R_tgt||_F^2 = 6 - 2·tr(R_piᵀ R_tgt)`` (smooth,
+    no arccos singularities; 0 when aligned, 8 when antipodal). Requires ``gain_mapping="rotated"``
+    with a LEARNED rotation — the runner sets ``agent._rot6d_slice`` (None for fixed-rot / non-rotated).
+    """
+
+    name = "supervised_rotation"
+    supported_targets = ("policy",)
+
+    def compute(self, ctx: LossContext) -> torch.Tensor:
+        sl = getattr(ctx.agent, "_rot6d_slice", None)
+        if sl is None:
+            raise ValueError(
+                "supervised_rotation loss is enabled but agent._rot6d_slice is None — it requires a "
+                "LEARNED rotation frame (gain_mapping='rotated' WITHOUT fixed_rotation_*)."
+            )
+        if "gt_interaction_rot" not in ctx.sampled:
+            raise KeyError(
+                "supervised_rotation loss needs ctx.sampled['gt_interaction_rot'] — the agent was not "
+                "set up to buffer it (the runner enables the buffer when this loss is on)."
+            )
+        # Lazy import: factory_control_utils pulls in Isaac math, only safe after the app has booted.
+        from wrappers.controllers.factory_control_utils import rotation_6d_to_matrix
+
+        R_pi = rotation_6d_to_matrix(ctx.actions[:, sl[0]:sl[1]])       # (N*B, 3, 3) grad-carrying
+        R_tgt = ctx.sampled["gt_interaction_rot"].view(-1, 3, 3)        # (N*B, 3, 3) noise-free target
+        chordal = ((R_pi - R_tgt) ** 2).sum(dim=(-2, -1))              # (N*B,) = 6 - 2·tr(R_piᵀ R_tgt)
+        return chordal.view(ctx.agent.num_agents, -1).mean(dim=1)      # (N,) per-agent
+
+
 @dataclasses.dataclass
 class _LossEntry:
     """One enabled loss plus its resolved per-target weights (internal to the

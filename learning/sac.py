@@ -41,6 +41,7 @@ class SAC(BlockAgent):
         num_agents: int = 1,
         aux_losses: "AuxLossManager | None" = None,
         contact_axes: list[int] | None = None,
+        rot6d_slice: tuple[int, int] | None = None,
     ) -> None:
         """Soft Actor-Critic (SAC) with per-agent block-parallel independence.
 
@@ -76,6 +77,7 @@ class SAC(BlockAgent):
             cfg=SAC_CFG(**cfg) if isinstance(cfg, dict) else cfg,
             num_agents=num_agents,
             contact_axes=contact_axes,
+            rot6d_slice=rot6d_slice,
         )
 
         # Asymmetric actor-critic: when ``state_space`` is provided, the critic
@@ -230,6 +232,8 @@ class SAC(BlockAgent):
 
             # Optional ground-truth contact tensor for the supervised-selection loss.
             self._maybe_create_contact_tensor()
+            # Optional ground-truth rotation-frame tensor for the supervised-rotation loss.
+            self._maybe_create_rot_target_tensor()
 
     # --------------------------------------------------------------
     # Interaction
@@ -303,6 +307,10 @@ class SAC(BlockAgent):
                 extra_kwargs["next_states"] = next_states
             # One-step-aligned contact ground truth for the SSL (no-op unless contact_axes).
             self._buffer_contact_for_write(
+                terminated=terminated, truncated=truncated, infos=infos, add_kwargs=extra_kwargs
+            )
+            # One-step-aligned rotation-frame target for the supervised-rotation loss (no-op unless rot6d_slice).
+            self._buffer_rot_target_for_write(
                 terminated=terminated, truncated=truncated, infos=infos, add_kwargs=extra_kwargs
             )
             self.memory.add_samples(
