@@ -104,15 +104,14 @@ class FlatSurfaceFollowTask(ForgeTask):
     keypoint_reward_weight: float = 1.0
 
     # --- Interaction (stiffness) frame: consumed by the rotated controllers' fixed_rotation_from_
-    #     interaction variant, the impedance metrics, and the viz marker (interaction_frame_world). ---
+    #     interaction variant and the viz marker (interaction_frame_world). ---
     # "geometric": z = surface normal, x = path_dir (along-track), y = cross-track — pure surface frame.
     # "dynamic":   z = direction of the measured contact REACTION (force_sensor_world_smooth, clean/
     #              EMA-smoothed, peg-gravity off), so the frame tilts off the normal by the friction
-    #              angle; x = path_dir projected ⊥ z (along-track), y = z × x (cross-track). Reverts to
-    #              the geometric frame when ‖force‖ < interaction_frame_min_force (direction undefined
-    #              off-contact), so it degrades gracefully.
+    #              angle; x = path_dir projected ⊥ z (along-track), y = z × x (cross-track).
+    # OFF-CONTACT (env.in_contact_any False — the single contact source of truth) BOTH modes collapse
+    # to the control/EEF frame (identity stiffness rotation): no surface, so stiffness is control-frame.
     interaction_frame_mode: str = "geometric"
-    interaction_frame_min_force: float = 0.5   # N; below this the dynamic frame falls back to geometric
 
     # --- Termination (per-env). Both default OFF. When EITHER is on, env_setup auto-attaches the
     # efficient-reset wrapper so partial resets teleport (no sim steps) instead of running Factory's

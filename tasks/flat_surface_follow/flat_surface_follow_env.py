@@ -210,14 +210,13 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             & EMA-smoothed; peg gravity is disabled so it's contact-only), which tilts off the normal
             by the friction angle. x = path_dir projected ⊥ z (along-track), y = z × x (cross-track).
 
-        OFF-CONTACT (‖force‖ < interaction_frame_min_force), BOTH modes return R_eef (world<-eef), so
-        the controller's R = R_eefᵀ·this = IDENTITY — with no surface to interact with, the stiffness
-        is applied in the control (EEF) frame, not a surface/reaction frame."""
-        f = self.force_sensor_world_smooth[:, 0:3]                                    # (E,3) world reaction
-        fmag = torch.linalg.norm(f, dim=-1, keepdim=True)                             # (E,1)
-        in_contact = fmag.squeeze(-1) > float(self.cfg_task.interaction_frame_min_force)   # (E,)
+        OFF-CONTACT, BOTH modes return R_eef (world<-eef), so the controller's R = R_eefᵀ·this =
+        IDENTITY — with no surface to interact with, the stiffness is applied in the control (EEF)
+        frame, not a surface/reaction frame. Contact is the env's single source of truth,
+        ``self.in_contact_any`` (contact sensor / normal-force fallback)."""
         if getattr(self.cfg_task, "interaction_frame_mode", "geometric") == "dynamic":
-            z = f / fmag.clamp_min(1e-6)                                              # z along the reaction
+            f = self.force_sensor_world_smooth[:, 0:3]                                # (E,3) world reaction
+            z = f / torch.linalg.norm(f, dim=-1, keepdim=True).clamp_min(1e-6)        # z along the reaction
             x = self.path_dir - (self.path_dir * z).sum(-1, keepdim=True) * z         # along-track ⊥ z
             x = x / torch.linalg.norm(x, dim=-1, keepdim=True).clamp_min(1e-6)
             frame = torch.stack([x, torch.cross(z, x, dim=-1), z], dim=-1)            # (E,3,3)
@@ -225,7 +224,7 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             frame = torch.stack([self.path_dir, self.d_lat, self.surface_normal], dim=-1)  # (E,3,3)
         # Off-contact -> R_eef so the stiffness rotation collapses to identity (stiffness in the EEF frame).
         R_eef = matrix_from_quat(self.fingertip_midpoint_quat)                        # (E,3,3) world<-eef
-        return torch.where(in_contact[:, None, None], frame, R_eef)
+        return torch.where(self.in_contact_any[:, None, None], frame, R_eef)
 
     # ------------------------------------------------------------------
     # Scene: procedural plate (fixed) + cylinder (held)
