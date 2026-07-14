@@ -211,7 +211,7 @@ def compose_tile(frame, force_squash, orn_squash, inset, border_rgb=None, pad=6,
     frame = np.asarray(frame, dtype=np.uint8).copy()
     H, W = frame.shape[:2]
     if inset is not None:
-        iw = int(W // 3 * 0.8)                       # ~20% smaller top-down inset
+        iw = int(W // 3 * 1.6)                       # top-down inset ~2x larger (scales with frame width)
         ins = np.asarray(Image.fromarray(inset).resize((iw, iw)), dtype=np.uint8)
         _paste(frame, ins, pad, H - iw - pad)
     if border_rgb is not None:                       # green success border around the IMAGE frame only

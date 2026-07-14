@@ -41,7 +41,7 @@ runner_cfg:
   # envs, since num_agents=1). 12 keeps the per-step GPU/camera load modest while
   # still filling the 3x4 grid from a single episode. Raise for more parallelism
   # (fewer episodes) at the cost of more simultaneous camera tiles.
-  num_envs: 48
+  num_envs: 24
   # Eval never samples the replay buffer, so keep it tiny.
   memory_size: 50_000
 

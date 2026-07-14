@@ -398,9 +398,12 @@ def collect_stills_grid(
 
     grid = sv.montage(tiles, rows, cols)
     out_path = os.path.join(output_dir, out_name)
-    Image.fromarray(grid).save(out_path)
-    print(f"[record] wrote stills grid {out_path} "
-          f"({rows}x{cols} tiles, {int(success.sum())}/{n_tiles} succeeded)", flush=True)
+    # stills_grid_png=False writes ONLY the mp4 below (no PNG montage) — for a pure video request.
+    write_png = bool(getattr(recorder_cfg, "stills_grid_png", True))
+    if write_png:
+        Image.fromarray(grid).save(out_path)
+        print(f"[record] wrote stills grid {out_path} "
+              f"({rows}x{cols} tiles, {int(success.sum())}/{n_tiles} succeeded)", flush=True)
 
     # Optional full mp4 of the SAME rollout: per-frame gauges + a top-down path that grows over time
     # (the in-scene keypoint balls animate for free in the captured frames). The matplotlib inset is
@@ -446,5 +449,215 @@ def collect_stills_grid(
         vid_base = os.path.join(output_dir, os.path.splitext(out_name)[0])
         vid_path = write_video(video, vid_base, fps=int(recorder_cfg.fps), fmt="mp4")
         print(f"[record] wrote stills video {vid_path} ({Tmax} frames)", flush=True)
+        if not write_png:
+            out_path = vid_path  # nothing else written; return the mp4 path
 
     return out_path
+
+
+def collect_annotated_ranked(
+    *,
+    env: Any,
+    agent: Any,
+    recorder_cfg: Any,
+    camera: Any,
+    max_episode_length: int,
+    num_trajectories: int,
+    output_dir: str,
+    gif_name: str = "recording.mp4",
+) -> str:
+    """Collect >= ``num_trajectories`` full episodes, select best-4 / median-4 / worst-4 by return,
+    and write an ANNOTATED 3x4 grid video of the selected 12 — the surface overlays (in-scene keypoint
+    balls + force/orientation gauges + top-down path inset) drawn on the RANKED selection.
+
+    This is the annotated viz layered ON TOP of the best/median/worst grid (unlike
+    :func:`collect_stills_grid`, which tiles one unranked rollout). Surface-task only (requires
+    ``env.viz_snapshot``). Returns the written mp4 path.
+    """
+    from learning import surface_viz as sv
+    from wrappers.recording_grid import select_grid_indices, write_video
+
+    uenv = env.unwrapped
+    if not hasattr(uenv, "viz_snapshot"):
+        raise RuntimeError("annotated_ranked requires FlatSurfaceFollowEnv (env.viz_snapshot missing).")
+
+    num_envs = int(env.num_envs)
+    H, W = int(recorder_cfg.height), int(recorder_cfg.width)
+    T = int(max_episode_length)
+    if T <= 0:
+        raise RuntimeError(f"max_episode_length must be > 0; got {max_episode_length!r}.")
+    rows, cols = 3, 4                       # best-4 / median-4 / worst-4 (matches the plain grid video)
+    n_sel = rows * cols
+    overlays = bool(getattr(recorder_cfg, "surface_overlays", True))
+    ball_frac = float(getattr(recorder_cfg, "ball_diameter_frac", 1.6))
+    os.makedirs(output_dir, exist_ok=True)
+    num_episodes = max(1, math.ceil(int(num_trajectories) / max(1, num_envs)))
+    print(f"[record] annotated-ranked: collecting >= {num_trajectories} trajectories "
+          f"({num_episodes} ep x {num_envs} envs), then best/median/worst {rows}x{cols}", flush=True)
+
+    # Per-trajectory stores, indexed GLOBALLY across episodes (like collect_and_record).
+    coll_frames: list[torch.Tensor] = []
+    coll_returns: list[float] = []
+    coll_term: list[int] = []
+    coll_succ: list[bool] = []
+    coll_fsq: list[np.ndarray] = []; coll_osq: list[np.ndarray] = []
+    coll_fN: list[np.ndarray] = [];  coll_ang: list[np.ndarray] = []
+    coll_tru: list[np.ndarray] = []; coll_trv: list[np.ndarray] = []
+    coll_trc: list[np.ndarray] = []; coll_tro: list[np.ndarray] = []
+    coll_start_uv: list[np.ndarray] = []; coll_goal_uv: list[np.ndarray] = []
+    coll_half: list[float] = [];     coll_desforce: list[float] = []
+
+    # In-scene markers persist across episodes; positions/colours are re-set each reset.
+    markers = goal_marker = pace_marker = None
+    k = 0
+
+    set_camera_active(camera, True)
+    try:
+        for ep in range(num_episodes):
+            frames = torch.zeros((num_envs, T, H, W, 3), dtype=torch.uint8)
+            returns = torch.zeros(num_envs, dtype=torch.float32)
+            term_step = np.full(num_envs, T - 1, dtype=np.int64)
+            success = np.zeros(num_envs, dtype=bool)
+            fsq = np.zeros((num_envs, T), np.float32); osq = np.zeros((num_envs, T), np.float32)
+            fN = np.zeros((num_envs, T), np.float32);  ang = np.zeros((num_envs, T), np.float32)
+            tru = np.zeros((num_envs, T), np.float32); trv = np.zeros((num_envs, T), np.float32)
+            trc = np.zeros((num_envs, T), bool);       tro = np.zeros((num_envs, T), bool)
+            env_done = np.zeros(num_envs, dtype=bool)
+            tracker = None; const = {}; des_force = None
+            base = start_w_env = path_dir_np = goal_lift = None
+            cur_s_ref = np.zeros(num_envs, np.float32)
+
+            obs, _ = env.reset()
+            state = _resolve_state(env, obs)
+            for t in range(T):
+                if tracker is not None:                                  # colour balls + move markers
+                    markers.update(tracker.marker_indices())
+                    gidx = np.clip(tracker.setpoint_idx - 1, 0, k - 1)
+                    goal_marker.update(base[np.arange(num_envs), gidx] + goal_lift)
+                    pace_marker.update(start_w_env + cur_s_ref[:, None] * path_dir_np + goal_lift)
+                actions, _ = agent.act(obs, state, timestep=10**9, timesteps=10**9)
+                obs, reward, terminated, truncated, info = env.step(actions)
+                rgb = read_camera_rgb(camera)
+                snap = uenv.viz_snapshot()
+
+                if t == 0:                                               # (re)build per-episode frame/markers
+                    spacing = float(snap["keypoint_spacing"])
+                    k = int(snap["keypoints_total"].min().item())
+                    radius = spacing * ball_frac / 2.0
+                    normal = snap["surface_normal"].numpy()
+                    env_origins = uenv.scene.env_origins.detach().cpu().numpy()
+                    base = sv.keypoint_world_positions(snap["start_w"], snap["path_dir"], spacing, k)
+                    base = base + env_origins[:, None, :]
+                    goal_radius = radius * 4.0
+                    goal_lift = normal * goal_radius
+                    if markers is None:                                  # create USD prims once
+                        markers = sv.KeypointBallMarkers("/World/Visuals/surface_keypoints", radius=radius)
+                        goal_marker = sv.GoalMarker("/World/Visuals/surface_goal", radius=goal_radius)
+                        pace_marker = sv.GoalMarker("/World/Visuals/surface_pace", radius=goal_radius, opacity=0.4)
+                    markers.set_positions((base + normal[:, None, :] * radius).reshape(-1, 3))
+                    start_w_env = snap["start_w"].numpy() + env_origins
+                    path_dir_np = snap["path_dir"].numpy()
+                    tracker = sv.KeypointStatusTracker(num_envs, k, spacing)
+                    des_force = np.maximum(snap["desired_force_N"].numpy(), 1e-6)
+                    start_w = snap["start_w"].numpy(); goal_w = snap["goal_w"].numpy()
+                    u_dir = snap["path_dir"].numpy(); v_dir = snap["d_lat"].numpy()
+                    center = 0.5 * (start_w + goal_w)
+                    su, svv = sv.project_uv(start_w, center, u_dir, v_dir)
+                    gu, gvv = sv.project_uv(goal_w, center, u_dir, v_dir)
+                    half = 0.5 * snap["path_length"].numpy()
+                    const = dict(center=center, u=u_dir, v=v_dir, start_uv=np.stack([su, svv], 1),
+                                 goal_uv=np.stack([gu, gvv], 1), half=half)
+
+                tu, tv = sv.project_uv(snap["tip_w"].numpy(), const["center"], const["u"], const["v"])
+                over = (np.abs(tu) <= const["half"]) & (np.abs(tv) <= const["half"])
+                alive = ~env_done
+                fsq[alive, t] = snap["force_squash"].numpy()[alive]
+                osq[alive, t] = snap["orn_squash"].numpy()[alive]
+                fN[alive, t] = snap["force_N"].numpy()[alive]
+                ang[alive, t] = snap["angle_dev_deg"].numpy()[alive]
+                tru[alive, t] = tu[alive]; trv[alive, t] = tv[alive]
+                trc[alive, t] = snap["in_contact"].numpy()[alive]
+                tro[alive, t] = over[alive]
+                alive_idx = np.nonzero(alive)[0]
+                if alive_idx.size:
+                    ii = torch.from_numpy(alive_idx)
+                    frames[ii, t] = rgb[ii]
+                    returns[ii] += reward.detach().view(-1).float().cpu()[ii]
+                cur_s_ref = snap["s_ref"].numpy()
+                tracker.update(snap["progress"].numpy(), snap["in_contact"].numpy())
+
+                term_now = _coerce_done(terminated).cpu().numpy()
+                trunc_now = _coerce_done(truncated).cpu().numpy()
+                new_done = (term_now | trunc_now) & alive
+                if new_done.any():
+                    idx = np.nonzero(new_done)[0]
+                    term_step[idx] = t
+                    succ = info.get("is_success", None)
+                    if isinstance(succ, torch.Tensor):
+                        success[idx] = succ.view(-1).bool().cpu().numpy()[idx]
+                    env_done[idx] = True
+                state = _resolve_state(env, obs)
+                if env_done.all():
+                    break
+
+            for e in range(num_envs):                                    # harvest this episode's trajectories
+                coll_frames.append(frames[e].clone())
+                coll_returns.append(float(returns[e])); coll_term.append(int(term_step[e]))
+                coll_succ.append(bool(success[e]))
+                coll_fsq.append(fsq[e].copy()); coll_osq.append(osq[e].copy())
+                coll_fN.append(fN[e].copy());   coll_ang.append(ang[e].copy())
+                coll_tru.append(tru[e].copy()); coll_trv.append(trv[e].copy())
+                coll_trc.append(trc[e].copy()); coll_tro.append(tro[e].copy())
+                coll_start_uv.append(const["start_uv"][e].copy()); coll_goal_uv.append(const["goal_uv"][e].copy())
+                coll_half.append(float(const["half"][e])); coll_desforce.append(float(des_force[e]))
+            del frames
+            print(f"[record] episode {ep + 1}/{num_episodes} done — {len(coll_frames)} trajectories", flush=True)
+    finally:
+        set_camera_active(camera, False)
+
+    R = torch.tensor(coll_returns)
+    sel = select_grid_indices(R).tolist()                                # 12 indices: best-4/median-4/worst-4
+    print(f"[record] selected {len(sel)}/{len(coll_frames)} by return "
+          f"(best={[round(coll_returns[j], 1) for j in sel[:4]]} "
+          f"worst={[round(coll_returns[j], 1) for j in sel[-4:]]})", flush=True)
+
+    # Animate the selected trajectories; insets cached at stride K (matplotlib is the bottleneck).
+    K = 3
+    Tmax = max(int(coll_term[j]) for j in sel) + 1
+    inset_cache: dict[int, list] = {}
+    if overlays:
+        for j in sel:
+            di = int(coll_term[j]); cache = []
+            for tt in range(0, di + 1, K):
+                cache.append(sv.topdown_inset(
+                    coll_tru[j][: tt + 1], coll_trv[j][: tt + 1], coll_trc[j][: tt + 1], coll_tro[j][: tt + 1],
+                    coll_start_uv[j], coll_goal_uv[j], coll_half[j], coll_half[j]))
+            inset_cache[j] = cache or [None]
+
+    fmt = getattr(recorder_cfg, "video_format", "mp4")
+    video = None
+    for t in range(Tmax):
+        tiles = []
+        for j in sel:
+            di = int(coll_term[j]); q = min(t, di)                       # freeze finished trajectories
+            frame = coll_frames[j][q].numpy()
+            border = (45, 200, 95) if (coll_succ[j] and t >= di) else None
+            if overlays:
+                ins = inset_cache[j][min(q // K, len(inset_cache[j]) - 1)]
+                tiles.append(sv.compose_tile(
+                    frame, float(coll_fsq[j][q]), float(coll_osq[j][q]), ins, border,
+                    force_text=f"{coll_fN[j][q]:.1f}N", orn_text=f"{coll_ang[j][q]:+.0f}°",
+                    force_fill=float(coll_fN[j][q] / (2.0 * coll_desforce[j])),
+                    orn_fill=float(coll_ang[j][q] / 30.0)))
+            else:
+                tiles.append(frame if border is None else sv.compose_tile(frame, 0, 0, None, border))
+        gframe = sv.montage(tiles, rows, cols)
+        if video is None:
+            video = np.zeros((Tmax,) + gframe.shape, dtype=np.uint8)
+        video[t] = gframe
+
+    vid_base = os.path.join(output_dir, os.path.splitext(gif_name)[0])
+    vid_path = write_video(video, vid_base, fps=int(recorder_cfg.fps), fmt=fmt)
+    print(f"[record] wrote annotated-ranked video {vid_path} "
+          f"({Tmax} frames, {rows}x{cols} of {len(coll_frames)} trajectories)", flush=True)
+    return vid_path

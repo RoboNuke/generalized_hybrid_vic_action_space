@@ -92,6 +92,18 @@ class RecorderCfg:
     """When ``stills_grid`` is on, ALSO write a full mp4 of the same rollout (per-frame gauges +
     a growing top-down path; the in-scene keypoint balls animate in the captured frames)."""
 
+    stills_grid_png: bool = True
+    """When ``stills_grid`` is on, write the PNG montage. Set False to write ONLY the mp4
+    (``stills_grid_video`` must then be on) — a pure video with no still montage."""
+
+    annotated_ranked: bool = False
+    """Surface-task only, and mutually exclusive with ``stills_grid``. When True, ``record.py``
+    collects >= ``num_trajectories`` full episodes, selects best-4 / median-4 / worst-4 by return
+    (the same ranking as the plain grid video), and writes an ANNOTATED 3x4 grid mp4 of the selected
+    12 — the surface overlays (in-scene keypoint balls + force/orientation gauges + top-down path
+    inset) drawn on the RANKED selection. This is the annotated viz layered on top of best/median/
+    worst, rather than an unranked single rollout (``stills_grid``)."""
+
     surface_overlays: bool = True
     """When ``stills_grid`` is on, draw the surface-follow overlays (force/orientation gauges +
     top-down path inset) on each tile. The in-scene keypoint balls are added separately by the
