@@ -116,6 +116,123 @@ def load_data(folder_name: str, root: str | None = None, verbose: bool = True) -
     return data
 
 
+# --------------------------------------------------------------------------- #
+# wandb -> local TensorBoard cache (download once, both notebooks reuse)
+# --------------------------------------------------------------------------- #
+def _group_complete(group_dir: str, expected: int) -> bool:
+    """True if ``group_dir`` already holds a full set of downloaded runs.
+
+    Requires at least ``expected`` numbered run sub-dirs, each carrying an
+    ``events.out.tfevents.*`` file. Used as the download-once cache check so a
+    complete group is never re-fetched (and a partial one IS re-fetched).
+    """
+    if not os.path.isdir(group_dir):
+        return False
+    run_dirs = [d for d in os.listdir(group_dir) if d.isdigit()]
+    if len(run_dirs) < expected:
+        return False
+    return all(
+        glob.glob(os.path.join(group_dir, d, "events.out.tfevents.*")) for d in run_dirs
+    )
+
+
+def _write_tfevents(run_dir: str, hist, step_key: str = "_step") -> int:
+    """Write one wandb run's history DataFrame to a TensorBoard event file in ``run_dir``.
+
+    Every numeric scalar column becomes an ``add_scalar`` series keyed on ``step_key``
+    (wandb ``_step`` == the training timestep, so the step axis matches the native TB
+    files). Non-numeric / internal (``_*``, ``gradient*``) columns and non-finite points
+    are skipped. Returns the number of scalar series written.
+    """
+    import math
+
+    from torch.utils.tensorboard import SummaryWriter
+
+    if step_key not in hist.columns:
+        raise KeyError(f"wandb history missing {step_key!r}; columns={list(hist.columns)[:8]}...")
+
+    writer = SummaryWriter(log_dir=run_dir)
+    steps = hist[step_key].to_numpy()
+    n_series = 0
+    for col in hist.columns:
+        if col == step_key or col.startswith("_") or col.startswith("gradient"):
+            continue
+        vals = hist[col].to_numpy()
+        wrote = False
+        for s, v in zip(steps, vals):
+            if v is None or s is None:
+                continue
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                break  # a non-scalar column (media / string) — skip it entirely
+            if not math.isfinite(fv) or not math.isfinite(float(s)):
+                continue
+            writer.add_scalar(col, fv, int(s))
+            wrote = True
+        n_series += int(wrote)
+    writer.flush()
+    writer.close()
+    return n_series
+
+
+def download_wandb_data(project: str, tag: str, entity: str | None = "hur",
+                        root: str | None = None, samples: int = 100_000,
+                        step_key: str = "_step", verbose: bool = True) -> str:
+    """Download every wandb run in ``{entity}/{project}`` carrying ``tag`` into the local
+    ``runs/{project}_{tag}/{group}/{agent_index}/`` tree as TensorBoard event files — the
+    exact layout :func:`load_data` reads — then return the folder name ``"{project}_{tag}"``.
+
+    Runs are bucketed by their wandb ``group`` (the method, e.g. ``5_GAS``) and numbered by
+    ``config['agent_index']``. **Download-once cache:** a group whose local dir already holds
+    a complete set of runs is skipped (see :func:`_group_complete`), so re-running this — or
+    the *other* analysis notebook — reuses the data without re-downloading, even if plotting
+    settings change. Delete a group's folder to force a refresh.
+
+    Requires ``wandb`` (API access) and ``torch`` (the tfevents writer); both are imported
+    lazily so the local-only workflow needs neither.
+    """
+    from collections import defaultdict
+
+    import wandb
+
+    folder = f"{project}_{tag}"
+    base = os.path.join(root or runs_root(), folder)
+
+    api = wandb.Api(timeout=60)
+    path = project if "/" in project else (f"{entity}/{project}" if entity else project)
+    runs = list(api.runs(path, filters={"tags": tag}))
+    if not runs:
+        raise RuntimeError(f"no wandb runs found in {path!r} tagged {tag!r}")
+
+    groups: dict = defaultdict(list)
+    for r in runs:
+        groups[r.group or r.name].append(r)
+
+    if verbose:
+        print(f"[wandb-dl] {len(runs)} run(s) in {path} tagged '{tag}' "
+              f"-> {len(groups)} group(s) -> {base}")
+
+    for group in sorted(groups):
+        grp_runs = groups[group]
+        group_dir = os.path.join(base, group)
+        if _group_complete(group_dir, len(grp_runs)):
+            if verbose:
+                print(f"[wandb-dl]   {group}: cached ({len(grp_runs)} runs), skip")
+            continue
+        for i, r in enumerate(sorted(grp_runs, key=lambda rr: rr.config.get("agent_index", 0))):
+            idx = int(r.config.get("agent_index", i))
+            run_dir = os.path.join(group_dir, str(idx))
+            os.makedirs(run_dir, exist_ok=True)
+            for old in glob.glob(os.path.join(run_dir, "events.out.tfevents.*")):
+                os.remove(old)  # clear any partial prior download for a clean rewrite
+            hist = r.history(samples=samples, pandas=True)
+            n = _write_tfevents(run_dir, hist, step_key)
+            if verbose:
+                print(f"[wandb-dl]   {group}/{idx}: {n} series ({len(hist)} steps) from {r.name}")
+    return folder
+
+
 def filter_top_n(data: dict, n: int, metric: str,
                  step_ceiling: float = np.inf, verbose: bool = True) -> dict:
     """Keep only the top-``n`` runs per group, ranked by each run's peak ``metric``.
@@ -243,8 +360,24 @@ def value_at_best(run: dict, metric: str, best_step: float, step_ceiling: float 
 
 
 def best_point_stats(data: dict, selection_metric: str, metric: str,
-                     ci_z: float = 1.96, step_ceiling: float = np.inf) -> dict:
-    """``{group: (mean, ci)}`` of ``metric`` taken at each run's best selection point."""
+                     ci_z: float = 1.96, step_ceiling: float = np.inf,
+                     offset: float = 0.0, rms: bool = False) -> dict:
+    """``{group: (value, ci)}`` of ``metric`` taken at each run's best selection point.
+
+    Each run is reduced to ``metric`` at the step where ``selection_metric`` peaks, then
+    ``offset`` is subtracted -- so a metric with a target value can be re-centered on it
+    (``value - offset == 0`` means "on target", e.g. ``offset`` = desired force). Across a
+    group's runs:
+
+    * ``rms=False`` (default): ``value`` is the mean signed error, ``ci`` its ``ci_z * SEM``.
+    * ``rms=True``: ``value`` is the root-mean-square error ``sqrt(mean(e_i**2))``. Unlike the
+      signed mean, RMS does NOT let per-run over/undershoots cancel to a misleadingly small
+      number; ``ci`` remains ``ci_z * SEM`` of the per-run errors (a run-to-run spread cue).
+
+    ``offset`` is in the metric's RAW units -- it is applied here, BEFORE any display
+    ``scale`` the table multiplies in later. With ``offset=0.0, rms=False`` this reproduces
+    the original plain-mean behavior.
+    """
     out: dict = {}
     for group, runs in data.items():
         vals = []
@@ -257,10 +390,11 @@ def best_point_stats(data: dict, selection_metric: str, metric: str,
             if v is not None:
                 vals.append(v)
         if vals:
-            arr = np.array(vals)
-            mean = arr.mean()
-            ci = ci_z * arr.std(ddof=1) / np.sqrt(len(arr)) if len(arr) > 1 else 0.0
-            out[group] = (mean, ci)
+            err = np.array(vals) - offset
+            n = len(err)
+            sem = err.std(ddof=1) / np.sqrt(n) if n > 1 else 0.0
+            value = float(np.sqrt(np.mean(err ** 2))) if rms else float(err.mean())
+            out[group] = (value, ci_z * sem)
     return out
 
 

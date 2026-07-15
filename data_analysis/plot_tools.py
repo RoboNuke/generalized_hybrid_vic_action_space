@@ -31,8 +31,11 @@ GLUED_ROT_DISPLAY_NAMES = {
     "1_fixed": "Fixed",
     "2_VICES": "VICES",
     "3_choleskey": "Cholesky",
-    "4_GAS_fixed_rot": "GAS (fixed rot)",
-    "5_GAS": "GAS",
+    "4_GAS_fixed_rot": "Ours (GT Geo-Rot)",
+    "5_GAS": "Ours (No-Losses)", 
+    "6_dynm_fixed_rot": "Ours (GT Dyn-Rot)",
+    "7_GAS_dyn": "Ours (Dyn-Loss)", 
+    "8_GAS_geo": "Ours (Geo-Loss)"
 }
 
 # Fixed color per group (stable across every plot).
@@ -40,8 +43,11 @@ GLUED_ROT_GROUP_COLORS = {
     "1_fixed": "#ff9500",          # orange  -- isotropic baseline
     "2_VICES": "#ff0000",          # red     -- diagonal, axis-aligned
     "3_choleskey": "#1f77b4",      # blue    -- full SPD, fixed frame
-    "4_GAS_fixed_rot": "#7107b8",  # purple  -- diagonal in a fixed rotated frame
+    "4_GAS_fixed_rot": "#a682be",  # purple  -- diagonal in a fixed rotated frame
     "5_GAS": "#1fb426",            # green   -- diagonal + learned rotation
+    "6_dynm_fixed_rot":  "#7107b8",
+    "7_GAS_dyn":  "#0003b3", 
+    "8_GAS_geo":  "#4244a7"
 }
 
 
@@ -178,16 +184,27 @@ def build_latex_table(data: dict, selection_metric: str, table_metrics: list,
     is bolded (max if ``higher_is_better`` else min). Each ``table_metrics`` dict:
     ``tag``, ``header``, ``higher_is_better``, ``unit`` (LaTeX, escape ``%``),
     ``scale``, ``decimals`` (defaults to ``default_decimals``).
+
+    Two optional per-column keys handle target-relative metrics:
+
+    * ``offset`` (default ``0``): subtracted from each run's value (RAW units, before
+      ``scale``), so a metric with a goal reads as an error centered on ``0``.
+    * ``rms`` (default ``False``): report the root-mean-square error across a group's runs
+      instead of the signed mean, so per-run over/undershoots don't cancel. Pair with
+      ``higher_is_better=False`` (smaller error is better).
     """
     sc = style.step_ceiling
-    stats = {s["tag"]: dl.best_point_stats(data, selection_metric, s["tag"], style.ci_z, sc)
+    # Key by column identity, not tag, so the SAME tag may appear in two columns with
+    # different offset/rms options (e.g. raw force AND target-relative RMS force error).
+    stats = {id(s): dl.best_point_stats(data, selection_metric, s["tag"], style.ci_z, sc,
+                                        offset=s.get("offset", 0.0), rms=s.get("rms", False))
              for s in table_metrics}
 
     best_group = {}
     for s in table_metrics:
-        col = stats[s["tag"]]
+        col = stats[id(s)]
         if col:
-            best_group[s["tag"]] = (max if s["higher_is_better"] else min)(
+            best_group[id(s)] = (max if s["higher_is_better"] else min)(
                 col, key=lambda g: col[g][0])
 
     def header(s):
@@ -213,15 +230,81 @@ def build_latex_table(data: dict, selection_metric: str, table_metrics: list,
     for group in table_groups:
         cells = []
         for s in table_metrics:
-            col = stats[s["tag"]]
+            col = stats[id(s)]
             if group not in col:
                 cells.append("--")
                 continue
             mean, ci = col[group]
-            cells.append(fmt(mean, ci, s, best_group.get(s["tag"]) == group))
+            cells.append(fmt(mean, ci, s, best_group.get(id(s)) == group))
         lines.append(style.name(group) + " & " + " & ".join(cells) + " \\\\")
     lines += ["\\bottomrule", "\\end{tabular}"]
     return "\n".join(lines)
+
+
+def _plot_unit(u: str) -> str:
+    """Convert a LaTeX ``unit`` (as written for the LaTeX table) to matplotlib-friendly text.
+
+    Any degree spelling (``\\circ``, ``\\degree``, ``\\textdegree``, ``\\deg`` -- with or
+    without ``^{...}`` / ``$...$`` scaffolding) becomes the Unicode degree glyph ``°``,
+    which renders in matplotlib's default font with no mathtext. ``\\%`` becomes ``%``. Any
+    other string (including genuine mathtext like ``m/s$^2$``) passes through unchanged.
+    """
+    if not u:
+        return ""
+    if any(tok in u for tok in ("\\circ", "\\degree", "\\textdegree", "\\deg")):
+        return "°"
+    return u.replace("\\%", "%")
+
+
+def plot_metric_bars(data: dict, metric_specs: list, groups: list, style: PlotStyle,
+                     selection_metric: str, ncols: int = 2, figsize_per=(4.2, 3.4),
+                     suptitle: str | None = None):
+    """Grid of bar charts (one subplot per metric spec): x = methods, y = the best-point value.
+
+    Each bar's height is the value :func:`data_loader.best_point_stats` reduces for that group
+    (the RMS error vs ``offset`` when the spec sets ``rms=True``, else the mean signed value),
+    scaled by ``scale``; the error bar is ``style.ci_z * SEM`` (a 95% CI at ``ci_z = 1.96``).
+
+    ``metric_specs`` entries are the SAME table-metrics-style dicts
+    :func:`build_latex_table` reads (``tag``, ``header``, ``unit``, ``scale``, ``offset``,
+    ``rms``), so a bar chart and the summary table stay consistent from one source of truth.
+    ``groups`` is the method order (e.g. from :func:`resolve_row_order`); bars are colored by
+    ``style.color`` and tagged with the display name (selectable in Inkscape). Returns the Figure.
+    """
+    n = len(metric_specs)
+    ncols = max(1, min(ncols, n))
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(figsize_per[0] * ncols, figsize_per[1] * nrows),
+                             squeeze=False)
+    labels = [style.name(g) for g in groups]
+    colors = [style.color(g, i) for i, g in enumerate(groups)]
+    xs = list(range(len(groups)))
+    for k, s in enumerate(metric_specs):
+        ax = axes[k // ncols][k % ncols]
+        col = dl.best_point_stats(data, selection_metric, s["tag"], style.ci_z,
+                                  style.step_ceiling,
+                                  offset=s.get("offset", 0.0), rms=s.get("rms", False))
+        scale = s.get("scale", 1)
+        heights = [col[g][0] * scale if g in col else np.nan for g in groups]
+        errs = [col[g][1] * scale if g in col else 0.0 for g in groups]
+        bars = ax.bar(xs, heights, yerr=errs, capsize=4, color=colors,
+                      edgecolor="black", linewidth=0.6, error_kw={"elinewidth": 1.0})
+        for b, g in zip(bars, groups):
+            b.set_gid(style.name(g).replace(" ", "_"))
+        unit = _plot_unit(s.get("unit", ""))
+        ax.set_ylabel(s["header"] + (f" ({unit})" if unit else ""))
+        ax.set_title(s["header"])
+        ax.set_xticks(xs)
+        ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+        ax.grid(axis="y", alpha=0.3)
+        ax.margins(x=0.02)
+    for k in range(n, nrows * ncols):  # hide any unused axes in the grid
+        axes[k // ncols][k % ncols].axis("off")
+    if suptitle:
+        fig.suptitle(suptitle)
+    fig.tight_layout()
+    return fig
 
 
 def resolve_row_order(data: dict, row_order: list, style: PlotStyle) -> list:
