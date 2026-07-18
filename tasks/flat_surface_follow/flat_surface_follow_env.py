@@ -93,7 +93,7 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         #  * keypoints_achieved: # keypoints whose arc-length the progress frontier passed during a
         #    GATED step (in contact AND on-track, |cross_track| < keypoint_track_tol). Multi-boundary
         #    steps count all of them; air/off-track crossings are forfeited. Sum -> the success reward
-        #    is weighted by achieved/total, and success requires achieved/total >= success_coverage_tol.
+        #    is weighted by achieved/total, and success requires achieved/total >= success_keypoint_frac.
         #  * keypoints_passed: running-max keypoint index the projected progress has reached (crossed),
         #    contact or not, clean or not — a pure "how far along d did we get" frontier. passed >>
         #    achieved reveals progress-without-clean-contact vs. genuinely stalling.
@@ -591,17 +591,14 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         at_goal = torch.linalg.norm(self.cyl_tip - self.goal_world, dim=-1) < self.cfg_task.success_pos_tol
         oriented = self.orn_error.abs() < float(np.deg2rad(self.cfg_task.success_orn_tol_deg))  # both radians
         success = torch.logical_and(at_goal, oriented)
-        # Success also requires the tool to have actually DRAGGED most of the path, so a fly-to-goal
-        # that skipped the surface can't read as success and every keypoint means something. The
-        # coverage gate is achieved/total >= success_coverage_tol (< 1, so it stays attainable);
-        # set success_coverage_tol = 0 to recover pure pose-only success.
-        cov_tol = float(self.cfg_task.success_coverage_tol)
-        if cov_tol > 0.0:
+        # Success also requires the tool to have actually DRAGGED enough of the path, so a fly-to-goal
+        # that skipped the surface can't read as success and every keypoint means something. The gate
+        # is achieved/total >= success_keypoint_frac; set it to 0 for pure pose-only success, or 1.0
+        # to demand EVERY keypoint achieved.
+        kp_frac = float(self.cfg_task.success_keypoint_frac)
+        if kp_frac > 0.0:
             coverage = self.keypoints_achieved.float() / self.keypoints_total.clamp_min(1).float()
-            success = success & (coverage >= cov_tol)
-        # Optional stricter A/B gate: demand EVERY keypoint achieved (default off).
-        if bool(self.cfg_task.require_keypoints_for_success):
-            success = success & (self.keypoints_achieved >= self.keypoints_total)
+            success = success & (coverage >= kp_frac)
         return success
 
     def viz_snapshot(self) -> dict:
@@ -691,9 +688,21 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         orn_value = self.orn_error                                            # (E,) rad, signed
         # Straightness: signed cross-track error e_perp = dp . d_lat (computed in _compute).
         straightness_value = self.cross_track                                # (E,) m, signed
-        # Pace: along-track error vs the moving setpoint s_ref (computed in _compute from the pace
-        # clock). The clock advances by one env step only while in contact (updated below).
-        pace_value = self.progress - self.s_ref                             # (E,) m, signed
+        # Pace. Two modes (task.vel_based_pace_enabled, default ON — see task cfg):
+        #  * VELOCITY-based (default): value = (measured along-track speed) - v_des, where the measured
+        #    speed is d(progress)/dt and v_des = desired_speed_cm_s (m/s). LIVE gradient at any lag.
+        #  * POSITION-based (legacy A/B): value = progress - s_ref (the time-based moving setpoint),
+        #    which runs away once the tool falls behind so the gradient dies.
+        # pace_a/pace_b/pace_wt select the active term's squashing params + weight (used below).
+        if bool(cfg.vel_based_pace_enabled):
+            _sdt = float(getattr(self, "step_dt", self.physics_dt * self.cfg.decimation))
+            _vdes = float(cfg.desired_speed_cm_s) / 100.0                    # cm/s -> m/s
+            v_along = (self.progress - self.prev_progress) / _sdt            # (E,) along-track speed (m/s)
+            pace_value = v_along - _vdes                                     # (E,) speed error (m/s), signed
+            pace_a, pace_b, pace_wt = cfg.vel_based_pace_a, cfg.vel_based_pace_b, cfg.vel_based_pace_weight
+        else:
+            pace_value = self.progress - self.s_ref                         # (E,) m, signed (position pace)
+            pace_a, pace_b, pace_wt = cfg.pace_a, cfg.pace_b, cfg.pace_weight
         # Action penalties: EXACTLY as in FactoryEnv._get_factory_rew_dict (linear, NOT squashed).
         # action_penalty_ee penalizes raw action magnitude; action_grad_penalty penalizes the
         # step-to-step action change (chatter). Applied with NEGATIVE scales; both scales default
@@ -749,14 +758,14 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         contact = self.in_contact_any.float()
         near_surface = (self.tip_surface_dist < float(cfg.orientation_gate_dist)).float()
         straight_air = float(cfg.straightness_air_weight) / max(float(cfg.straightness_weight), 1e-9)
-        pace_air = float(cfg.pace_air_weight) / max(float(cfg.pace_weight), 1e-9)
+        pace_air = float(cfg.pace_air_weight) / max(float(pace_wt), 1e-9)      # ratio vs the ACTIVE pace weight
         straight_factor = torch.where(self.in_contact_any, torch.ones_like(contact), torch.full_like(contact, straight_air))
         pace_factor = torch.where(self.in_contact_any, torch.ones_like(contact), torch.full_like(contact, pace_air))
         rew_dict = {
             "force": factory_utils.squashing_fn(force_value, cfg.force_a, cfg.force_b) * contact,
             "orientation": factory_utils.squashing_fn(orn_value, cfg.orientation_a, cfg.orientation_b) * near_surface,
             "straightness": factory_utils.squashing_fn(straightness_value, cfg.straightness_a, cfg.straightness_b) * straight_factor,
-            "pace": factory_utils.squashing_fn(pace_value, cfg.pace_a, cfg.pace_b) * pace_factor,
+            "pace": factory_utils.squashing_fn(pace_value, pace_a, pace_b) * pace_factor,
             # Fixed bonus paid ONCE per keypoint, the first time it is achieved (count newly achieved
             # this step; usually 0/1 but >1 when a single fast step drags across multiple boundaries).
             "keypoint": newly_achieved.float(),
@@ -769,7 +778,7 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "force": float(cfg.force_weight),
             "orientation": float(cfg.orientation_weight),
             "straightness": float(cfg.straightness_weight),
-            "pace": float(cfg.pace_weight),
+            "pace": float(pace_wt),                                          # active pace weight (vel- or position-based)
             "keypoint": float(cfg.keypoint_reward_weight),
             "contact": float(cfg.contact_weight),
             "action_penalty_ee": -float(cfg.action_penalty_ee_scale),

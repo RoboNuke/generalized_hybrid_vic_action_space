@@ -34,7 +34,8 @@ runner_cfg:
     task.terminate_on_lag: false
     task.terminate_on_success: true
     task.pace_lag_frac: 0.5
-    task.keypoint_reward_weight: 1.5
+    task.keypoint_reward_weight: 8.0
+    task.vel_based_pace_enabled: true   # velocity-based pace (reward matching v_des along d); false = legacy position pace
 
 loss_cfg:
   supervised_selection_enabled: false

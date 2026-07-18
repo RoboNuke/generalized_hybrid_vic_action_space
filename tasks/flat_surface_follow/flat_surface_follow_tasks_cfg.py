@@ -97,12 +97,11 @@ class FlatSurfaceFollowTask(ForgeTask):
     # --- Success tolerances ---
     success_pos_tol: float = 0.01                 # cylinder tip within this of the far-edge center
     success_orn_tol_deg: float = 10.0             # |orientation error| (deg) within this of the desired
-    # Success = reached the goal pose (above tolerances) AND actually dragged most of the path:
-    # keypoints_achieved / keypoints_total >= success_coverage_tol. This makes every keypoint MEAN
-    # something (a fly-to-goal that skipped the surface can't succeed) while staying attainable (the
-    # threshold is < 1, so a few forfeited keypoints are tolerated). Set to 0.0 to recover the old
-    # pose-only success. require_keypoints_for_success (below) is the stricter all-keypoints A/B gate.
-    success_coverage_tol: float = 0.9
+    # Success = reached the goal pose (above tolerances) AND actually dragged enough of the path:
+    # keypoints_achieved / keypoints_total >= success_keypoint_frac. This makes every keypoint MEAN
+    # something (a fly-to-goal that skipped the surface can't succeed). Set to 0.0 to recover the old
+    # pose-only success; set to 1.0 to require EVERY keypoint be achieved.
+    success_keypoint_frac: float = 0.9
 
     # --- Keypoints (checkpoints): reward the ACTUAL drag, not a fly-to-goal shortcut ---
     # The checkpoints are evenly spaced arc-length points on the ideal path — spacing v*dt, so their
@@ -112,9 +111,7 @@ class FlatSurfaceFollowTask(ForgeTask):
     # so legitimate pace variation is credited, but boundaries crossed out of contact / off-track are
     # forfeited (the frontier still advances, so a fly-ahead shortcut permanently loses them). The
     # success reward is weighted by achieved/total (partial credit) and success itself requires
-    # achieved/total >= success_coverage_tol. require_keypoints_for_success is an OPTIONAL stricter
-    # hard gate (default off) that instead demands EVERY keypoint be achieved.
-    require_keypoints_for_success: bool = False
+    # achieved/total >= success_keypoint_frac.
     # Max lateral (cross-track) error for a keypoint crossing to count as achieved. Keeps "achieved"
     # meaningful — the tool must be near the path, not dragging far off to the side.
     keypoint_track_tol: float = 0.003
@@ -199,6 +196,18 @@ class FlatSurfaceFollowTask(ForgeTask):
     # hover-and-track). At 0.1 the whole air-track is at best a tenth of what contact unlocks.
     straightness_air_weight: float = 0.1
     pace_air_weight: float = 0.1
+
+    # Alternative VELOCITY-based pace (task.vel_based_pace_enabled, default ON): SWAPS IN for the
+    # position pace above. Instead of the along-track POSITION error (progress - s_ref, whose
+    # time-based s_ref runs away once the tool lags — the gradient dies and it never catches up), it
+    # rewards matching the DESIRED along-track SPEED: value = d(progress)/dt - v_des (m/s), squashed.
+    # This stays a LIVE gradient at ANY lag, so it continuously pulls the tool forward at ~v_des and
+    # breaks the "sit still in contact" local minimum. Reuses the "pace" reward-dict key, the
+    # contact/air gating, and the per-term logging (so only one pace term is active at a time).
+    vel_based_pace_enabled: bool = True
+    vel_based_pace_weight: float = 1.0
+    vel_based_pace_a: float = 100.0               # squashing steepness over the along-track SPEED error (m/s)
+    vel_based_pace_b: float = -1.0                # peak = 1
 
     # Time-to-success bonus: ONE-SHOT, paid on the first step success is reached. value = t* - t_succ
     # where t* = (first-contact time) + path_length / desired_speed is the ideal completion time and

@@ -27,7 +27,8 @@ class FlatSurfaceFollowWrapper(FactoryWrapper):
             "force": float(cfg.force_weight),
             "orientation": float(cfg.orientation_weight),
             "straightness": float(cfg.straightness_weight),
-            "pace": float(cfg.pace_weight),
+            # Active pace weight: velocity-based when vel_based_pace_enabled, else the position pace.
+            "pace": float(cfg.vel_based_pace_weight if bool(cfg.vel_based_pace_enabled) else cfg.pace_weight),
             "keypoint": float(cfg.keypoint_reward_weight),
             "contact": float(cfg.contact_weight),
             "action_penalty_ee": -float(cfg.action_penalty_ee_scale),
