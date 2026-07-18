@@ -474,19 +474,19 @@ def build_env(
                 f"name={_task_name!r}."
             )
         # The weld's constant in-gripper tilt: peg reads it from runner_cfg.rel_grasp_rot_init_deg
-        # (with grasp_rot_mode='fixed'); the surface reads its task.inhand_tilt_range_deg (treated as
-        # a fixed offset — the held cylinder is welded at that constant angle).
-        _weld_tilt = (
-            list(env_cfg.task.inhand_tilt_range_deg) if _is_surface else runner_cfg.rel_grasp_rot_init_deg
-        )
+        # (with grasp_rot_mode='fixed'); the surface grips the cylinder rigidly ALIGNED with the
+        # gripper (identity in-grip rotation — its whole spawn orientation is set on the wrist), so
+        # the weld tilt is zero.
+        _weld_tilt = [0.0, 0.0, 0.0] if _is_surface else runner_cfg.rel_grasp_rot_init_deg
         # The peg is folded into the Franka articulation as a rigid LINK on the env-0 prototype
         # before clone_environments (replicate_physics propagates it to every env), so
         # clone_in_fabric stays True and there is NO maximal-coordinate loop joint — which is what
         # removes the host-RAM leak. (Turning glue off skips all of this: the peg stays a normal
         # friction-held articulation, i.e. vanilla behaviour.)
         # A constant link frame requires a deterministic in-grip pose: zero the per-reset position
-        # jitter so the env's intended grasp matches the fixed link frame.
-        if any(float(v) != 0.0 for v in getattr(env_cfg.task, "held_asset_pos_noise", [])):
+        # jitter so the env's intended grasp matches the fixed link frame. (Peg only — the surface
+        # grip is deterministic by construction; it does not use held_asset_pos_noise.)
+        if _is_peg and any(float(v) != 0.0 for v in getattr(env_cfg.task, "held_asset_pos_noise", [])):
             print(f"[runner] glue_peg_to_gripper enabled: zeroing held_asset_pos_noise "
                   f"(was {list(env_cfg.task.held_asset_pos_noise)}) so the constant link frame "
                   "matches the deterministic grasp.")

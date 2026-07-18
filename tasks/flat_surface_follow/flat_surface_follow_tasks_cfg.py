@@ -66,19 +66,25 @@ class FlatSurfaceFollowTask(ForgeTask):
     plate_yaw_range_deg: float = 360.0           # full in-plane orientation randomization
     plate_tilt_range_deg: float = 10.0           # small roll/pitch cone off world +z (see note)
 
-    # --- Held cylinder in-hand randomization ---
-    # Per-reset random tilt of the cylinder long axis in the gripper (roll/pitch/yaw,
-    # degrees). All-zero => fixed tip-down grasp. Non-zero => "random angle in hand".
-    inhand_tilt_range_deg: list = [0.0, 0.0, 0.0]
-    held_asset_pos_noise: list = [0.0, 0.0, 0.0]  # in-hand position jitter (keep centered)
-
-    # --- Start placement (NO force controller; spawn just above the surface) ---
-    start_standoff: float = 0.001                 # >= 1 mm above surface along the normal
-    # Hand-init randomization expressed in the SURFACE-LOCAL frame:
-    #   x = along the path (near->far), y = across the path, z = along the surface normal.
-    # Default: +/-1 cm in-plane, 0 in z (so the cylinder stays exactly start_standoff above).
-    start_pos_noise: list = [0.01, 0.01, 0.0]
-    hand_init_orn_noise: list = [0.0, 0.0, 3.1416]  # yaw is free (cylinder is axisymmetric)
+    # --- Held-cylinder spawn pose (NO force controller: the TIP is placed directly, then the arm
+    #     is IK'd to match). The reset geometry is used only to POSITION the spawn — no privileged
+    #     info reaches the policy. The cylinder TIP is placed at a configurable offset from the
+    #     STARTING KEYPOINT (the keypoint the policy first observes at step 0 = start + spacing*d),
+    #     and an orientation offset is applied ABOUT THE TIP, so it never moves the tip.
+    #
+    #     Each of the 6 DOF has a MEAN and a STD. std == 0 => the mean is used EXACTLY (no sampling);
+    #     std > 0 => the value is sampled from N(mean, std) per reset. ---
+    # Tip position offset from the starting keypoint, in the SURFACE-LOCAL frame (x = along the path
+    # near->far, y = across the path, z = along the surface normal, +z = above the plate). Meters.
+    spawn_tip_pos_mean: list = [0.0, 0.0, 0.001]   # default: tip 1 mm above the starting keypoint
+    spawn_tip_pos_std: list = [0.0, 0.0, 0.0]      # per-axis Gaussian std (m); 0 => fixed at the mean
+    # Orientation offset of the cylinder about its tip, as WORLD-FRAME roll/pitch/yaw (DEGREES):
+    # roll about world x, pitch about world y, yaw about world z. The zero-offset pose is the peg
+    # straight up/down (axis along world +z, tip down) — INDEPENDENT of the surface orientation
+    # (which the policy does not know a priori). roll/pitch tilt the axis off world-vertical; yaw
+    # spins the (axisymmetric) cylinder about vertical.
+    spawn_orn_mean_deg: list = [0.0, 10.0, 0.0]    # default: 10 deg pitch off world-vertical
+    spawn_orn_std_deg: list = [0.0, 0.0, 0.0]      # per-axis Gaussian std (deg); 0 => fixed at the mean
 
     # --- Task command setpoints ---
     desired_speed_cm_s: float = 5.0               # v: desired along-track speed (cm/s) for the pace term
@@ -89,14 +95,27 @@ class FlatSurfaceFollowTask(ForgeTask):
     # --- Success tolerances ---
     success_pos_tol: float = 0.01                 # cylinder tip within this of the far-edge center
     success_orn_tol_deg: float = 10.0             # |orientation error| (deg) within this of the desired
+    # Success = reached the goal pose (above tolerances) AND actually dragged most of the path:
+    # keypoints_achieved / keypoints_total >= success_coverage_tol. This makes every keypoint MEAN
+    # something (a fly-to-goal that skipped the surface can't succeed) while staying attainable (the
+    # threshold is < 1, so a few forfeited keypoints are tolerated). Set to 0.0 to recover the old
+    # pose-only success. require_keypoints_for_success (below) is the stricter all-keypoints A/B gate.
+    success_coverage_tol: float = 0.9
 
     # --- Keypoints (checkpoints): reward the ACTUAL drag, not a fly-to-goal shortcut ---
     # The checkpoints are evenly spaced arc-length points on the ideal path — spacing v*dt, so their
     # COUNT is L/(v*dt), NOT a free parameter (see keypoints_total in the env). A keypoint is ACHIEVED
-    # when the tool crosses it IN CONTACT with exactly one keypoint crossed that step (a clean drag);
-    # the success reward is then weighted by achieved/total (partial credit). require_keypoints_for_
-    # success is an OPTIONAL hard gate (default off) that instead demands EVERY keypoint be achieved.
+    # the first time the progress frontier passes it during a step that is IN CONTACT and laterally
+    # ON-TRACK (|cross_track| < keypoint_track_tol); the count is not capped to one boundary per step,
+    # so legitimate pace variation is credited, but boundaries crossed out of contact / off-track are
+    # forfeited (the frontier still advances, so a fly-ahead shortcut permanently loses them). The
+    # success reward is weighted by achieved/total (partial credit) and success itself requires
+    # achieved/total >= success_coverage_tol. require_keypoints_for_success is an OPTIONAL stricter
+    # hard gate (default off) that instead demands EVERY keypoint be achieved.
     require_keypoints_for_success: bool = False
+    # Max lateral (cross-track) error for a keypoint crossing to count as achieved. Keeps "achieved"
+    # meaningful — the tool must be near the path, not dragging far off to the side.
+    keypoint_track_tol: float = 0.003
 
     # Fixed reward paid ONCE per keypoint, the first time it is cleanly ACHIEVED (crossed in contact,
     # one at a time, advancing the achieved frontier). A dense forward-progress signal that — unlike
@@ -105,10 +124,12 @@ class FlatSurfaceFollowTask(ForgeTask):
 
     # --- Interaction (stiffness) frame: consumed by the rotated controllers' fixed_rotation_from_
     #     interaction variant and the viz marker (interaction_frame_world). ---
-    # "geometric": z = surface normal, x = path_dir (along-track), y = cross-track — pure surface frame.
+    # In BOTH modes x points from the contact point to the CURRENT goal keypoint (setpoint_pos),
+    # projected ⊥ the mode's z-axis; y = z × x (cross-track).
+    # "geometric": z = surface normal — pure surface frame; x = goal-keypoint dir projected ⊥ normal.
     # "dynamic":   z = direction of the measured contact REACTION (force_sensor_world_smooth, clean/
     #              EMA-smoothed, peg-gravity off), so the frame tilts off the normal by the friction
-    #              angle; x = path_dir projected ⊥ z (along-track), y = z × x (cross-track).
+    #              angle; x = goal-keypoint dir with its component parallel to z (reaction) subtracted.
     # OFF-CONTACT (env.in_contact_any False — the single contact source of truth) BOTH modes collapse
     # to the control/EEF frame (identity stiffness rotation): no surface, so stiffness is control-frame.
     interaction_frame_mode: str = "geometric"

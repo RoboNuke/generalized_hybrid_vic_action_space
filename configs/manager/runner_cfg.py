@@ -271,8 +271,9 @@ class RunnerCfg:
             )
         # A constant gripper weld is only well-defined for a DETERMINISTIC grasp: the GPU pipeline
         # parses a joint's local frame at play time and cannot change it per step. 'random' grasp
-        # tilt is therefore incompatible. 'fixed' (peg tasks) and 'none' (surface task, whose grasp
-        # tilt comes from task.inhand_tilt_range_deg) are both deterministic and allowed; the
+        # tilt is therefore incompatible. 'fixed' (peg tasks) and 'none' (surface task, which grips
+        # the cylinder rigidly aligned and sets its spawn orientation on the wrist) are both
+        # deterministic and allowed; the
         # per-task consistency (which tilt source feeds the weld) is enforced in env_setup.build_env.
         if self.glue_peg_to_gripper and self.grasp_rot_mode == "random":
             raise ValueError(

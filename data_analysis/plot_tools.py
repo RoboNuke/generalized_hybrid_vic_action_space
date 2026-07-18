@@ -43,11 +43,11 @@ GLUED_ROT_GROUP_COLORS = {
     "1_fixed": "#ff9500",          # orange  -- isotropic baseline
     "2_VICES": "#ff0000",          # red     -- diagonal, axis-aligned
     "3_choleskey": "#1f77b4",      # blue    -- full SPD, fixed frame
-    "4_GAS_fixed_rot": "#a682be",  # purple  -- diagonal in a fixed rotated frame
+    "4_GAS_fixed_rot": "#FF00EE",  # purple  -- diagonal in a fixed rotated frame
     "5_GAS": "#1fb426",            # green   -- diagonal + learned rotation
     "6_dynm_fixed_rot":  "#7107b8",
-    "7_GAS_dyn":  "#0003b3", 
-    "8_GAS_geo":  "#4244a7"
+    "7_GAS_dyn":  "#0004ff", 
+    "8_GAS_geo":  "#00ffee"
 }
 
 
@@ -294,7 +294,9 @@ def plot_metric_bars(data: dict, metric_specs: list, groups: list, style: PlotSt
             b.set_gid(style.name(g).replace(" ", "_"))
         unit = _plot_unit(s.get("unit", ""))
         ax.set_ylabel(s["header"] + (f" ({unit})" if unit else ""))
-        ax.set_title(s["header"])
+        # Arrow shows which direction is GOOD (same convention as the LaTeX table header).
+        arrow = {True: " ↑", False: " ↓"}.get(s.get("higher_is_better"), "")
+        ax.set_title(s["header"] + arrow)
         ax.set_xticks(xs)
         ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
         ax.grid(axis="y", alpha=0.3)

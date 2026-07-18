@@ -2,9 +2,10 @@
 
 Reuses Forge/Factory machinery (robot control targets, force sensing, IK reset
 placement, per-env logging) and overrides only what the new geometry needs:
-scene assets (plate + cylinder), reset placement (cylinder spawned just above the
-near-edge center of a randomly-oriented plate), observations, success, and a
-(currently stubbed) reward. The control/logging wrappers attach unchanged.
+scene assets (plate + cylinder), reset placement (the cylinder TIP is placed at a
+configurable pose relative to the starting keypoint on a randomly-oriented plate,
+then the arm is IK'd to match), observations, success, and a (currently stubbed)
+reward. The control/logging wrappers attach unchanged.
 
 NOTE: reward terms are intentionally NOT implemented yet — this pass establishes
 the task STRUCTURE. ``_get_rewards`` returns zeros and ``_log_factory_metrics``
@@ -50,6 +51,9 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.path_dir = torch.tensor([1.0, 0.0, 0.0], device=self.device).expand(self.num_envs, 3).clone()
         self.d_lat = torch.tensor([0.0, 1.0, 0.0], device=self.device).expand(self.num_envs, 3).clone()
         self.surface_normal = torch.tensor([0.0, 0.0, 1.0], device=self.device).expand(self.num_envs, 3).clone()
+        # Contact point under the tip (recomputed each _compute); init so interaction_frame_world()'s
+        # goal-keypoint x-axis (setpoint_pos - contact_point) is safe before the first _compute.
+        self.contact_point = torch.zeros((self.num_envs, 3), device=self.device)
         # Contact flag (set each _compute); init here so interaction_frame_world() is safe if the
         # controller queries the stiffness frame before the first _compute.
         self.in_contact_any = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
@@ -62,6 +66,9 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # Moving setpoint (recomputed each _compute); init for safety before the first reset.
         self.s_ref = torch.zeros((self.num_envs,), device=self.device)
         self.setpoint_pos = torch.zeros((self.num_envs, 3), device=self.device)
+        # The keypoint after the current setpoint (fallback goal for interaction_frame_world() when the
+        # tip sits on the current keypoint); recomputed each _compute, init for safety before reset.
+        self.next_setpoint_pos = torch.zeros((self.num_envs, 3), device=self.device)
         # Time-to-success bonus state. t_contact: episode time (s) of FIRST contact (+inf until
         # contact); success_reward_given: whether the one-shot bonus has already been paid this
         # episode. Both reset each episode in _reset_idx.
@@ -83,9 +90,10 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.cq_breaks = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         self.cq_prev = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
         # Keypoint accounting (all progress-projection based; see _get_rewards):
-        #  * keypoints_achieved: # crossed IN CONTACT with EXACTLY ONE keypoint crossed that step (a
-        #    clean single-keypoint drag; that one is necessarily the current setpoint). Sum -> the
-        #    success reward is weighted by achieved/total. A multi-keypoint jump achieves none.
+        #  * keypoints_achieved: # keypoints whose arc-length the progress frontier passed during a
+        #    GATED step (in contact AND on-track, |cross_track| < keypoint_track_tol). Multi-boundary
+        #    steps count all of them; air/off-track crossings are forfeited. Sum -> the success reward
+        #    is weighted by achieved/total, and success requires achieved/total >= success_coverage_tol.
         #  * keypoints_passed: running-max keypoint index the projected progress has reached (crossed),
         #    contact or not, clean or not — a pure "how far along d did we get" frontier. passed >>
         #    achieved reveals progress-without-clean-contact vs. genuinely stalling.
@@ -94,7 +102,7 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # prev_progress carries last step's progress for the per-step crossing test. Reset each episode.
         self.keypoints_achieved = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         self.keypoints_passed = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
-        # Furthest keypoint index cleanly achieved; gates the once-per-keypoint reward (see _get_rewards).
+        # Furthest keypoint index achieved (gated); gates the once-per-keypoint reward (see _get_rewards).
         self.kp_ach_frontier = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         self.setpoint_kp_idx = torch.ones((self.num_envs,), dtype=torch.long, device=self.device)
         self.prev_progress = torch.zeros((self.num_envs,), device=self.device)
@@ -140,6 +148,17 @@ class FlatSurfaceFollowEnv(ForgeEnv):
     def _identity_quat(self, n=None):
         n = self.num_envs if n is None else n
         return torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).unsqueeze(0).repeat(n, 1)
+
+    def _sample_spawn_dof(self, mean_list, std_list, n):
+        """Sample ``n`` rows of a 3-DOF spawn quantity (position or orientation offset).
+
+        Per component: ``std == 0`` => the mean is used EXACTLY (no sampling); ``std > 0`` =>
+        the value is drawn from ``N(mean, std)``. Returns ``(n, 3)``.
+        """
+        mean = torch.tensor(mean_list, dtype=torch.float32, device=self.device).unsqueeze(0).expand(n, -1)
+        std = torch.tensor(std_list, dtype=torch.float32, device=self.device).unsqueeze(0).expand(n, -1)
+        sampled = torch.normal(mean, std)                 # std == 0 columns already return the mean
+        return torch.where(std > 0.0, sampled, mean)      # explicit: no sampling where std == 0
 
     def _rotate_vec(self, quat, vec):
         """Rotate ``vec`` (E,3) or (3,) by ``quat`` (E,4): returns R(quat) @ vec.
@@ -205,26 +224,40 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         Consumed by the controller's ``fixed_rotation_from_interaction`` stiffness variant (R =
         R_eefᵀ @ this = the true interaction->EEF rotation), the impedance metrics, and the viz marker.
 
+        In BOTH modes the x-axis points from the contact point toward the CURRENT goal keypoint
+        (``self.setpoint_pos``), projected clear of that mode's z-axis so x ⊥ z. (Previously x was the
+        constant along-track ``path_dir``; the goal-keypoint direction also corrects lateral drift, and
+        it is what the supervised-rotation loss target now supervises.) When the tip sits within 0.1 mm
+        of the current keypoint — where that direction is ill-defined and x would be random — it falls
+        back to the NEXT keypoint (``self.next_setpoint_pos``) so x stays meaningful and stable.
+
         ``interaction_frame_mode`` (task cfg):
-          * "geometric" (default): x = path_dir (along-track), y = d_lat (cross-track), z = surface
-            normal — the pure surface frame. Recomputed each step at the contact point, so it's the
-            LOCAL frame for curved surfaces too.
+          * "geometric" (default): z = surface normal — the pure surface frame; x = the goal-keypoint
+            direction projected ⊥ normal (in-plane), y = z × x (cross-track). Recomputed each step at the
+            contact point, so it's the LOCAL frame for curved surfaces too.
           * "dynamic": z = direction of the measured contact reaction (force_sensor_world_smooth, clean
             & EMA-smoothed; peg gravity is disabled so it's contact-only), which tilts off the normal
-            by the friction angle. x = path_dir projected ⊥ z (along-track), y = z × x (cross-track).
+            by the friction angle. x = the goal-keypoint direction with its component parallel to the
+            reaction (z) subtracted, y = z × x (cross-track).
 
         OFF-CONTACT, BOTH modes return R_eef (world<-eef), so the controller's R = R_eefᵀ·this =
         IDENTITY — with no surface to interact with, the stiffness is applied in the control (EEF)
         frame, not a surface/reaction frame. Contact is the env's single source of truth,
         ``self.in_contact_any`` (contact sensor / normal-force fallback)."""
+        # x points from the contact point to the current goal keypoint. When the tip sits essentially
+        # ON that keypoint (<0.1 mm), the direction is ill-defined (x goes random), so fall back to the
+        # NEXT keypoint to keep x meaningful and stable.
+        at_goal = (torch.linalg.norm(self.setpoint_pos - self.contact_point, dim=-1) < 1e-4)  # (E,) 0.1 mm
+        goal_pos = torch.where(at_goal[:, None], self.next_setpoint_pos, self.setpoint_pos)  # (E,3)
+        to_goal = goal_pos - self.contact_point                                      # (E,3) toward goal keypoint
         if getattr(self.cfg_task, "interaction_frame_mode", "geometric") == "dynamic":
             f = self.force_sensor_world_smooth[:, 0:3]                                # (E,3) world reaction
             z = f / torch.linalg.norm(f, dim=-1, keepdim=True).clamp_min(1e-6)        # z along the reaction
-            x = self.path_dir - (self.path_dir * z).sum(-1, keepdim=True) * z         # along-track ⊥ z
-            x = x / torch.linalg.norm(x, dim=-1, keepdim=True).clamp_min(1e-6)
-            frame = torch.stack([x, torch.cross(z, x, dim=-1), z], dim=-1)            # (E,3,3)
         else:
-            frame = torch.stack([self.path_dir, self.d_lat, self.surface_normal], dim=-1)  # (E,3,3)
+            z = self.surface_normal                                                  # z along the surface normal
+        x = to_goal - (to_goal * z).sum(-1, keepdim=True) * z                         # goal dir ⊥ z
+        x = x / torch.linalg.norm(x, dim=-1, keepdim=True).clamp_min(1e-6)
+        frame = torch.stack([x, torch.cross(z, x, dim=-1), z], dim=-1)                # (E,3,3)
         # Off-contact -> R_eef so the stiffness rotation collapses to identity (stiffness in the EEF frame).
         R_eef = matrix_from_quat(self.fingertip_midpoint_quat)                        # (E,3,3) world<-eef
         return torch.where(self.in_contact_any[:, None, None], frame, R_eef)
@@ -259,24 +292,17 @@ class FlatSurfaceFollowEnv(ForgeEnv):
     # In-hand grasp pose (tip-down cylinder, optional in-hand tilt)
     # ------------------------------------------------------------------
     def get_handheld_asset_relative_pose(self):
+        # Rigid, ALIGNED grip (identity in-grip rotation): the cylinder's long axis is collinear
+        # with the gripper approach axis. The whole spawn orientation is set on the WRIST in
+        # randomize_initial_state, never within the grip.
+        # IMPORTANT: the procedural CylinderCfg's prim origin is at the cylinder's CENTER (it spans
+        # [-H/2, +H/2] along its local z), unlike the Factory peg USD whose origin is at the
+        # base/tip. So grip at (H/2 - fingerpad) from the center => fingerpad below the TOP end,
+        # with the cylinder hanging down and its lower end as the contact tip.
         rel_pos = torch.zeros((self.num_envs, 3), device=self.device)
-        # IMPORTANT: the procedural CylinderCfg's prim origin is at the cylinder's
-        # CENTER (it spans [-H/2, +H/2] along its local z), unlike the Factory peg
-        # USD whose origin is at the base/tip. So grip at (H/2 - fingerpad) from the
-        # center => fingerpad below the TOP end, with the cylinder hanging down and its
-        # lower end as the contact tip. (Using the full H here mis-grips by H/2.)
         rel_pos[:, 2] = self.cfg_task.held_asset_cfg.height / 2.0
         rel_pos[:, 2] -= self.cfg_task.robot_cfg.franka_fingerpad_length
-
-        rel_quat = self._identity_quat()
-        tilt = self.cfg_task.inhand_tilt_range_deg
-        if any(abs(float(t)) > 0.0 for t in tilt):
-            rand = 2.0 * (torch.rand((self.num_envs, 3), device=self.device) - 0.5)  # [-1, 1]
-            tilt_rad = torch.deg2rad(torch.tensor(tilt, dtype=torch.float32, device=self.device))
-            d = rand @ torch.diag(tilt_rad)
-            perturb = torch_utils.quat_from_euler_xyz(d[:, 0], d[:, 1], d[:, 2])
-            rel_quat = torch_utils.quat_mul(torch_utils.quat_conjugate(perturb), rel_quat)
-        return rel_pos, rel_quat
+        return rel_pos, self._identity_quat()
 
     # ------------------------------------------------------------------
     # Intermediate values: stash task geometry after the Forge base compute
@@ -356,6 +382,11 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.setpoint_kp_idx = torch.maximum(self.setpoint_kp_idx, new_setpoint)
         setpoint_arclen = (self.setpoint_kp_idx.float() * self.keypoint_spacing).minimum(self.path_length)
         self.setpoint_pos = start + setpoint_arclen.unsqueeze(-1) * path_dir
+        # The keypoint AFTER the current one (index+1, clamped to total/L). Used by interaction_frame_
+        # world() as a fallback goal when the contact point sits essentially on the current keypoint,
+        # where the direction to it (the frame's x-axis) is ill-defined.
+        next_arclen = ((self.setpoint_kp_idx + 1).float() * self.keypoint_spacing).minimum(self.path_length)
+        self.next_setpoint_pos = start + next_arclen.unsqueeze(-1) * path_dir
 
         # Measured normal force = projection of the FT force onto the true surface normal.
         # The raw smoothed force (force_sensor_world_smooth) is in the force_sensor child-joint
@@ -554,9 +585,15 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         at_goal = torch.linalg.norm(self.cyl_tip - self.goal_world, dim=-1) < self.cfg_task.success_pos_tol
         oriented = self.orn_error.abs() < float(np.deg2rad(self.cfg_task.success_orn_tol_deg))  # both radians
         success = torch.logical_and(at_goal, oriented)
-        # Keypoints no longer HARD-gate success — the success reward is instead weighted by
-        # achieved/total in _get_rewards (partial credit for the drag). The optional flag is kept
-        # (default off) for A/B tests; when on it still requires every keypoint cleanly achieved.
+        # Success also requires the tool to have actually DRAGGED most of the path, so a fly-to-goal
+        # that skipped the surface can't read as success and every keypoint means something. The
+        # coverage gate is achieved/total >= success_coverage_tol (< 1, so it stays attainable);
+        # set success_coverage_tol = 0 to recover pure pose-only success.
+        cov_tol = float(self.cfg_task.success_coverage_tol)
+        if cov_tol > 0.0:
+            coverage = self.keypoints_achieved.float() / self.keypoints_total.clamp_min(1).float()
+            success = success & (coverage >= cov_tol)
+        # Optional stricter A/B gate: demand EVERY keypoint achieved (default off).
         if bool(self.cfg_task.require_keypoints_for_success):
             success = success & (self.keypoints_achieved >= self.keypoints_total)
         return success
@@ -615,27 +652,29 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         curr_successes = self._get_curr_successes()
         cfg = self.cfg_task
 
-        # --- Keypoint accounting (progress-projection based; drives the success weight) ---
-        # kp index at an arc-length = floor(progress / spacing). ACHIEVED: in contact AND EXACTLY ONE
-        # keypoint crossed this step (a clean single-keypoint drag; that one is necessarily the current
-        # setpoint). A multi-keypoint jump (overshoot / fly-ahead) crosses >1 and achieves NONE, but
-        # the new setpoint still moves on to after the last one passed (via setpoint_kp_idx in
-        # _compute). PASSED: running-max keypoint index the projection has reached, achieved or not (a
-        # pure progress frontier). prev_progress is last step's value (updated at the end of this
-        # method), so this must run before that update.
+        # --- Keypoint accounting (progress-projection based; drives the success weight + gate) ---
+        # kp index at an arc-length = floor(progress / spacing). A keypoint is ACHIEVED the first time
+        # the progress frontier passes it during a GATED step: in contact AND laterally on-track
+        # (|cross_track| < keypoint_track_tol). Multiple boundaries crossed in one step all count (no
+        # exactly-one rule) so legitimate pace variation isn't punished; but boundaries crossed while
+        # NOT gated (in the air / off-track) are forfeited — kp_prev still advances through them, so a
+        # fly-ahead shortcut permanently loses those keypoints. kp_ach_frontier is the furthest kp
+        # index already credited (each keypoint counts once). PASSED: running-max kp index the
+        # projection reached, gated or not (pure progress frontier). prev_progress is last step's value
+        # (updated at the end of this method), so this must run before that update.
         Ktot = self.keypoints_total
         kp_prev = torch.floor(self.prev_progress / self.keypoint_spacing).clamp_min(0).long().minimum(Ktot)
         kp_curr = torch.floor(self.progress / self.keypoint_spacing).clamp_min(0).long().minimum(Ktot)
-        crossed = (kp_curr - kp_prev).clamp_min(0)                            # keypoints crossed forward this step
-        clean = self.in_contact_any & (crossed == 1)                         # exactly one, in contact -> achieved
-        # Count/reward each keypoint ONCE: only a clean achievement that advances the frontier past the
-        # furthest keypoint already achieved. Without this a peg jittering across one boundary in
-        # contact would re-collect the same keypoint every step.
-        newly_achieved = clean & (kp_curr > self.kp_ach_frontier)            # (E,) bool: first time for this kp
-        self.kp_ach_frontier = torch.where(newly_achieved, kp_curr, self.kp_ach_frontier)
-        self.keypoints_achieved = (self.keypoints_achieved + newly_achieved.long()).minimum(Ktot)
+        on_track = self.cross_track.abs() < float(cfg.keypoint_track_tol)
+        gate = self.in_contact_any & on_track                                # in contact AND on-track this step
+        # Newly achieved = boundaries beyond BOTH last step's index and the achieved frontier, but only
+        # when gated (so uncredited air/off-track crossings between kp_prev and the frontier are lost).
+        newly_achieved = (kp_curr - torch.maximum(kp_prev, self.kp_ach_frontier)).clamp_min(0)
+        newly_achieved = torch.where(gate, newly_achieved, torch.zeros_like(newly_achieved))  # (E,) # this step
+        self.kp_ach_frontier = torch.where(gate, torch.maximum(self.kp_ach_frontier, kp_curr), self.kp_ach_frontier)
+        self.keypoints_achieved = (self.keypoints_achieved + newly_achieved).minimum(Ktot)
         self.keypoints_passed = torch.maximum(self.keypoints_passed, kp_curr)
-        # Success reward weight = fraction of keypoints cleanly achieved (partial credit for the drag).
+        # Success reward weight = fraction of keypoints achieved (partial credit for the drag).
         success_frac = self.keypoints_achieved.float() / self.keypoints_total.clamp_min(1).float()
 
         # Force tracking: desired (sampled, along the surface normal) - measured normal force
@@ -712,7 +751,8 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "orientation": factory_utils.squashing_fn(orn_value, cfg.orientation_a, cfg.orientation_b) * near_surface,
             "straightness": factory_utils.squashing_fn(straightness_value, cfg.straightness_a, cfg.straightness_b) * straight_factor,
             "pace": factory_utils.squashing_fn(pace_value, cfg.pace_a, cfg.pace_b) * pace_factor,
-            # Fixed bonus paid ONCE per keypoint the first time it is cleanly achieved (0/1 this step).
+            # Fixed bonus paid ONCE per keypoint, the first time it is achieved (count newly achieved
+            # this step; usually 0/1 but >1 when a single fast step drags across multiple boundaries).
             "keypoint": newly_achieved.float(),
             "contact": contact,
             "action_penalty_ee": action_penalty_ee,
@@ -937,9 +977,9 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.flip_quats[rand_flips] = -1.0
 
     def randomize_initial_state(self, env_ids):
-        """Place the plate at a random orientation and the cylinder just above the
-        near-edge center (NO force-controlled contact — we spawn >= start_standoff
-        above the surface and let the policy establish contact)."""
+        """Place the plate at a random orientation and the cylinder with its TIP at a configurable
+        pose relative to the STARTING KEYPOINT (NO force-controlled contact — we spawn the tip a
+        configurable height above the surface and let the policy establish contact)."""
         physics_sim_view = sim_utils.SimulationContext.instance().physics_sim_view
         physics_sim_view.set_gravity(carb.Float3(0.0, 0.0, 0.0))
 
@@ -979,57 +1019,61 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # The Forge action frame + FT reference = near-edge center (start).
         self.fixed_pos_obs_frame[:] = start
 
-        # (3) IK the hand to (near-edge center + standoff along the normal), pointing
-        # into the plate, with surface-local hand-init randomization. Retry per-env.
-        # Fingertip-above-surface offset: with the center-origin grasp (origin placed
-        # (H/2 - fingerpad) below the fingertip), the lower contact tip sits a further
-        # H/2 below the origin, i.e. (H - fingerpad) below the fingertip. So putting the
-        # fingertip (H - fingerpad + standoff) above the surface lands the tip exactly
-        # start_standoff above it. (Do NOT change this to H/2 — the grasp offset already
-        # carries the center-origin correction.)
-        offset = (
-            self.cfg_task.held_asset_cfg.height
-            - self.cfg_task.robot_cfg.franka_fingerpad_length
-            + self.cfg_task.start_standoff
-        )
-        target_pos_all = start + normal * offset
-        target_quat_all = torch.zeros((self.num_envs, 4), dtype=torch.float32, device=self.device)
+        # (3) HELD-CYLINDER SPAWN + arm IK. Place the cylinder TIP directly at a configurable pose
+        # relative to the STARTING KEYPOINT, then invert the rigid grip to get the fingertip target
+        # and IK the arm to it. The plate geometry is used only to POSITION the reset pose (no
+        # privileged info reaches the policy). The tip position is set first; the orientation offset
+        # is applied ABOUT THE TIP, so it never moves the tip.
+        #
+        # Per-DOF sampling (see _sample_spawn_dof): std == 0 => mean used exactly (no sampling);
+        # std > 0 => N(mean, std). Position offset (m) and orientation offset (deg->rad) are both in
+        # the SURFACE frame: x = along-path, y = cross-track, z = surface normal (rpy about those).
+        pos_off = self._sample_spawn_dof(
+            self.cfg_task.spawn_tip_pos_mean, self.cfg_task.spawn_tip_pos_std, self.num_envs
+        )                                                                     # (E,3) m, surface-local
+        orn_off = torch.deg2rad(
+            self._sample_spawn_dof(self.cfg_task.spawn_orn_mean_deg, self.cfg_task.spawn_orn_std_deg, self.num_envs)
+        )                                                                     # (E,3) rad, surface-local rpy
 
+        # Starting keypoint = start + spacing*path_dir (matches the step-0 observation setpoint,
+        # setpoint_kp_idx = 1). spacing = v_des * step_dt (same as _compute_intermediate_values).
+        v_des = float(self.cfg_task.desired_speed_cm_s) / 100.0               # cm/s -> m/s
+        step_dt = float(getattr(self, "step_dt", self.physics_dt * self.cfg.decimation))
+        keypoint_spacing = max(v_des * step_dt, 1e-6)
+        path_len = torch.linalg.norm(goal - start, dim=-1, keepdim=True)      # (E,1)
+        arclen = torch.full_like(path_len, keypoint_spacing).minimum(path_len)
+        start_kp = start + path_dir * arclen                                  # (E,3) starting keypoint
+
+        # Surface-frame rotation (world<-surface): columns [along-path, cross-track, normal]. Used only
+        # to map the POSITION offset, which is surface-local so that "z above the plate" = along the
+        # normal (perpendicular distance) and x/y = along/across the path.
+        R_surf = torch.stack([path_dir, cross_dir, normal], dim=-1)          # (E,3,3)
+        q_surf = quat_from_matrix(R_surf)                                     # (E,4)
+
+        # Desired TIP position: starting keypoint + surface-local offset rotated into world.
+        p_tip = start_kp + quat_apply(q_surf, pos_off)                        # (E,3)
+        # Desired cylinder orientation: WORLD-frame roll/pitch/yaw. The zero-offset pose is the peg
+        # straight up/down (axis along world +z, tip down) — INDEPENDENT of the surface orientation,
+        # which the policy does not know a priori. cyl_axis points from the tip toward the grip.
+        held_quat_des = torch_utils.quat_from_euler_xyz(orn_off[:, 0], orn_off[:, 1], orn_off[:, 2])  # (E,4) world<-cyl
+        z_hat = torch.tensor([0.0, 0.0, 1.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
+        cyl_axis = quat_apply(held_quat_des, z_hat)                          # (E,3)
+
+        # Invert the rigid grip to the fingertip target (see step (4) for the grip transform, which
+        # this exactly reverses): fingertip = tip + (H - fingerpad) up the cylinder axis, and
+        # fingertip_quat = held_quat ∘ flip. After IK + step (4) the tip lands back at p_tip.
+        H = self.cfg_task.held_asset_cfg.height
+        fingerpad = self.cfg_task.robot_cfg.franka_fingerpad_length
+        flip_z_quat = torch.tensor([0.0, 0.0, 1.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
+        target_pos_all = p_tip + (H - fingerpad) * cyl_axis                   # (E,3) fingertip target
+        target_quat_all = torch_utils.quat_mul(held_quat_des, flip_z_quat)    # (E,4) fingertip target
+
+        # IK the arm to the FIXED fingertip target; reseed the arm for any env that didn't converge
+        # and retry. Targets are NOT re-sampled on retry, so the spawn distribution stays unbiased.
         bad_envs = env_ids.clone()
         while True:
-            n_bad = bad_envs.shape[0]
-
-            # Surface-local hand-position noise: x along path, y across, z along normal.
-            rs = 2.0 * (torch.rand((n_bad, 3), device=self.device) - 0.5)
-            off_local = rs @ torch.diag(
-                torch.tensor(self.cfg_task.start_pos_noise, dtype=torch.float32, device=self.device)
-            )
-            pos_noise_world = (
-                off_local[:, 0:1] * path_dir[bad_envs]
-                + off_local[:, 1:2] * cross_dir[bad_envs]
-                + off_local[:, 2:3] * normal[bad_envs]
-            )
-            target_pos = target_pos_all.clone()
-            target_pos[bad_envs] = target_pos[bad_envs] + pos_noise_world
-
-            # Orientation: hand-down in the plate frame (roll=pi -> gripper points along
-            # -normal), plus the commanded axis tilt (pitch) and free yaw noise.
-            local_euler = torch.zeros((n_bad, 3), device=self.device)
-            local_euler[:, 0] = np.pi
-            # Hand pitch from straight-down = the tool axis's angle OFF the surface NORMAL, which IS
-            # orientation_desired_angle_deg under the current convention (0 = tip-down). So the cylinder
-            # spawns exactly at the commanded angle. (Was 90 - desired, a leftover of the old angle-to-
-            # PLANE convention, which spawned the tool ~80deg off-normal — nearly sideways.)
-            local_euler[:, 1] = float(np.deg2rad(self.cfg_task.orientation_desired_angle_deg))
-            yaw_noise = (2.0 * (torch.rand((n_bad,), device=self.device) - 0.5)) * float(
-                self.cfg_task.hand_init_orn_noise[2]
-            )
-            local_euler[:, 2] = yaw_noise
-            local_quat = torch_utils.quat_from_euler_xyz(local_euler[:, 0], local_euler[:, 1], local_euler[:, 2])
-            target_quat_all[bad_envs] = torch_utils.quat_mul(self.fixed_quat[bad_envs], local_quat)
-
             pos_error, aa_error = self.set_pos_inverse_kinematics(
-                ctrl_target_fingertip_midpoint_pos=target_pos,
+                ctrl_target_fingertip_midpoint_pos=target_pos_all,
                 ctrl_target_fingertip_midpoint_quat=target_quat_all,
                 env_ids=bad_envs,
             )
@@ -1058,14 +1102,8 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         held_quat, held_pos = torch_utils.tf_combine(
             q1=fingertip_flipped_quat, t1=fingertip_flipped_pos, q2=asset_in_hand_quat, t2=asset_in_hand_pos
         )
-
-        rs = 2.0 * (torch.rand((self.num_envs, 3), device=self.device) - 0.5)
-        held_pos_noise = rs @ torch.diag(
-            torch.tensor(self.cfg_task.held_asset_pos_noise, dtype=torch.float32, device=self.device)
-        )
-        held_quat, held_pos = torch_utils.tf_combine(
-            q1=held_quat, t1=held_pos, q2=self._identity_quat(), t2=held_pos_noise
-        )
+        # No extra in-grip position jitter: the tip pose was placed explicitly in step (3) (any
+        # desired jitter is expressed there via spawn_tip_pos_std), and the grip is rigid + aligned.
 
         held_state = self._held_asset.data.default_root_state.clone()
         held_state[:, 0:3] = held_pos + self.scene.env_origins

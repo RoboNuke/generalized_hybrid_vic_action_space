@@ -95,9 +95,10 @@ class ControlCfg(ForgeCtrlCfg):
     fixed_rotation_rpy: list | None = None
 
     # Fixed-rotation variant driven by the ENV's interaction frame instead of a constant rpy. When
-    # True, R is the TRUE rotation from the interaction frame (x = path direction d, z = surface
-    # normal, y = z x x = n x d) into the EEF frame, recomputed per env/step — so it changes with each
-    # plate's orientation. Requires the env to expose interaction_frame_world() (E,3,3, world<-interaction).
+    # True, R is the TRUE rotation from the interaction frame (x = direction to the current goal
+    # keypoint projected ⊥ z, z = surface normal or contact-reaction dir per interaction_frame_mode,
+    # y = z x x) into the EEF frame, recomputed per env/step — so it changes with each plate's
+    # orientation. Requires the env to expose interaction_frame_world() (E,3,3, world<-interaction).
     # Like fixed_rotation_rpy it FIXES R (drops the rot6d action dims); only valid with
     # gain_mapping='rotated' and mutually exclusive with fixed_rotation_rpy.
     fixed_rotation_from_interaction: bool = False

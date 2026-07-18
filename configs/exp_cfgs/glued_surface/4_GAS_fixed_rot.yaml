@@ -22,7 +22,14 @@ runner_cfg:
     task.force_desired_max: 5.0
     task.orientation_desired_angle_deg: 10.0
     task.plate_tilt_range_deg: 10.0
-    task.inhand_tilt_range_deg: [0.0, 0.0, 0.0]
+    # Held-cylinder spawn: TIP 1 mm above the starting keypoint (along the surface normal), peg straight
+    # up/down (no rotation), no jitter. Each DOF has a mean + std; std == 0 => mean used exactly (no
+    # sampling). pos = surface-local (x=along-path, y=cross-track, z=normal, m); orn = WORLD-frame
+    # roll/pitch/yaw (deg), nominal = peg straight up/down.
+    task.spawn_tip_pos_mean: [0.0, 0.0, 0.001]
+    task.spawn_tip_pos_std: [0.0, 0.0, 0.0]
+    task.spawn_orn_mean_deg: [0.0, 0.0, 0.0]
+    task.spawn_orn_std_deg: [0.0, 0.0, 0.0]
     task.observe_eef_torque: false
     task.terminate_on_lag: false
     task.terminate_on_success: true
