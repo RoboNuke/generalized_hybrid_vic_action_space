@@ -69,8 +69,10 @@ class FlatSurfaceFollowTask(ForgeTask):
     # --- Held-cylinder spawn pose (NO force controller: the TIP is placed directly, then the arm
     #     is IK'd to match). The reset geometry is used only to POSITION the spawn — no privileged
     #     info reaches the policy. The cylinder TIP is placed at a configurable offset from the
-    #     STARTING KEYPOINT (the keypoint the policy first observes at step 0 = start + spacing*d),
-    #     and an orientation offset is applied ABOUT THE TIP, so it never moves the tip.
+    #     STARTING KEYPOINT k0 = the near-edge center (start), which is also the keypoint the policy
+    #     is shown at step 0 (the target is held at k0 until first contact, so the peg descends
+    #     straight onto k0, then the setpoint advances one keypoint at a time). An orientation offset
+    #     is applied ABOUT THE TIP, so it never moves the tip.
     #
     #     Each of the 6 DOF has a MEAN and a STD. std == 0 => the mean is used EXACTLY (no sampling);
     #     std > 0 => the value is sampled from N(mean, std) per reset. ---

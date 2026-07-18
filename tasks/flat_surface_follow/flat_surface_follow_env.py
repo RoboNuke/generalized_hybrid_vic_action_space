@@ -97,14 +97,16 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         #  * keypoints_passed: running-max keypoint index the projected progress has reached (crossed),
         #    contact or not, clean or not — a pure "how far along d did we get" frontier. passed >>
         #    achieved reveals progress-without-clean-contact vs. genuinely stalling.
-        #  * setpoint_kp_idx: the current TARGET keypoint (next one ahead of projected progress); drives
-        #    the OBSERVATION setpoint and the keypoint-ball colouring.
+        #  * setpoint_kp_idx: the current TARGET keypoint; drives the OBSERVATION setpoint and the
+        #    keypoint-ball colouring. Starts at 0 (k0 = the near-edge spawn point) and is HELD there
+        #    until first contact, so the peg descends straight down onto k0; after contact it advances
+        #    to the next keypoint ahead of progress, one at a time (see _compute_intermediate_values).
         # prev_progress carries last step's progress for the per-step crossing test. Reset each episode.
         self.keypoints_achieved = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         self.keypoints_passed = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         # Furthest keypoint index achieved (gated); gates the once-per-keypoint reward (see _get_rewards).
         self.kp_ach_frontier = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
-        self.setpoint_kp_idx = torch.ones((self.num_envs,), dtype=torch.long, device=self.device)
+        self.setpoint_kp_idx = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         self.prev_progress = torch.zeros((self.num_envs,), device=self.device)
         self.prev_cross_track = torch.zeros((self.num_envs,), device=self.device)
         # Derived each _compute from L/(v*dt); placeholder until then.
@@ -369,16 +371,20 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.keypoint_spacing = max(v_des * step_dt, 1e-6)
         self.keypoints_total = torch.floor(self.path_length / self.keypoint_spacing).clamp_min(1.0).long()
 
-        # OBSERVATION setpoint = the NEXT keypoint ahead of the projected progress (contact-independent):
-        # setpoint index = floor(progress/spacing) + 1, clamped to [1, total]. Advancing purely on the
-        # along-track projection means coming off the surface and drifting along d still advances it
-        # (no turn-around incentive), and its LATERAL offset from the tip carries the "off the line"
-        # error. The policy/critic track this local keypoint instead of the far goal.
+        # OBSERVATION setpoint. BEFORE first contact the target is HELD at keypoint 0 (k0 = the
+        # near-edge spawn point, directly under the tip): the peg is spawned over k0 and told to go to
+        # k0, so it descends straight DOWN onto the surface. AFTER first contact (t_contact finite) the
+        # target advances to the NEXT keypoint ahead of the projected progress (floor(progress/spacing)
+        # + 1), i.e. it drags along the line ONE keypoint at a time. Advancing on the along-track
+        # projection means drifting off the surface along d still advances it (no turn-around
+        # incentive), and its LATERAL offset from the tip carries the "off the line" error.
         kp_passed_now = torch.floor(self.progress / self.keypoint_spacing).clamp_min(0).long()
-        new_setpoint = (kp_passed_now + 1).minimum(self.keypoints_total).clamp_min(1)
+        next_ahead = (kp_passed_now + 1).minimum(self.keypoints_total)
+        made_contact = torch.isfinite(self.t_contact)                         # touched at any point this episode
+        new_setpoint = torch.where(made_contact, next_ahead, torch.zeros_like(next_ahead))
         # RATCHET: the observation setpoint only ever advances. Moving backward (progress dropping)
         # does NOT pull the target back — it stays at the furthest keypoint reached this episode.
-        # Reset to 1 in _reset_idx (and carried by the efficient-reset cache).
+        # Reset to 0 in _reset_idx (and carried by the efficient-reset cache).
         self.setpoint_kp_idx = torch.maximum(self.setpoint_kp_idx, new_setpoint)
         setpoint_arclen = (self.setpoint_kp_idx.float() * self.keypoint_spacing).minimum(self.path_length)
         self.setpoint_pos = start + setpoint_arclen.unsqueeze(-1) * path_dir
@@ -958,7 +964,7 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.keypoints_achieved = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         self.keypoints_passed = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         self.kp_ach_frontier = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
-        self.setpoint_kp_idx = torch.ones((self.num_envs,), dtype=torch.long, device=self.device)
+        self.setpoint_kp_idx = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)  # k0 until contact
         self.prev_progress = torch.zeros((self.num_envs,), device=self.device)
         self.prev_cross_track = torch.zeros((self.num_envs,), device=self.device)
         self.drag_count = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
@@ -1035,14 +1041,11 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             self._sample_spawn_dof(self.cfg_task.spawn_orn_mean_deg, self.cfg_task.spawn_orn_std_deg, self.num_envs)
         )                                                                     # (E,3) rad, surface-local rpy
 
-        # Starting keypoint = start + spacing*path_dir (matches the step-0 observation setpoint,
-        # setpoint_kp_idx = 1). spacing = v_des * step_dt (same as _compute_intermediate_values).
-        v_des = float(self.cfg_task.desired_speed_cm_s) / 100.0               # cm/s -> m/s
-        step_dt = float(getattr(self, "step_dt", self.physics_dt * self.cfg.decimation))
-        keypoint_spacing = max(v_des * step_dt, 1e-6)
-        path_len = torch.linalg.norm(goal - start, dim=-1, keepdim=True)      # (E,1)
-        arclen = torch.full_like(path_len, keypoint_spacing).minimum(path_len)
-        start_kp = start + path_dir * arclen                                  # (E,3) starting keypoint
+        # Starting keypoint = k0 = the near-edge center (start). The peg spawns directly over k0 and
+        # the step-0 observation setpoint is ALSO k0 (held there until first contact, see
+        # _compute_intermediate_values), so the peg descends straight down onto k0, then the setpoint
+        # advances one keypoint at a time as it drags.
+        start_kp = start                                                     # (E,3) k0 (near-edge center)
 
         # Surface-frame rotation (world<-surface): columns [along-path, cross-track, normal]. Used only
         # to map the POSITION offset, which is surface-local so that "z above the plate" = along the
