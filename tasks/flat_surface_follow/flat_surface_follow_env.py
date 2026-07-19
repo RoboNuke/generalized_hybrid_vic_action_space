@@ -694,12 +694,17 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         #  * POSITION-based (legacy A/B): value = progress - s_ref (the time-based moving setpoint),
         #    which runs away once the tool falls behind so the gradient dies.
         # pace_a/pace_b/pace_wt select the active term's squashing params + weight (used below).
+        pace_speed_gate = 1.0                                                # optional hard min-speed cliff (vel pace only); 1.0 = no gate
         if bool(cfg.vel_based_pace_enabled):
             _sdt = float(getattr(self, "step_dt", self.physics_dt * self.cfg.decimation))
             _vdes = float(cfg.desired_speed_cm_s) / 100.0                    # cm/s -> m/s
             v_along = (self.progress - self.prev_progress) / _sdt            # (E,) along-track speed (m/s)
             pace_value = v_along - _vdes                                     # (E,) speed error (m/s), signed
             pace_a, pace_b, pace_wt = cfg.vel_based_pace_a, cfg.vel_based_pace_b, cfg.vel_based_pace_weight
+            # MIN-SPEED gate: below the threshold along-track speed, pay ZERO (hard cliff) so the tool
+            # must commit to real forward motion; holding still earns no pace at all.
+            if bool(cfg.vel_based_pace_min_speed_enabled):
+                pace_speed_gate = (v_along >= float(cfg.vel_based_pace_min_speed)).float()   # (E,) 0/1
         else:
             pace_value = self.progress - self.s_ref                         # (E,) m, signed (position pace)
             pace_a, pace_b, pace_wt = cfg.pace_a, cfg.pace_b, cfg.pace_weight
@@ -765,7 +770,7 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "force": factory_utils.squashing_fn(force_value, cfg.force_a, cfg.force_b) * contact,
             "orientation": factory_utils.squashing_fn(orn_value, cfg.orientation_a, cfg.orientation_b) * near_surface,
             "straightness": factory_utils.squashing_fn(straightness_value, cfg.straightness_a, cfg.straightness_b) * straight_factor,
-            "pace": factory_utils.squashing_fn(pace_value, pace_a, pace_b) * pace_factor,
+            "pace": factory_utils.squashing_fn(pace_value, pace_a, pace_b) * pace_factor * pace_speed_gate,
             # Fixed bonus paid ONCE per keypoint, the first time it is achieved (count newly achieved
             # this step; usually 0/1 but >1 when a single fast step drags across multiple boundaries).
             "keypoint": newly_achieved.float(),

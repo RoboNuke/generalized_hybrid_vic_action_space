@@ -206,8 +206,14 @@ class FlatSurfaceFollowTask(ForgeTask):
     # contact/air gating, and the per-term logging (so only one pace term is active at a time).
     vel_based_pace_enabled: bool = True
     vel_based_pace_weight: float = 1.0
-    vel_based_pace_a: float = 100.0               # squashing steepness over the along-track SPEED error (m/s)
+    vel_based_pace_a: float = 30.0                # squashing steepness over the along-track SPEED error (m/s)
     vel_based_pace_b: float = -1.0                # peak = 1
+    # Optional MIN-SPEED gate: when enabled, the velocity pace pays ZERO whenever the along-track
+    # speed d(progress)/dt is below vel_based_pace_min_speed (m/s). A hard cliff — tiny jitter earns
+    # nothing and the reward JUMPS on once the tool commits to real forward motion, so holding still
+    # in contact gets no pace at all. Default OFF (smooth squash only).
+    vel_based_pace_min_speed_enabled: bool = False
+    vel_based_pace_min_speed: float = 0.001       # m/s (1 mm/s) — gate threshold when enabled
 
     # Time-to-success bonus: ONE-SHOT, paid on the first step success is reached. value = t* - t_succ
     # where t* = (first-contact time) + path_length / desired_speed is the ideal completion time and
