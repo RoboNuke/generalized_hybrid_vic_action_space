@@ -205,7 +205,7 @@ class FlatSurfaceFollowTask(ForgeTask):
     # breaks the "sit still in contact" local minimum. Reuses the "pace" reward-dict key, the
     # contact/air gating, and the per-term logging (so only one pace term is active at a time).
     vel_based_pace_enabled: bool = True
-    vel_based_pace_weight: float = 1.0
+    vel_based_pace_weight: float = 2.0            # match the ~125 the constraint terms reach (pace was flat ~50 at 1.0)
     vel_based_pace_a: float = 30.0                # squashing steepness over the along-track SPEED error (m/s)
     vel_based_pace_b: float = -1.0                # peak = 1
     # Optional MIN-SPEED gate: when enabled, the velocity pace pays ZERO whenever the along-track

@@ -37,6 +37,7 @@ runner_cfg:
     task.pace_lag_frac: 0.5
     task.keypoint_reward_weight: 8.0
     task.vel_based_pace_enabled: true   # velocity-based pace (reward matching v_des along d); false = legacy position pace
+    task.vel_based_pace_weight: 2.0                # up from 1.0 so pace can pull as hard as the constraint terms
     task.vel_based_pace_a: 30.0                   # wider squash basin -> gradient from rest toward v_des
     task.vel_based_pace_min_speed_enabled: true   # zero pace below the min speed (hard cliff to force real motion)
     task.vel_based_pace_min_speed: 0.001          # m/s (1 mm/s)
