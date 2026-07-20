@@ -21,6 +21,7 @@ from configs.manager.sac_cfg import SAC_CFG
 from learning.block_agent import BlockAgent
 from learning.losses import AuxLossManager, LossContext
 from models.block_simba import (
+    assign_block_slice,
     merge_optimizer_states,
     slice_optimizer_state,
 )
@@ -712,7 +713,10 @@ class SAC(BlockAgent):
     # Per-agent checkpoint hooks (BlockAgent does the slicing/stitching)
     # --------------------------------------------------------------
     def _checkpoint_model_keys(self) -> list[str]:
-        return ["policy", "critic_1", "critic_2", "target_critic_1", "target_critic_2"]
+        # Target critics are NOT saved: they're just EMA copies of critic_1/critic_2, so serializing
+        # them wastes ~0.27 GB/agent on disk (and in the save's host staging). They're reconstructed
+        # as target := critic on load (see _load_extra_into_slot) — a valid init that polyak re-tracks.
+        return ["policy", "critic_1", "critic_2"]
 
     def _checkpoint_optimizer_keys(self) -> list[str]:
         return ["policy_optimizer", "critic_optimizer"]
@@ -760,6 +764,12 @@ class SAC(BlockAgent):
                 self.log_entropy_coefficient.data[target_slot].copy_(
                     saved_log_ent.to(self.device)
                 )
+        # Reconstruct the (no-longer-saved) target critics for this slot as target := critic. The
+        # critic_1/critic_2 slices were just loaded above; polyak averaging re-tracks the targets
+        # during training. Backward-compatible: old checkpoints that still contain target_critic_*
+        # keys simply ignore them (critic_1/critic_2 are always present) and reconstruct the same way.
+        assign_block_slice(self.target_critic_1, target_slot, self.num_agents, ckpt["critic_1"])
+        assign_block_slice(self.target_critic_2, target_slot, self.num_agents, ckpt["critic_2"])
 
     def _load_extra_optimizers(self, per_agent_ckpts: list[dict], path: str) -> None:
         """Stitch the (conditional) entropy optimizer; validate learn_entropy agreement.
