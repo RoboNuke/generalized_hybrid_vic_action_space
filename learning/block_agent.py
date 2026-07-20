@@ -1287,6 +1287,28 @@ class BlockAgent(Agent):
             )
         return full[key]
 
+    @staticmethod
+    def _release_host_memory() -> None:
+        """Return the host memory a large ``torch.save`` just freed back to the OS.
+
+        ``torch.save`` serializes each GPU tensor by staging a CPU copy; the per-agent checkpoint
+        here is ~1 GB (large critic ensemble + Adam state), so a checkpoint stages ~num_agents GB.
+        After the save that CPU memory is freed, but glibc keeps it in its arena instead of returning
+        it to the OS — so periodic checkpoints STAIRCASE RSS upward (~num_agents GB per interval)
+        until the job OOMs. ``gc.collect()`` drops the last Python refs and ``malloc_trim(0)`` hands
+        the freed arena back to the OS, flattening the staircase."""
+        import ctypes
+        import ctypes.util
+        import gc
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        try:
+            ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6").malloc_trim(0)
+        except Exception:
+            pass  # non-glibc platform: gc.collect() still ran; nothing else to do
+
     def write_checkpoint(self, timestep: int, timesteps: int) -> None:
         """Save one ``ckpt_{timestep}.pt`` file per agent, each in its own folder.
 
@@ -1299,6 +1321,7 @@ class BlockAgent(Agent):
             os.makedirs(ckpt_dir, exist_ok=True)
             path = os.path.join(ckpt_dir, f"ckpt_{tag}.pt")
             torch.save(self._build_per_agent_checkpoint(i, timestep), path)
+            self._release_host_memory()  # hand the save's GPU->CPU staging back to the OS (per agent)
 
     def _write_best_checkpoint(self, i: int, timestep: int, success_rate: float) -> None:
         """(Re)write agent ``i``'s ``ckpt_best.pt`` — the highest this-interval
@@ -1316,6 +1339,8 @@ class BlockAgent(Agent):
         ckpt["best_success_rate"] = float(success_rate)
         best_path = os.path.join(ckpt_dir, "ckpt_best.pt")
         torch.save(ckpt, best_path)
+        del ckpt
+        self._release_host_memory()  # hand the save's GPU->CPU staging back to the OS
         # Back up ONLY the best checkpoint to this agent's wandb run's Files (plain file, not an
         # artifact), live-watched so each improvement re-uploads. Guarded: only when a MetricWriter
         # with a wandb run exists for this agent (no-op for TB-only / record mode).
