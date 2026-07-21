@@ -60,7 +60,7 @@ sac_cfg:
   learning_starts: 300
   learn_entropy: true
   initial_entropy_value: 0.05
-  target_entropy: -5            # = -|continuous|/2 = -10/2 (7 base + 3 rotated diag gains (fixed R, 3-DOF))
+  target_entropy: -10             # -|continuous| = -10 (standard SAC; was -dim/2, lowered to curb late over-exploration)
   grad_norm_clip: 1.0
   mixed_precision: false
   observation_preprocessor: RunningStandardScaler
@@ -135,8 +135,8 @@ controller_cfg:
   # ---- shared per-axis bounds [x,y,z,Rx,Ry,Rz], geometric scaling k = lo*(hi/lo)^((a+1)/2) ----
   # A lower bound < ~1e-6 disables that channel (k=0) instead of producing NaN, so use > 0 for
   # meaningful variable impedance. Translation and rotation differ ~10x, hence the split values.
-  gain_min: [400, 400, 400, 20, 20, 20] # pose stiffness K (position x3, rotation x3)
-  gain_max: [800, 800, 800, 40, 40, 40] 
+  gain_min: [500, 500, 500, 20, 20, 20] # pose stiffness K (position x3, rotation x3)
+  gain_max: [900, 900, 900, 40, 40, 40] 
 
   # Policy commands the pose stiffness directly, so disable the base Forge env's per-reset
   # multiplicative gain randomization (default [0.41]x6) to avoid randomizing on top of the

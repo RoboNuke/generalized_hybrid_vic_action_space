@@ -60,7 +60,7 @@ sac_cfg:
   learning_starts: 300
   learn_entropy: true
   initial_entropy_value: 0.05
-  target_entropy: -3.5            # -|continuous|/2 then +1 (raised for exploration)
+  target_entropy: -7             # -|continuous| = -7 (standard SAC; was -dim/2, lowered to curb late over-exploration)
   grad_norm_clip: 1.0
   mixed_precision: false
   observation_preprocessor: RunningStandardScaler
@@ -169,7 +169,7 @@ controller_cfg:
   force_action_threshold: [2.0, 2.0, 2.0]
   torque_action_threshold: [0.01, 0.01, 0.01]
 
-  #default_task_prop_gains: [100, 100, 100, 30, 30, 30]
+  default_task_prop_gains: [650, 650, 650, 28, 28, 28]   # constant K; overrides the Forge default (565). Raised toward where the learning methods land (~650)
   #default_task_force_gains: [0.5, 0.5, 0.5, 0.1, 0.1, 0.1]   # K_f diagonal in "constant" mode
   default_task_force_gains: [2.8, 2.8, 2.8, 0.1, 0.1, 0.1]
   async_z_force_bounds: true
