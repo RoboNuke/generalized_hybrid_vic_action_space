@@ -867,3 +867,177 @@ def plot_metric_vs_success(data: dict, metric_tag: str, success_tag: str,
     ax.legend(loc="best", fontsize=8)
     ax.grid(True, alpha=0.3)
     return ax
+
+
+# --------------------------------------------------------------------------- #
+# Surface-frame stiffness plots (flat-surface-follow analysis, NO task phases)
+# --------------------------------------------------------------------------- #
+# The flat-surface task has no free->search->insertion phases, and the natural
+# reference frame is the SURFACE frame [along-track, cross-track, normal] rather
+# than the peg axis. The controller logs the applied stiffness resolved onto those
+# axes as ``Impedance_Stiffness/k_along_track_mean`` / ``k_cross_track_mean`` /
+# ``k_normal_mean`` (diag(R_surfᵀ K R_surf); see ctrl_action_interface
+# ._log_stiffness_frame_metrics). These helpers are the phaseless surface-frame
+# analogues of plot_axial_lateral_scatter / plot_stiffness_ellipses above.
+SURFACE_STIFFNESS_TAGS = {
+    "along_track": "Impedance_Stiffness/k_along_track_mean",
+    "cross_track": "Impedance_Stiffness/k_cross_track_mean",
+    "normal":      "Impedance_Stiffness/k_normal_mean",
+}
+
+
+def plot_surface_stiffness_scatter(data: dict, style: PlotStyle,
+                                   x_tag=SURFACE_STIFFNESS_TAGS["along_track"],
+                                   y_tag=SURFACE_STIFFNESS_TAGS["normal"],
+                                   xlabel="k$_\\parallel$  (along-track stiffness)",
+                                   ylabel="k$_n$  (normal / into-surface stiffness)",
+                                   groups=None, reduce="mean_tail", selection_metric=None,
+                                   ax=None):
+    """Scatter of two surface-frame stiffnesses, one marker (mean ± CI) per controller.
+
+    Defaults to k_normal (y) vs k_along_track (x) -- the phaseless, surface-frame
+    analogue of :func:`plot_axial_lateral_scatter`. Each controller is reduced to a
+    single end-of-training point (``reduce``) with CI whiskers across its runs. The
+    ``y = x`` line is isotropy: points above it press harder INTO the surface than
+    they resist ALONG it (the usual surface-following strategy), below it the
+    reverse. Returns the Axes.
+    """
+    groups = groups if groups is not None else list(data.keys())
+    if ax is None:
+        _, ax = plt.subplots(figsize=(6, 6))
+
+    xs = dl.summarize_tag(data, x_tag, reduce=reduce, ci_z=style.ci_z,
+                          step_ceiling=style.step_ceiling, selection_metric=selection_metric)
+    ys = dl.summarize_tag(data, y_tag, reduce=reduce, ci_z=style.ci_z,
+                          step_ceiling=style.step_ceiling, selection_metric=selection_metric)
+
+    allv = []
+    for idx, group in enumerate(groups):
+        if group not in xs or group not in ys:
+            continue
+        xm, xci, _ = xs[group]
+        ym, yci, _ = ys[group]
+        color = style.color(group, idx)
+        ax.errorbar(xm, ym, xerr=xci, yerr=yci, fmt="o", color=color, markersize=7,
+                    capsize=3, elinewidth=1, label=style.name(group), zorder=3)
+        allv += [xm, ym]
+
+    if allv:
+        lo, hi = min(allv), max(allv)
+        ax.plot([lo, hi], [lo, hi], "k--", alpha=0.4, linewidth=1,
+                label="isotropic (k$_n$=k$_\\parallel$)")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title("Surface-frame stiffness by controller\n(marker = mean, whiskers = 95% CI across runs)")
+    ax.legend(loc="best", fontsize=8)
+    ax.grid(True, alpha=0.3)
+    return ax
+
+
+def plot_surface_stiffness_ellipses(data: dict, style: PlotStyle,
+                                    normal_tag=SURFACE_STIFFNESS_TAGS["normal"],
+                                    along_tag=SURFACE_STIFFNESS_TAGS["along_track"],
+                                    groups=None, reduce="mean_tail", selection_metric=None,
+                                    ncols=None, figsize_per=(2.3, 2.3),
+                                    color_by_normal=False, ghost=False, ghost_normal=None,
+                                    scale_mode="max", cmap="viridis"):
+    """Cartoon of the stiffness "oval" in the surface plane, one panel per controller.
+
+    Each oval shows only two of the three surface directions -- the SURFACE NORMAL on
+    the vertical axis (semi-axis = k_normal) and the ALONG-TRACK direction horizontally
+    (semi-axis = k_along_track); cross-track is dropped so the shape reads as a clean
+    2-D profile of "how hard it presses down vs. how hard it resists along the path".
+    The surface frame is orthonormal by construction, so the ovals are upright (no tilt
+    term is logged, unlike the peg-axis version). Phaseless analogue of
+    :func:`plot_stiffness_ellipses`. Returns the Figure.
+
+    Cues (composable), matching the peg version:
+
+    * ``color_by_normal``: fill each oval by its *true* k_normal via ``cmap`` + shared
+      colorbar, so panels separate by colour even when the shapes look alike.
+    * ``ghost``: draw a reference oval (dashed grey) in every panel as a fixed anchor.
+      Defaults to the grand-mean oval; pass ``ghost_normal`` (true stiffness units) to
+      anchor on a fixed circle of that radius instead.
+    * ``scale_mode``: ``"max"`` normalizes both semi-axes by the global largest value
+      (true geometry); ``"range"`` affine-maps the global [min, max] over ALL semi-axis
+      values onto [0.25, 1.0] so small differences between panels pop.
+    """
+    groups = groups if groups is not None else list(data.keys())
+    n = dl.summarize_tag(data, normal_tag, reduce=reduce, ci_z=style.ci_z,
+                         step_ceiling=style.step_ceiling, selection_metric=selection_metric)
+    al = dl.summarize_tag(data, along_tag, reduce=reduce, ci_z=style.ci_z,
+                          step_ceiling=style.step_ceiling, selection_metric=selection_metric)
+
+    normal_vals = [n[g][0] for g in n]
+    vals = normal_vals + [al[g][0] for g in al]
+    range_note = None
+    if scale_mode == "range" and vals:
+        gmin, gmax = min(vals), max(vals)
+        span = (gmax - gmin) or 1.0
+        to_disp = lambda v: 0.25 + 0.75 * (v - gmin) / span
+        range_note = (f"Range-stretched scale: semi-axis 0.25 = {gmin:.0f}, "
+                      f"1.0 = {gmax:.0f} (stiffness units, global min/max over both axes)")
+    else:
+        scale = max(vals) if vals else 1.0
+        to_disp = lambda v: v / scale
+
+    sm = None
+    if color_by_normal and normal_vals:
+        norm = mpl.colors.Normalize(vmin=min(normal_vals), vmax=max(normal_vals))
+        sm = mpl.cm.ScalarMappable(norm=norm, cmap=plt.get_cmap(cmap))
+
+    ghost_params = None
+    if ghost and ghost_normal is not None:
+        ghost_params = (float(ghost_normal), float(ghost_normal))
+    elif ghost and normal_vals:
+        ghost_params = (float(np.mean(normal_vals)),
+                        float(np.mean([al[g][0] for g in al])))
+
+    t = np.linspace(0, 2 * np.pi, 100)
+
+    def _oval_xy(k_normal, k_along):
+        # k_along along the horizontal (surface tangent), k_normal along the vertical.
+        return k_along * np.cos(t), k_normal * np.sin(t)
+
+    plotted = [g for g in groups if g in n and g in al]
+    ncols = ncols if ncols is not None else max(1, len(plotted))
+    nrows = max(1, (len(plotted) + ncols - 1) // ncols)
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(figsize_per[0] * ncols, figsize_per[1] * nrows),
+                             squeeze=False, constrained_layout=color_by_normal)
+    flat_axes = axes.ravel()
+    for k, ax in enumerate(flat_axes):
+        ax.set_aspect("equal")
+        ax.set_xlim(-1.2, 1.2)
+        ax.set_ylim(-1.2, 1.2)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        if k >= len(plotted):
+            ax.axis("off")
+            continue
+        group = plotted[k]
+        outline = style.color(group, k)
+        # Surface normal reference (vertical) + surface plane (horizontal).
+        ax.plot([0, 0], [-1.1, 1.1], color="0.6", linestyle=":", linewidth=1)
+        ax.plot([-1.1, 1.1], [0, 0], color="0.85", linestyle="-", linewidth=1, zorder=0)
+        if ghost_params is not None:
+            gx, gy = _oval_xy(to_disp(ghost_params[0]), to_disp(ghost_params[1]))
+            ax.plot(gx, gy, color="0.7", linestyle="--", linewidth=1.0, zorder=1)
+        kn = to_disp(n[group][0])
+        ka = to_disp(al[group][0])
+        xr, yr = _oval_xy(kn, ka)
+        fill = sm.to_rgba(n[group][0]) if sm is not None else outline
+        ax.fill(xr, yr, color=fill, alpha=0.6 if sm is not None else 0.35, zorder=2)
+        ax.plot(xr, yr, color=outline, linewidth=1.2, zorder=3)
+        ax.set_title(style.name(group), fontsize=9)
+    if sm is not None:
+        sm.set_array([])
+        fig.colorbar(sm, ax=axes.ravel().tolist(), shrink=0.6,
+                     label="k_normal (true units)")
+    fig.suptitle("Surface-frame stiffness oval  (vertical = normal, horizontal = along-track)")
+    if not color_by_normal:
+        fig.tight_layout()
+    if range_note:
+        fig.subplots_adjust(bottom=max(fig.subplotpars.bottom, 0.06))
+        fig.text(0.5, 0.01, range_note, ha="center", va="bottom", fontsize=8, color="0.3")
+    return fig
