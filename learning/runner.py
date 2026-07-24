@@ -255,6 +255,8 @@ def main(argv: list[str] | None = None) -> None:
     loss_cfg = loaded["loss_cfg"]
     # Sampling-Based reset Curriculum (absent -> default-constructed, disabled).
     reset_curriculum_cfg = loaded["reset_curriculum_cfg"]
+    # Surface keypoint-servo action override (absent -> default-constructed, disabled).
+    keypoint_servo_cfg = loaded["keypoint_servo_cfg"]
 
     # Which learning algorithm to run. ``active_cfg`` supplies the fields the runner
     # plumbs that exist on both SAC_CFG and PPO_CFG (experiment dir, observation
@@ -312,6 +314,7 @@ def main(argv: list[str] | None = None) -> None:
     env, ctrl_wrapper, is_automate_assembly, env_cfg, total_envs = build_env(
         args, runner_cfg, sac_cfg, ppo_cfg, controller_cfg, noise_cfg, sensor_cfg, agent_type,
         reset_curriculum_cfg=reset_curriculum_cfg,
+        keypoint_servo_cfg=keypoint_servo_cfg,
     )
 
     device = torch.device(args.device)
@@ -371,6 +374,40 @@ def main(argv: list[str] | None = None) -> None:
             f"[runner] disable_success_pred: force_zero_action_dims -> "
             f"{actor_kwargs['force_zero_action_dims']} (index 6 = success prediction)"
         )
+
+    # Keypoint-servo action override (surface task): the wrapper removes the leading N pose dims
+    # from the policy-facing action, so every action-INDEX-keyed model_cfg field (authored against
+    # the FULL action vector) must be remapped onto the reduced layout: drop indices that landed in
+    # the removed [0, N) block, shift the rest down by N. Without this, e.g. scale_down_action_dims
+    # [0,1,2] points at now-removed dims and BlockSimBa raises "index out of range".
+    _ks_removed = int(getattr(env.unwrapped, "_keypoint_servo_removed_dims", 0))
+    if _ks_removed:
+        # Hybrid force SELECTION ties Bernoulli gates to pose-component outputs (ctrl_wrapper's
+        # policy_selection_layout); removing pose outputs while keeping those gates would break that
+        # structure. Surface configs run force-free (N=0), so refuse the unsupported combo loudly.
+        if ctrl_wrapper is not None and any(len(x) for x in ctrl_wrapper.policy_selection_layout):
+            raise NotImplementedError(
+                "keypoint_servo_cfg.enabled with hybrid force selection (use_hybrid_force / "
+                "non-zero force_axes) is not supported: the servo removes pose-component action "
+                "dims the selection gates are tied to. Disable hybrid force, or the servo."
+            )
+
+        def _remap_action_dims(dims):
+            return [d - _ks_removed for d in dims if d >= _ks_removed]
+
+        for _key in (
+            "scale_down_action_dims",
+            "second_act_init_std_dims",
+            "force_zero_action_dims",
+            "bernoulli_action_dims",
+        ):
+            if actor_kwargs.get(_key):
+                _old = list(actor_kwargs[_key])
+                actor_kwargs[_key] = _remap_action_dims(_old)
+                print(
+                    f"[runner] keypoint-servo: remapped actor.{_key} {_old} -> "
+                    f"{actor_kwargs[_key]} (dropped leading {_ks_removed} pose dims)"
+                )
 
     # selection_distribution / selection_init_bias apply only to the hybrid actor;
     # pop them so they never reach the plain BlockSimBaActor (which doesn't accept them).
@@ -590,6 +627,14 @@ def main(argv: list[str] | None = None) -> None:
                 "(controller_cfg.gain_mapping='rotated' WITHOUT fixed_rotation_from_interaction/rpy); "
                 "the controller exposed no rot6d action slice (env._rot6d_action_slice is None)."
             )
+        # The rot6d slice is authored against the FULL action layout; the keypoint-servo wrapper
+        # removed the leading pose dims, so shift it onto the reduced action the aux loss slices
+        # (it lives in the trailing gain block, past the removed pose dims, so both ends shift).
+        if _ks_removed:
+            _old_slice = rot6d_slice
+            rot6d_slice = (rot6d_slice[0] - _ks_removed, rot6d_slice[1] - _ks_removed)
+            print(f"[runner] keypoint-servo: remapped rot6d_slice {_old_slice} -> {rot6d_slice} "
+                  f"(dropped leading {_ks_removed} pose dims)")
         print(f"[runner] supervised rotation loss: rot6d_slice={rot6d_slice} "
               "(GAS rotation dims supervised toward the ground-truth interaction frame)")
 
@@ -612,6 +657,12 @@ def main(argv: list[str] | None = None) -> None:
         contact_axes=contact_axes,
         rot6d_slice=rot6d_slice,
     )
+
+    # Keypoint-servo removes the leading pose dims from the policy action, so the SAC per-pose-axis
+    # action diagnostic must log only the pose axes the policy STILL emits: the servo takes the
+    # first _ks_removed of (x,y,z,rx,ry,rz), leaving the rest at the front of the reduced action.
+    if _ks_removed:
+        agent._pose_axis_labels = ("x", "y", "z", "rx", "ry", "rz")[_ks_removed:]
 
     # SimBa periodic reset: give the agent a factory that rebuilds fresh, identically-constructed
     # networks (see sac_cfg.periodic_reset_*). Attached unconditionally; the agent only calls it

@@ -141,6 +141,7 @@ def main() -> None:
     noise_cfg = loaded["noise_cfg"]
     sensor_cfg = loaded["sensor_cfg"]
     loss_cfg = loaded["loss_cfg"]
+    keypoint_servo_cfg = loaded["keypoint_servo_cfg"]
 
     agent_type = str(runner_cfg.agent_type).lower()
     if agent_type not in ("sac", "ppo"):
@@ -181,7 +182,8 @@ def main() -> None:
 
     # ---- env (identical to training) ----
     env, ctrl_wrapper, is_automate_assembly, env_cfg, total_envs = build_env(
-        args, runner_cfg, sac_cfg, ppo_cfg, controller_cfg, noise_cfg, sensor_cfg, agent_type
+        args, runner_cfg, sac_cfg, ppo_cfg, controller_cfg, noise_cfg, sensor_cfg, agent_type,
+        keypoint_servo_cfg=keypoint_servo_cfg,
     )
 
     device = torch.device(args.device)

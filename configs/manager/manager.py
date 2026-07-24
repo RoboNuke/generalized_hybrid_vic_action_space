@@ -22,6 +22,7 @@ from typing import Any
 import yaml
 
 from configs.manager.controller_cfg import ControlCfg
+from configs.manager.keypoint_servo_cfg import KeypointServoCfg
 from configs.manager.loss_cfg import LossCfg
 from configs.manager.reset_curriculum_cfg import ResetCurriculumCfg
 from configs.manager.model_cfg import ModelCfg
@@ -114,6 +115,7 @@ class ConfigManager:
         "sensor_cfg": SensorCfg,
         "loss_cfg": LossCfg,  # auxiliary-loss switches; consumed by learning/losses.py
         "reset_curriculum_cfg": ResetCurriculumCfg,  # SBC reset curriculum; consumed by env_setup
+        "keypoint_servo_cfg": KeypointServoCfg,  # surface keypoint-servo action override; env_setup
     }
 
     @classmethod

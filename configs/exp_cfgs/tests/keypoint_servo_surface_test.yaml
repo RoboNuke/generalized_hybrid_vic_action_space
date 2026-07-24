@@ -1,0 +1,33 @@
+# Smoke-test overlay: keypoint-servo action override on the surface-following task.
+# Deep-merged over a VARIABLE-GAIN surface base (so the policy still has gain dims after the pose
+# block is removed). With fix_orientation:true the wrapper removes all 6 pose dims, so a pose-only
+# base (glued_surface/1_fixed, constant gains) would leave the policy with 0 actions and is rejected
+# — use 2_VICES / 4_GAS / 8_GAS_geo, or set fix_orientation:false to keep the 3 rotation dims.
+#   python learning/runner.py \
+#     --config configs/exp_cfgs/glued_surface/2_VICES.yaml \
+#     --overlay configs/exp_cfgs/tests/keypoint_servo_surface_test.yaml --headless
+#
+# The wrapper removes the EEF translation + (with fix_orientation) rotation from the policy action
+# space and drives the held-cylinder tip toward env.setpoint_pos plus a small directional offset
+# (2 mm off the surface along the normal, 5 mm ahead along-track). Short run, few envs, wandb off —
+# exercises the action-space surgery, the scale_down_action_dims remap, projection, and the
+# fixed-orientation path, not a trained policy.
+
+runner_cfg:
+  num_envs: 16
+  num_agents: 1
+  total_timesteps: 400
+
+keypoint_servo_cfg:
+  enabled: true
+  along_track_offset: 0.005      # 5 mm ahead of the setpoint along path_dir
+  off_track_offset: 0.0
+  normal_offset: 0.002           # 2 mm off the surface along surface_normal
+  fix_orientation: true
+  fixed_rpy_deg: [180.0, 0.0, 0.0]   # world Euler XYZ (illustrative fixed EEF orientation for the test)
+
+sac_cfg:
+  learning_starts: 50
+  tensorboard: true
+  experiment:
+    wandb: false

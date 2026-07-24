@@ -78,6 +78,7 @@ def build_env(
     agent_type,
     *,
     reset_curriculum_cfg=None,
+    keypoint_servo_cfg=None,
     force_camera: bool = False,
 ):
     """Construct the full wrapped Isaac Lab env exactly as training does.
@@ -587,6 +588,31 @@ def build_env(
         )
     elif control_type != "pose":
         raise ValueError(f"[runner] unknown controller_cfg.control_type: {control_type!r}")
+
+    # Keypoint-servo action override (installed just OUTSIDE the control wrapper): removes the
+    # leading pose dims from the policy-facing action and computes them from the surface geometry
+    # (servo the tip toward env.setpoint_pos + a directional offset; optionally hold a fixed EEF
+    # orientation). Surface task only — it reads the FlatSurfaceFollow geometry (setpoint_pos,
+    # held_end_pos, path_dir/d_lat/surface_normal). Must wrap the control wrapper so the full-width
+    # action is reconstructed before the controller sees it; the reduced space is exposed upward.
+    if keypoint_servo_cfg is not None and keypoint_servo_cfg.enabled:
+        if not runner_cfg.task.startswith("Isaac-FlatSurfaceFollow-"):
+            raise ValueError(
+                "keypoint_servo_cfg.enabled=True requires an Isaac-FlatSurfaceFollow-* task "
+                f"(it servos to the surface setpoint keypoint), but task is {runner_cfg.task!r}."
+            )
+        from wrappers.controllers.keypoint_servo_wrapper import KeypointServoActionWrapper
+        env = KeypointServoActionWrapper(env, keypoint_servo_cfg)
+        _ori = (
+            f"fixed orientation rpy={list(keypoint_servo_cfg.fixed_rpy_deg)} deg"
+            if keypoint_servo_cfg.fix_orientation
+            else "policy-controlled orientation"
+        )
+        print(
+            f"[runner] keypoint-servo action override attached (offsets "
+            f"[along, off, normal]=[{keypoint_servo_cfg.along_track_offset}, "
+            f"{keypoint_servo_cfg.off_track_offset}, {keypoint_servo_cfg.normal_offset}] m, {_ori})."
+        )
 
     # Efficient reset (installed BEFORE fragile, just OUTSIDE the control wrapper): patches
     # _reset_idx so the runtime chain is control._wrapped -> efficient._wrapped -> reset, i.e.

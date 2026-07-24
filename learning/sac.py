@@ -650,16 +650,22 @@ class SAC(BlockAgent):
                 self.track_per_agent("Action / saturation rate", split(saturation).mean(dim=(1, 2)))
                 self.track_per_agent("Action / log_prob (mean)", split(log_prob).mean(dim=(1, 2)))
 
-                # Pose-action magnitude — the first 6 action dims are the raw,
-                # pre-scaled pose command (x, y, z, rx, ry, rz) the policy emits
-                # before the env rescales to physical units. Tracks the average
-                # magnitude and its spread per axis so we can see how hard the
-                # policy drives each pose channel independent of gain/gripper dims.
-                with torch.no_grad():
-                    pose_abs_pa = split(abs_a[..., :6])        # (N, B, 6)
-                for i, axis in enumerate(("x", "y", "z", "rx", "ry", "rz")):
-                    self.track_per_agent(f"Action / pose |{axis}| mean", pose_abs_pa[..., i].mean(dim=1))
-                    self.track_per_agent(f"Action / pose |{axis}| std",  pose_abs_pa[..., i].std(dim=1))
+                # Pose-action magnitude — the leading action dims are the raw, pre-scaled pose
+                # command (x, y, z, rx, ry, rz) the policy emits before the env rescales to
+                # physical units. Tracks the average magnitude and its spread per axis so we can
+                # see how hard the policy drives each pose channel independent of gain/gripper dims.
+                # The keypoint-servo wrapper can take over the leading pose dims (position, or
+                # position+orientation); the runner then sets ``_pose_axis_labels`` to just the pose
+                # axes the policy STILL emits (empty when all are servo-provided). Default to all 6,
+                # and clamp to the action width so this never indexes past a shrunk action vector.
+                pose_axes = getattr(self, "_pose_axis_labels", ("x", "y", "z", "rx", "ry", "rz"))
+                n_pose = min(len(pose_axes), abs_a.shape[-1])
+                if n_pose > 0:
+                    with torch.no_grad():
+                        pose_abs_pa = split(abs_a[..., :n_pose])        # (N, B, n_pose)
+                    for i, axis in enumerate(pose_axes[:n_pose]):
+                        self.track_per_agent(f"Action / pose |{axis}| mean", pose_abs_pa[..., i].mean(dim=1))
+                        self.track_per_agent(f"Action / pose |{axis}| std",  pose_abs_pa[..., i].std(dim=1))
 
                 # Continuous-action L2 norm — surfaces "do nothing" collapse.
                 # If the policy parks all continuous dims near 0 (e.g. when the

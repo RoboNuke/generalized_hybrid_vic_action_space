@@ -218,6 +218,7 @@ def main() -> None:
     controller_cfg = loaded["controller_cfg"]
     noise_cfg = loaded["noise_cfg"]
     sensor_cfg = loaded["sensor_cfg"]
+    keypoint_servo_cfg = loaded["keypoint_servo_cfg"]
 
     agent_type = str(runner_cfg.agent_type).lower()
     if agent_type not in ("sac", "ppo"):
@@ -263,7 +264,7 @@ def main() -> None:
     # ---- env (identical to training, camera forced on) ----
     env, ctrl_wrapper, is_automate_assembly, env_cfg, total_envs = build_env(
         args, runner_cfg, sac_cfg, ppo_cfg, controller_cfg, noise_cfg, sensor_cfg,
-        agent_type, force_camera=True,
+        agent_type, keypoint_servo_cfg=keypoint_servo_cfg, force_camera=True,
     )
 
     train_exc = None
