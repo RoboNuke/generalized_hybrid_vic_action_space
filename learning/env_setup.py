@@ -340,15 +340,36 @@ def build_env(
     # the gripper — 'random' = per-reset random, 'fixed' = constant signed offset. Must run before
     # gym.make (it patches the env class). 'none' => not installed => upstream behavior.
     if runner_cfg.grasp_rot_mode != "none":
-        if not (runner_cfg.task.startswith("Isaac-Forge-")
-                or runner_cfg.task.startswith("Isaac-Factory-")):
+        _is_forge_factory = (runner_cfg.task.startswith("Isaac-Forge-")
+                             or runner_cfg.task.startswith("Isaac-Factory-"))
+        _is_surface_grasp = runner_cfg.task.startswith("Isaac-FlatSurfaceFollow-")
+        if _is_forge_factory:
+            from wrappers.sensors.grasp_tilt_wrapper import install_grasp_rot_randomization
+            install_grasp_rot_randomization(runner_cfg.rel_grasp_rot_init_deg, runner_cfg.grasp_rot_mode)
+        elif _is_surface_grasp:
+            # Surface task: the cylinder is a rigid weld LINK (glue_peg_to_gripper), so its fixed
+            # in-gripper tilt is folded into the weld frame below (_weld_tilt), NOT via the
+            # FactoryEnv.get_handheld_asset_relative_pose patch (the surface env overrides that
+            # method). held_quat reads the welded-link pose, so the env sees the tilt (cyl_axis /
+            # angle_from_normal follow). A weld is authored once before play, so only the constant
+            # 'fixed' mode is meaningful, and the weld must be on to carry it.
+            if runner_cfg.grasp_rot_mode != "fixed":
+                raise ValueError(
+                    "runner_cfg.grasp_rot_mode on the FlatSurfaceFollow task must be 'fixed' (the "
+                    "cylinder tilt is a constant weld frame that cannot be re-randomized per reset), "
+                    f"got {runner_cfg.grasp_rot_mode!r}."
+                )
+            if not runner_cfg.glue_peg_to_gripper:
+                raise ValueError(
+                    "runner_cfg.grasp_rot_mode='fixed' on the FlatSurfaceFollow task requires "
+                    "glue_peg_to_gripper=True (the tilt is folded into the peg-gripper weld frame)."
+                )
+        else:
             raise ValueError(
                 f"runner_cfg.grasp_rot_mode={runner_cfg.grasp_rot_mode!r} requires a Forge/Factory "
-                "peg-insertion task (it patches FactoryEnv.get_handheld_asset_relative_pose), but "
-                f"task is {runner_cfg.task!r}."
+                "peg-insertion task or the FlatSurfaceFollow task, but task is "
+                f"{runner_cfg.task!r}."
             )
-        from wrappers.sensors.grasp_tilt_wrapper import install_grasp_rot_randomization
-        install_grasp_rot_randomization(runner_cfg.rel_grasp_rot_init_deg, runner_cfg.grasp_rot_mode)
 
     # Optional Sampling-Based Curriculum on the reset pose (Forge/Factory peg insertion). Patches
     # FactoryEnv.randomize_initial_state to sample height/lateral/tilt per-env from [floor, max] with
@@ -481,11 +502,25 @@ def build_env(
                 f"flat_surface_follow tasks (the weld mirrors their grasp), but task={runner_cfg.task!r} "
                 f"name={_task_name!r}."
             )
-        # The weld's constant in-gripper tilt: peg reads it from runner_cfg.rel_grasp_rot_init_deg
-        # (with grasp_rot_mode='fixed'); the surface grips the cylinder rigidly ALIGNED with the
-        # gripper (identity in-grip rotation — its whole spawn orientation is set on the wrist), so
-        # the weld tilt is zero.
-        _weld_tilt = [0.0, 0.0, 0.0] if _is_surface else runner_cfg.rel_grasp_rot_init_deg
+        # The weld's constant in-gripper tilt = runner_cfg.rel_grasp_rot_init_deg (with
+        # grasp_rot_mode='fixed'), folded into the peg link frame. The PEG (Forge/Factory) always
+        # uses it (RunnerCfg enforces 'fixed' when glued). The SURFACE cylinder honors it only in
+        # 'fixed' mode; 'none' (the default for existing surface configs) keeps the rigid ALIGNED
+        # grip (zero tilt), so this is backward-compatible. held_quat reads the welded link pose,
+        # so a nonzero tilt propagates to cyl_axis / angle_from_normal.
+        if _is_surface:
+            _weld_tilt = (
+                runner_cfg.rel_grasp_rot_init_deg
+                if runner_cfg.grasp_rot_mode == "fixed"
+                else [0.0, 0.0, 0.0]
+            )
+            # Tell the surface reset the weld tilt so randomize_initial_state inverts it when
+            # seating the cylinder — the eef/wrist absorbs the tilt and the cylinder still spawns
+            # at the desired (normal-aligned) orientation. (Peg tasks use grasp_tilt_wrapper's
+            # get_handheld patch instead, so this is surface-only.)
+            env_cfg.task.grasp_weld_tilt_deg = list(_weld_tilt)
+        else:
+            _weld_tilt = runner_cfg.rel_grasp_rot_init_deg
         # The peg is folded into the Franka articulation as a rigid LINK on the env-0 prototype
         # before clone_environments (replicate_physics propagates it to every env), so
         # clone_in_fabric stays True and there is NO maximal-coordinate loop joint — which is what

@@ -57,6 +57,13 @@ class FlatSurfaceFollowTask(ForgeTask):
     fixed_asset_cfg: PlateCfg = PlateCfg()
     held_asset_cfg: CylinderHeldCfg = CylinderHeldCfg()
 
+    # Fixed grasp tilt [roll, pitch, yaw] (deg) of the cylinder RELATIVE TO THE GRIPPER, folded
+    # into the peg-gripper weld. Set by env_setup.build_env from runner_cfg.rel_grasp_rot_init_deg
+    # (grasp_rot_mode='fixed'); NOT a user override. The reset reads it to invert the tilt when
+    # seating the cylinder, so a tilted grasp still spawns the cylinder at the desired orientation
+    # (the eef/wrist absorbs the tilt). All-zero = aligned grip.
+    grasp_weld_tilt_deg: list = [0.0, 0.0, 0.0]
+
     # --- Plate geometry + spawn randomization ---
     plate_length: float = _PLATE_LENGTH
     plate_width: float = _PLATE_WIDTH

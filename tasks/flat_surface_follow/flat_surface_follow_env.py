@@ -294,17 +294,29 @@ class FlatSurfaceFollowEnv(ForgeEnv):
     # In-hand grasp pose (tip-down cylinder, optional in-hand tilt)
     # ------------------------------------------------------------------
     def get_handheld_asset_relative_pose(self):
-        # Rigid, ALIGNED grip (identity in-grip rotation): the cylinder's long axis is collinear
-        # with the gripper approach axis. The whole spawn orientation is set on the WRIST in
-        # randomize_initial_state, never within the grip.
-        # IMPORTANT: the procedural CylinderCfg's prim origin is at the cylinder's CENTER (it spans
-        # [-H/2, +H/2] along its local z), unlike the Factory peg USD whose origin is at the
-        # base/tip. So grip at (H/2 - fingerpad) from the center => fingerpad below the TOP end,
-        # with the cylinder hanging down and its lower end as the contact tip.
+        # In-grip pose of the cylinder. Position: the procedural CylinderCfg's prim origin is at the
+        # cylinder's CENTER (it spans [-H/2, +H/2] along its local z), unlike the Factory peg USD
+        # whose origin is at the base/tip. So grip at (H/2 - fingerpad) from the center => fingerpad
+        # below the TOP end, with the cylinder hanging down and its lower end as the contact tip.
+        # Orientation: a fixed grasp TILT (cylinder relative to the gripper), folded into the in-grip
+        # rotation the SAME way the weld does (peg_weld_wrapper._compute_peg_in_fingertip):
+        # rel_quat = quat_conjugate(perturb), perturb = quat_from_euler_xyz(grasp_weld_tilt_deg).
+        # Zero tilt => identity (rigid ALIGNED grip), so the reset math below is unchanged there.
         rel_pos = torch.zeros((self.num_envs, 3), device=self.device)
         rel_pos[:, 2] = self.cfg_task.held_asset_cfg.height / 2.0
         rel_pos[:, 2] -= self.cfg_task.robot_cfg.franka_fingerpad_length
-        return rel_pos, self._identity_quat()
+        tilt = self.cfg_task.grasp_weld_tilt_deg
+        if any(abs(float(v)) > 1e-9 for v in tilt):
+            r, p, y = (float(np.deg2rad(float(v))) for v in tilt)
+            perturb = torch_utils.quat_from_euler_xyz(
+                torch.tensor([r], device=self.device),
+                torch.tensor([p], device=self.device),
+                torch.tensor([y], device=self.device),
+            )
+            rel_quat = torch_utils.quat_conjugate(perturb).repeat(self.num_envs, 1)
+        else:
+            rel_quat = self._identity_quat()
+        return rel_pos, rel_quat
 
     # ------------------------------------------------------------------
     # Intermediate values: stash task geometry after the Forge base compute
@@ -1084,14 +1096,23 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         z_hat = torch.tensor([0.0, 0.0, 1.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
         cyl_axis = quat_apply(held_quat_des, z_hat)                          # (E,3)
 
-        # Invert the rigid grip to the fingertip target (see step (4) for the grip transform, which
-        # this exactly reverses): fingertip = tip + (H - fingerpad) up the cylinder axis, and
-        # fingertip_quat = held_quat ∘ flip. After IK + step (4) the tip lands back at p_tip.
+        # Fingertip target = the exact inverse of the seating in step (4):
+        #   held = (fingertip ∘ flip_z) ∘ inverse(held_rel)   [step (4)]
+        #   =>  fingertip = held ∘ held_rel ∘ flip_z
+        # where held = the desired cylinder BODY pose (center at tip + (H/2)·cyl_axis, orientation
+        # held_quat_des) and held_rel = get_handheld_asset_relative_pose() (which now carries the
+        # fixed grasp TILT). Because held_rel absorbs the grasp tilt, the IK gives the eef/wrist a
+        # DIFFERENT target while the cylinder still seats at held_quat_des (perpendicular to the
+        # surface for the zero-offset pose) — the reset auto-compensates for the grasp tilt. For a
+        # zero tilt (identity held_rel) this reduces EXACTLY to the old
+        # (held_quat_des ∘ flip_z, p_tip + (H - fingerpad)·cyl_axis).
         H = self.cfg_task.held_asset_cfg.height
-        fingerpad = self.cfg_task.robot_cfg.franka_fingerpad_length
         flip_z_quat = torch.tensor([0.0, 0.0, 1.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
-        target_pos_all = p_tip + (H - fingerpad) * cyl_axis                   # (E,3) fingertip target
-        target_quat_all = torch_utils.quat_mul(held_quat_des, flip_z_quat)    # (E,4) fingertip target
+        zeros3 = torch.zeros((self.num_envs, 3), device=self.device)
+        held_rel_pos, held_rel_quat = self.get_handheld_asset_relative_pose()  # (pos, quat) — tilt-aware
+        held_center_pos = p_tip + 0.5 * H * cyl_axis                          # (E,3) cylinder body origin
+        _q1, _t1 = torch_utils.tf_combine(held_quat_des, held_center_pos, held_rel_quat, held_rel_pos)
+        target_quat_all, target_pos_all = torch_utils.tf_combine(_q1, _t1, flip_z_quat, zeros3)
 
         # IK the arm to the FIXED fingertip target; reseed the arm for any env that didn't converge
         # and retry. Targets are NOT re-sampled on retry, so the spawn distribution stays unbiased.

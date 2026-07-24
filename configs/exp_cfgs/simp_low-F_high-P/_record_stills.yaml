@@ -1,0 +1,52 @@
+# _record_stills.yaml — per-agent recorder OVERLAY that writes a single 4x4 PNG montage of
+# annotated STILL frames (one env per tile) instead of the best/median/worst grid video.
+#
+# Deep-merged over a trained agent's snapshotted config.yaml by learning/record.py. Each tile shows
+# the rendered scene with the in-scene keypoint balls (blue=unreached, green=achieved, red=passed-
+# not-achieved) plus a force gauge, an orientation gauge, and a matplotlib top-down path inset.
+#
+#   python learning/record.py \
+#     --agent_dir runs/surface_baselines/surface_baselines/1_fixed/0 \
+#     --record_config configs/exp_cfgs/glued_surface/_record_stills.yaml \
+#     --headless --checkpoint_step best
+
+controller_cfg:
+  # Keep the scene uncluttered for the stills — the keypoint balls are the focus.
+  visualize_rotation_frame: false
+  visualize_peg_tip_frame: false
+  visualize_eef_frame: false
+  visualize_stiffness_ellipsoid: false
+
+runner_cfg:
+  num_agents: 1
+  num_envs: 16              # one env per 4x4 tile (single rollout)
+  memory_size: 50_000
+  # Override the (frozen) training flags so the rollout runs the FULL episode with the new reward
+  # behavior — no early lag/success termination, force target 5 N, keypoint hard-gate off.
+  env_cfg_overrides:
+    task.terminate_on_lag: false
+    task.terminate_on_success: false
+    task.force_desired_min: 5.0
+    task.force_desired_max: 5.0
+
+sac_cfg:
+  recorder:
+    enabled: true                  # triggers TiledCamera injection in build_env
+    stills_grid: true              # -> collect_stills_grid (PNG montage), not the grid video
+    grid_rows: 4
+    grid_cols: 4
+    surface_overlays: true
+    stills_grid_video: true        # also write a full mp4 of the rollout
+    ball_diameter_frac: 1.0        # diameter = keypoint spacing (spec is 0.5; enlarged for legibility)
+    video_format: mp4
+    num_trajectories: 16
+    width: 480
+    height: 360
+    camera_pos: [1.0, 0.0, 0.37]   # raised +2 cm in z
+    camera_quat: [-0.3535534, 0.6123724, 0.6123724, -0.3535534]
+    focal_length: 24.0
+    focus_distance: 0.05
+    horizontal_aperture: 20.955
+    clipping_range: [0.1, 20.0]
+    fps: 30
+    output_subdir: videos
