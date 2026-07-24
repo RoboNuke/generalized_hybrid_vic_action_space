@@ -529,44 +529,50 @@ def collect_annotated_ranked(
 
             obs, _ = env.reset()
             state = _resolve_state(env, obs)
+
+            # Per-episode marker/tracker setup BEFORE the capture loop, from a POST-RESET snapshot,
+            # so the very FIRST captured frame already shows the fresh overlay (setpoint at k0, no
+            # keypoints coloured, pace at the start). Previously this ran inside the t==0 branch
+            # AFTER the first step, so frame 0 rendered the PREVIOUS episode's stale markers — the
+            # peg looked reset but the keypoints/setpoint showed the prior run's END state, which
+            # read as "the task starts midway / keypoints already marked before the video starts".
+            snap = uenv.viz_snapshot()
+            spacing = float(snap["keypoint_spacing"])
+            k = int(snap["keypoints_total"].min().item())
+            radius = spacing * ball_frac / 2.0
+            normal = snap["surface_normal"].numpy()
+            env_origins = uenv.scene.env_origins.detach().cpu().numpy()
+            base = sv.keypoint_world_positions(snap["start_w"], snap["path_dir"], spacing, k)
+            base = base + env_origins[:, None, :]
+            goal_radius = radius * 4.0
+            goal_lift = normal * goal_radius
+            if markers is None:                                          # create USD prims once
+                markers = sv.KeypointBallMarkers("/World/Visuals/surface_keypoints", radius=radius)
+                goal_marker = sv.GoalMarker("/World/Visuals/surface_goal", radius=goal_radius)
+                pace_marker = sv.GoalMarker("/World/Visuals/surface_pace", radius=goal_radius, opacity=0.4)
+            markers.set_positions((base + normal[:, None, :] * radius).reshape(-1, 3))
+            start_w_env = snap["start_w"].numpy() + env_origins
+            path_dir_np = snap["path_dir"].numpy()
+            tracker = sv.KeypointStatusTracker(num_envs, k, spacing)
+            des_force = np.maximum(snap["desired_force_N"].numpy(), 1e-6)
+            start_w = snap["start_w"].numpy(); goal_w = snap["goal_w"].numpy()
+            u_dir = snap["path_dir"].numpy(); v_dir = snap["d_lat"].numpy()
+            center = 0.5 * (start_w + goal_w)
+            su, svv = sv.project_uv(start_w, center, u_dir, v_dir)
+            gu, gvv = sv.project_uv(goal_w, center, u_dir, v_dir)
+            half = 0.5 * snap["path_length"].numpy()
+            const = dict(center=center, u=u_dir, v=v_dir, start_uv=np.stack([su, svv], 1),
+                         goal_uv=np.stack([gu, gvv], 1), half=half)
+
             for t in range(T):
-                if tracker is not None:                                  # colour balls + move markers
-                    markers.update(tracker.marker_indices())
-                    gidx = np.clip(tracker.setpoint_idx - 1, 0, k - 1)
-                    goal_marker.update(base[np.arange(num_envs), gidx] + goal_lift)
-                    pace_marker.update(start_w_env + cur_s_ref[:, None] * path_dir_np + goal_lift)
+                markers.update(tracker.marker_indices())                 # fresh at t=0 (set BEFORE the step renders)
+                gidx = np.clip(tracker.setpoint_idx - 1, 0, k - 1)
+                goal_marker.update(base[np.arange(num_envs), gidx] + goal_lift)
+                pace_marker.update(start_w_env + cur_s_ref[:, None] * path_dir_np + goal_lift)
                 actions, _ = agent.act(obs, state, timestep=10**9, timesteps=10**9)
                 obs, reward, terminated, truncated, info = env.step(actions)
                 rgb = read_camera_rgb(camera)
                 snap = uenv.viz_snapshot()
-
-                if t == 0:                                               # (re)build per-episode frame/markers
-                    spacing = float(snap["keypoint_spacing"])
-                    k = int(snap["keypoints_total"].min().item())
-                    radius = spacing * ball_frac / 2.0
-                    normal = snap["surface_normal"].numpy()
-                    env_origins = uenv.scene.env_origins.detach().cpu().numpy()
-                    base = sv.keypoint_world_positions(snap["start_w"], snap["path_dir"], spacing, k)
-                    base = base + env_origins[:, None, :]
-                    goal_radius = radius * 4.0
-                    goal_lift = normal * goal_radius
-                    if markers is None:                                  # create USD prims once
-                        markers = sv.KeypointBallMarkers("/World/Visuals/surface_keypoints", radius=radius)
-                        goal_marker = sv.GoalMarker("/World/Visuals/surface_goal", radius=goal_radius)
-                        pace_marker = sv.GoalMarker("/World/Visuals/surface_pace", radius=goal_radius, opacity=0.4)
-                    markers.set_positions((base + normal[:, None, :] * radius).reshape(-1, 3))
-                    start_w_env = snap["start_w"].numpy() + env_origins
-                    path_dir_np = snap["path_dir"].numpy()
-                    tracker = sv.KeypointStatusTracker(num_envs, k, spacing)
-                    des_force = np.maximum(snap["desired_force_N"].numpy(), 1e-6)
-                    start_w = snap["start_w"].numpy(); goal_w = snap["goal_w"].numpy()
-                    u_dir = snap["path_dir"].numpy(); v_dir = snap["d_lat"].numpy()
-                    center = 0.5 * (start_w + goal_w)
-                    su, svv = sv.project_uv(start_w, center, u_dir, v_dir)
-                    gu, gvv = sv.project_uv(goal_w, center, u_dir, v_dir)
-                    half = 0.5 * snap["path_length"].numpy()
-                    const = dict(center=center, u=u_dir, v=v_dir, start_uv=np.stack([su, svv], 1),
-                                 goal_uv=np.stack([gu, gvv], 1), half=half)
 
                 tu, tv = sv.project_uv(snap["tip_w"].numpy(), const["center"], const["u"], const["v"])
                 over = (np.abs(tu) <= const["half"]) & (np.abs(tv) <= const["half"])
@@ -623,7 +629,9 @@ def collect_annotated_ranked(
 
     # Animate the selected trajectories; insets cached at stride K (matplotlib is the bottleneck).
     K = 3
-    Tmax = max(int(coll_term[j]) for j in sel) + 1
+    # Render the FULL episode length (not just up to the longest selected trajectory) so every video
+    # is the same task-length clip; trajectories that ended early freeze at their last frame (q below).
+    Tmax = T
     inset_cache: dict[int, list] = {}
     if overlays:
         for j in sel:
