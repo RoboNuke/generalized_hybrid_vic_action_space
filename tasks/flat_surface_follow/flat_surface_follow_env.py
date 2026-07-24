@@ -1154,9 +1154,141 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.prev_actions = torch.zeros_like(self.actions)
 
         self.ee_angvel_fd[:, :] = 0.0
-        self.ee_linvel_fd[:, :] = 0.0
-
+        # Operational gains for the press-to-contact step below (so the contact-force scale during
+        # the press matches the runtime controller, not the stiff quick-reset grasp gains).
         self.task_prop_gains = self.default_gains
         self.task_deriv_gains = factory_utils.get_deriv_gains(self.default_gains)
 
+        # (5) PRESS TO CONTACT. Gravity is still OFF (only the contact reaction acts), and this runs
+        # in the full-reset (all-envs) path, so the efficient-reset wrapper's cached donor state
+        # captures the in-contact pose and per-env teleport resets reproduce it. See the method.
+        self._press_held_to_contact(normal)
+
+        # Bookkeeping AFTER the press so the first step's finite-difference velocities start at ~0
+        # from the FINAL (pressed) pose, not the pre-descent one.
+        self.ee_linvel_fd[:, :] = 0.0
+
         physics_sim_view.set_gravity(carb.Float3(*self.cfg.sim.gravity))
+
+    # ------------------------------------------------------------------
+    # Reset press-to-contact
+    # ------------------------------------------------------------------
+    def _press_held_to_contact(self, surface_normal):
+        """Press the just-gripped held object toward the surface until each env reads in contact.
+
+        Physical (controller-driven) press: the gripper stays closed and a CUMULATIVE fingertip
+        position target steps down ``reset_press_step`` along ``-surface_normal`` each settle step,
+        so the tracking error (hence press force) BUILDS until real contact registers — a constant
+        offset can only ever build ``Kp * step`` and stalls a fraction of a mm above the plate. The
+        target is clamped to lead the current fingertip by at most ``reset_press_max_lead``, capping
+        the steady press force at ~``Kp * max_lead`` (no spike at touchdown; no blow-up if the
+        surface is absent). The orientation target is held fixed (pure translation press).
+
+        Each env is FROZEN the step it first reads in contact, latched at its DESCENDING press target
+        (which leads the fingertip into the surface) rather than the current fingertip: the fingertip
+        pose at first-contact is a dynamic overshoot whose static equilibrium sits just off the
+        surface, so holding it would let the peg relax back out of contact. Still-moving envs keep
+        descending; the loop ends when all are in contact or ``reset_press_max_dist`` is exhausted.
+
+        Runs during reset with gravity OFF, on ALL envs (the full-reset path), so nothing falls and
+        the whole in-contact configuration is caught by the efficient-reset donor cache (per-env
+        teleport resets then reproduce it). Contact is read via :meth:`_reset_contact_mask`.
+        """
+        cfg = self.cfg_task
+        if not bool(getattr(cfg, "reset_press_to_contact", True)):
+            return
+        step_len = float(cfg.reset_press_step)
+        max_dist = float(cfg.reset_press_max_dist)
+        max_lead = float(cfg.reset_press_max_lead)
+        if step_len <= 0.0 or max_dist <= 0.0:
+            return
+        n_steps = int(max_dist / step_len) + 1
+
+        # Unit descent direction (into the surface), per env.
+        down = -surface_normal / torch.linalg.norm(surface_normal, dim=1, keepdim=True).clamp_min(1e-8)
+
+        # CUMULATIVE position target, seeded at the current fingertip. It steps DOWN each iteration so
+        # the tracking error (hence press force) can grow past a single step — a constant offset can
+        # only ever build ``Kp * step_len`` and stalls before real contact. The orientation target is
+        # held fixed (pure translation press). Latched targets freeze a settled env in place.
+        press_pos = self.fingertip_midpoint_pos.clone()
+        press_quat = self.fingertip_midpoint_quat.clone()
+        latched_pos = self.fingertip_midpoint_pos.clone()
+        latched_quat = self.fingertip_midpoint_quat.clone()
+        settled = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+        for _ in range(n_steps):
+            moving = ~settled
+            if not bool(moving.any()):
+                break
+            # Advance the cumulative target down for moving envs, then CLAMP it so it never leads the
+            # current fingertip by more than ``max_lead`` along ``down``: this caps the steady press
+            # force at ~``Kp * max_lead`` (no spike when the tip finally touches; no blow-up if the
+            # surface is somehow absent) while still building enough force to read as in contact.
+            press_pos[moving] = press_pos[moving] + step_len * down[moving]
+            lead = ((press_pos - self.fingertip_midpoint_pos) * down).sum(-1, keepdim=True)  # +down = below tip
+            press_pos = press_pos - (lead - max_lead).clamp_min(0.0) * down
+            m = moving.unsqueeze(-1)
+            tgt_pos = torch.where(m, press_pos, latched_pos)
+            tgt_quat = torch.where(m, press_quat, latched_quat)
+            self.generate_ctrl_signals(
+                ctrl_target_fingertip_midpoint_pos=tgt_pos,
+                ctrl_target_fingertip_midpoint_quat=tgt_quat,
+                ctrl_target_gripper_dof_pos=0.0,  # keep the gripper closed
+            )
+            self.step_sim_no_action()
+
+            newly = self._reset_contact_mask() & ~settled
+            if bool(newly.any()):
+                # Latch the hold target at the DESCENDING press target (which leads the fingertip
+                # into the surface), NOT the current fingertip: the fingertip pose at first-contact
+                # is a dynamic overshoot whose static equilibrium sits just OFF the surface, so
+                # holding it would let the peg relax out of contact. Holding press_pos maintains the
+                # steady ~contact-threshold press through the hold and into the cached state.
+                latched_pos[newly] = press_pos[newly]
+                latched_quat[newly] = press_quat[newly]
+                settled |= newly
+
+        # Safety: any env that never registered contact within the max-descent cap (e.g. a spawn
+        # configured higher than reset_press_max_dist) latches at its current press target, so the
+        # hold phase below does not yank it back up to the pre-press seed pose.
+        if not bool(settled.all()):
+            stuck = ~settled
+            latched_pos[stuck] = press_pos[stuck]
+            latched_quat[stuck] = press_quat[stuck]
+
+        # Hold everything at its latched pose for a few steps so the last-settled envs damp to ~0
+        # velocity before the state is cached / gravity is restored.
+        for _ in range(3):
+            self.generate_ctrl_signals(
+                ctrl_target_fingertip_midpoint_pos=latched_pos,
+                ctrl_target_fingertip_midpoint_quat=latched_quat,
+                ctrl_target_gripper_dof_pos=0.0,
+            )
+            self.step_sim_no_action()
+
+    def _reset_contact_mask(self):
+        """Per-env in-contact bool that stops the reset press (freshly refreshed).
+
+        When the runtime per-axis contact sensor is live this returns exactly its reading
+        (``env.in_contact.any(dim=1)``) — the SAME "in contact in any direction" the policy sees at
+        runtime — refreshed here via the ContactSensorWrapper's ``_refresh_in_contact`` hook (the
+        wrapper's own ``step()`` never runs during a reset). The press then builds force until the
+        sensor genuinely registers, so episodes start reading in contact on that sensor rather than
+        merely touching. A geometric "tip reached the surface" check is deliberately NOT OR-ed in
+        here: on a rigid plate the tip cannot penetrate, so it would fire at a feather-touch and
+        latch the press before the sensor reads contact.
+
+        When no live sensor exists (contact wrapper disabled, or not yet initialized on the very
+        first reset), it falls back to the measured normal force OR a geometric tip-at-surface
+        backstop — there is no sensor threshold to build toward, so a light arrival is the signal.
+        """
+        cfg = self.cfg_task
+        refresh = getattr(self, "_refresh_in_contact", None)
+        sensor_live = bool(refresh()) if callable(refresh) else False
+        cw = getattr(self, "in_contact", None)
+        if sensor_live and torch.is_tensor(cw):
+            return cw.any(dim=1)
+        force = self.measured_normal_force.abs() > float(cfg.reset_contact_force_threshold)
+        geom = self.tip_surface_dist <= float(cfg.reset_press_contact_depth)
+        return force | geom

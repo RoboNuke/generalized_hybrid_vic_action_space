@@ -88,6 +88,31 @@ class FlatSurfaceFollowTask(ForgeTask):
     spawn_orn_mean_deg: list = [0.0, 10.0, 0.0]    # default: 10 deg pitch off world-vertical
     spawn_orn_std_deg: list = [0.0, 0.0, 0.0]      # per-axis Gaussian std (deg); 0 => fixed at the mean
 
+    # --- Reset press-to-contact: after the peg is spawned (above the surface) and gripped, PRESS it
+    #     toward the surface until each env reads in contact, then latch it in place, so episodes
+    #     start already reading in contact instead of hovering. The gripper stays closed and a
+    #     CUMULATIVE fingertip position target steps down along -surface-normal each settle step, so
+    #     the tracking error (hence press force) BUILDS until contact is read — a constant offset can
+    #     only ever build Kp*step and stalls a fraction of a mm above the plate. The target is clamped
+    #     to lead the fingertip by at most reset_press_max_lead, capping the steady press force at
+    #     ~Kp*max_lead (no spike at touchdown, no blow-up if the surface is absent). Each env is
+    #     frozen the step it first reads in contact. "In contact" is the SAME per-axis contact sensor
+    #     the policy sees at runtime, refreshed during reset via the ContactSensorWrapper hook (it is
+    #     otherwise only updated in the wrapper's step()); with no live sensor it falls back to the
+    #     measured normal force / a geometric tip-at-surface check. reset_press_max_dist caps the loop.
+    #     This runs in the full-reset (all-envs) path, so the efficient-reset wrapper's cached donor
+    #     state records the in-contact pose and per-env teleport resets reproduce it. ---
+    reset_press_to_contact: bool = True            # master toggle (False => spawn hovering, as before)
+    reset_press_step: float = 0.0005               # m: cumulative target descent per settle step
+    reset_press_max_lead: float = 0.003            # m: max the target may lead the fingertip; the LATCHED
+                                                   # lead => the sustained press force ~Kp*max_lead. Sized so
+                                                   # that force stays a light ~1-2 N (comfortably above the
+                                                   # contact-sensor threshold so it keeps reading, well below
+                                                   # a hard press). Raise for a firmer start, lower for lighter.
+    reset_press_max_dist: float = 0.02             # m: cap on total target travel (bounds the loop iterations)
+    reset_press_contact_depth: float = 0.0         # m: no-sensor geometric backstop — stop once tip_surface_dist <= this
+    reset_contact_force_threshold: float = 0.1     # N: no-sensor |measured normal force| contact fallback
+
     # --- Task command setpoints ---
     desired_speed_cm_s: float = 5.0               # v: desired along-track speed (cm/s) for the pace term
 

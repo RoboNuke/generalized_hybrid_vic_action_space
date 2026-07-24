@@ -197,6 +197,11 @@ class ContactSensorWrapper(gym.Wrapper):
         self.unwrapped.in_contact = torch.zeros(
             (self.num_envs, 3), dtype=torch.bool, device=self.device
         )
+        # Hook the env can call to refresh `in_contact` OUTSIDE this wrapper's step() — e.g. the
+        # surface task's reset-time press-to-contact, which settles via step_sim_no_action (the
+        # wrapper's step() never runs during a reset, so `in_contact` would otherwise stay stale).
+        # Returns True when the live view produced a fresh reading; no logging side effects.
+        self.unwrapped._refresh_in_contact = self._refresh_in_contact
         if hasattr(self.unwrapped, "extras") and "to_log" not in self.unwrapped.extras:
             self.unwrapped.extras["to_log"] = {}
 
@@ -237,19 +242,26 @@ class ContactSensorWrapper(gym.Wrapper):
         return True
 
     # --------------------------------------------------------------- contact
-    def _update_contact(self) -> None:
+    def _refresh_in_contact(self) -> bool:
+        """Recompute ``env.in_contact`` from the live contact view. No logging side effects, so
+        it is safe to call mid-reset (e.g. the surface task's press-to-contact). Returns True if
+        the view was ready and ``in_contact`` was updated, False otherwise (view not yet live)."""
         from isaaclab.utils.math import quat_rotate_inverse
 
         if not self._ensure_view():
-            return
+            return False
         # (num_envs, M_filters, 3) per-pair contact force; sum over filtered bodies -> world net.
         fmat = self._contact_view.get_contact_force_matrix(self._dt)
         force_w = fmat.sum(dim=1)
         # Rotate into the EE / force-torque frame so per-axis flags align with the control axes.
         force_ee = quat_rotate_inverse(self.unwrapped.fingertip_midpoint_quat, force_w)
-        in_contact = force_ee.abs() > self._threshold  # (num_envs, 3) bool
-        self.unwrapped.in_contact = in_contact
+        self.unwrapped.in_contact = force_ee.abs() > self._threshold  # (num_envs, 3) bool
+        return True
 
+    def _update_contact(self) -> None:
+        if not self._refresh_in_contact():
+            return
+        in_contact = self.unwrapped.in_contact
         if self._log_contact and hasattr(self.unwrapped, "extras"):
             to_log = self.unwrapped.extras.setdefault("to_log", {})
             for i, name in enumerate(_AXIS_NAMES):
