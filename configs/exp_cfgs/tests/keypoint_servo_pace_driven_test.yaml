@@ -1,0 +1,32 @@
+# Smoke-test overlay: PACE-DRIVEN keypoint target + keypoint-servo action override.
+# Deep-merged over a VARIABLE-GAIN surface base (see keypoint_servo_surface_test.yaml for why a
+# pose-only base leaves 0 actions under fix_orientation:true).
+#   python learning/runner.py \
+#     --config configs/exp_cfgs/glued_surface/2_VICES.yaml \
+#     --overlay configs/exp_cfgs/tests/keypoint_servo_pace_driven_test.yaml --headless
+#
+# Exercises the new task.setpoint_pace_driven flag: env.setpoint_pos (the keypoint target the servo
+# tracks + the obs reports) advances on the time-based pace clock (v*pace_tau) instead of the arm's
+# realized progress, so the target marches forward at desired_speed_cm_s and never waits for the arm.
+# Short run, few envs, wandb off — checks the setpoint plumbing runs end-to-end, not a trained policy.
+
+runner_cfg:
+  num_envs: 16
+  num_agents: 1
+  total_timesteps: 400
+  env_cfg_overrides:
+    task.setpoint_pace_driven: true
+
+keypoint_servo_cfg:
+  enabled: true
+  along_track_offset: 0.005      # 5 mm ahead of the setpoint along path_dir
+  off_track_offset: 0.0
+  normal_offset: 0.002           # 2 mm off the surface along surface_normal
+  fix_orientation: true
+  fixed_rpy_deg: [180.0, 0.0, 0.0]   # world Euler XYZ (illustrative fixed EEF orientation for the test)
+
+sac_cfg:
+  learning_starts: 50
+  tensorboard: true
+  experiment:
+    wandb: false

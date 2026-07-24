@@ -116,6 +116,15 @@ class FlatSurfaceFollowTask(ForgeTask):
     # --- Task command setpoints ---
     desired_speed_cm_s: float = 5.0               # v: desired along-track speed (cm/s) for the pace term
 
+    # How the OBSERVATION setpoint (env.setpoint_pos — the keypoint target the obs reports and the
+    # keypoint-servo wrapper tracks) advances along the ideal path:
+    #  * False (default, ROBOT-DRIVEN): the target sits one keypoint ahead of the arm's REALIZED
+    #    progress and waits for the arm to catch up before advancing.
+    #  * True  (PACE-DRIVEN): the target advances on the time-based pace clock (v*pace_tau, same as the
+    #    pace-reward setpoint s_ref) and never waits for the arm — it moves forward at desired_speed_cm_s
+    #    regardless of whether the arm keeps up. Both modes hold at keypoint 0 until first contact.
+    setpoint_pace_driven: bool = False
+
     # --- Observation toggles ---
     observe_eef_torque: bool = False              # add the 3-D EEF-frame torque to the obs (policy + critic)
 

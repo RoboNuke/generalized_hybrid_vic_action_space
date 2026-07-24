@@ -374,11 +374,19 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # OBSERVATION setpoint. BEFORE first contact the target is HELD at keypoint 0 (k0 = the
         # near-edge spawn point, directly under the tip): the peg is spawned over k0 and told to go to
         # k0, so it descends straight DOWN onto the surface. AFTER first contact (t_contact finite) the
-        # target advances to the NEXT keypoint ahead of the projected progress (floor(progress/spacing)
-        # + 1), i.e. it drags along the line ONE keypoint at a time. Advancing on the along-track
-        # projection means drifting off the surface along d still advances it (no turn-around
-        # incentive), and its LATERAL offset from the tip carries the "off the line" error.
-        kp_passed_now = torch.floor(self.progress / self.keypoint_spacing).clamp_min(0).long()
+        # target advances to the NEXT keypoint ahead of the SOURCE arc length (floor(source/spacing) + 1),
+        # i.e. it drags along the line ONE keypoint at a time.
+        #
+        # Two source modes (task.setpoint_pace_driven):
+        #  * ROBOT-DRIVEN (default): source = self.progress (the arm's realized along-track distance), so
+        #    the target sits one keypoint ahead of where the arm actually is and WAITS for it to catch up.
+        #    Advancing on the along-track projection means drifting off the surface along d still advances
+        #    it (no turn-around incentive), and its lateral offset from the tip carries the "off the line" error.
+        #  * PACE-DRIVEN: source = self.s_ref (the time-based pace target v*pace_tau), so the target marches
+        #    forward on the pace CLOCK and never waits for the arm. Same keypoint discretization, ratchet,
+        #    and pre-contact hold (s_ref is 0 until first contact, so both modes hold at k0 until then).
+        setpoint_source = self.s_ref if bool(self.cfg_task.setpoint_pace_driven) else self.progress
+        kp_passed_now = torch.floor(setpoint_source / self.keypoint_spacing).clamp_min(0).long()
         next_ahead = (kp_passed_now + 1).minimum(self.keypoints_total)
         made_contact = torch.isfinite(self.t_contact)                         # touched at any point this episode
         new_setpoint = torch.where(made_contact, next_ahead, torch.zeros_like(next_ahead))
