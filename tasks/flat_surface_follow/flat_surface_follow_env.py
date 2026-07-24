@@ -1181,6 +1181,10 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # accept the stragglers' best-effort pose; the reset press-to-contact still settles them.
         bad_envs = env_ids.clone()
         _IK_MAX_ATTEMPTS = 25
+        _default_joints = torch.tensor(
+            [0.00871, -0.10368, -0.00794, -1.49139, -0.00083, 1.38774, 0.0], device=self.device
+        )
+        _gripper_w = self.cfg_task.held_asset_cfg.diameter / 2 * 1.25
         for _ik_attempt in range(_IK_MAX_ATTEMPTS):
             pos_error, aa_error = self.set_pos_inverse_kinematics(
                 ctrl_target_fingertip_midpoint_pos=target_pos_all,
@@ -1193,9 +1197,23 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             bad_envs = bad_envs[any_bad.nonzero(as_tuple=False).squeeze(-1)]
             if bad_envs.shape[0] == 0:
                 break
-            self._set_franka_to_default_pose(
-                joints=[0.00871, -0.10368, -0.00794, -1.49139, -0.00083, 1.38774, 0.0], env_ids=bad_envs
-            )
+            # RESEED the stragglers to the default arm pose PLUS random joint noise (growing with the
+            # attempt), so each retry restarts the IK from a DIFFERENT configuration. The fingertip
+            # TARGET is held fixed (unbiased spawn), so reseeding to a CONSTANT pose just retries the
+            # identical deterministic solve — which is why some spawn_align headings never converged
+            # (8% best-effort). The redundant 7-DOF arm can reach almost any EEF heading from SOME
+            # config; noisy restarts let the IK find it and hit the EXACT desired pose (no heading
+            # bias). Mirrors Factory's randomized-retry (which perturbs the target instead).
+            n = bad_envs.shape[0]
+            jp = self._robot.data.default_joint_pos[bad_envs].clone()
+            noise = (torch.rand((n, 7), device=self.device) * 2.0 - 1.0) * (0.15 * (1 + _ik_attempt))
+            jp[:, :7] = _default_joints.unsqueeze(0) + noise
+            jp[:, 7:] = _gripper_w
+            self.ctrl_target_joint_pos[bad_envs, :] = jp
+            self._robot.set_joint_position_target(self.ctrl_target_joint_pos[bad_envs], env_ids=bad_envs)
+            self._robot.write_joint_state_to_sim(jp, torch.zeros_like(jp), env_ids=bad_envs)
+            self._robot.reset()
+            self.step_sim_no_action()
         if bad_envs.shape[0] > 0:
             print(
                 f"[flat_surface] reset IK did not converge for {bad_envs.shape[0]}/{env_ids.shape[0]} "
