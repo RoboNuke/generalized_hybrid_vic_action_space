@@ -178,7 +178,8 @@ def _write_tfevents(run_dir: str, hist, step_key: str = "_step") -> int:
 
 def download_wandb_data(project: str, tag: str, entity: str | None = "hur",
                         root: str | None = None, samples: int = 100_000,
-                        step_key: str = "_step", verbose: bool = True) -> str:
+                        step_key: str = "_step", force: bool = False,
+                        verbose: bool = True) -> str:
     """Download every wandb run in ``{entity}/{project}`` carrying ``tag`` into the local
     ``runs/{project}_{tag}/{group}/{agent_index}/`` tree as TensorBoard event files — the
     exact layout :func:`load_data` reads — then return the folder name ``"{project}_{tag}"``.
@@ -187,7 +188,9 @@ def download_wandb_data(project: str, tag: str, entity: str | None = "hur",
     ``config['agent_index']``. **Download-once cache:** a group whose local dir already holds
     a complete set of runs is skipped (see :func:`_group_complete`), so re-running this — or
     the *other* analysis notebook — reuses the data without re-downloading, even if plotting
-    settings change. Delete a group's folder to force a refresh.
+    settings change. Delete a group's folder to force a refresh, or pass ``force=True`` to
+    re-fetch EVERY group from the server and overwrite the local cache regardless of whether
+    it looks complete (each run's stale ``events.*`` are cleared before the fresh rewrite).
 
     Requires ``wandb`` (API access) and ``torch`` (the tfevents writer); both are imported
     lazily so the local-only workflow needs neither.
@@ -216,10 +219,12 @@ def download_wandb_data(project: str, tag: str, entity: str | None = "hur",
     for group in sorted(groups):
         grp_runs = groups[group]
         group_dir = os.path.join(base, group)
-        if _group_complete(group_dir, len(grp_runs)):
+        if not force and _group_complete(group_dir, len(grp_runs)):
             if verbose:
                 print(f"[wandb-dl]   {group}: cached ({len(grp_runs)} runs), skip")
             continue
+        if force and verbose:
+            print(f"[wandb-dl]   {group}: force refresh — overwriting local cache")
         for i, r in enumerate(sorted(grp_runs, key=lambda rr: rr.config.get("agent_index", 0))):
             idx = int(r.config.get("agent_index", i))
             run_dir = os.path.join(group_dir, str(idx))

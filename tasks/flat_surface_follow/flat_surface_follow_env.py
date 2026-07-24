@@ -1154,14 +1154,6 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             self.step_sim_no_action()
             grasp_time += self.sim.get_physics_dt()
 
-        self.prev_joint_pos = self.joint_pos[:, 0:7].clone()
-        self.prev_fingertip_pos = self.fingertip_midpoint_pos.clone()
-        self.prev_fingertip_quat = self.fingertip_midpoint_quat.clone()
-
-        self.actions = torch.zeros_like(self.actions)
-        self.prev_actions = torch.zeros_like(self.actions)
-
-        self.ee_angvel_fd[:, :] = 0.0
         # Operational gains for the press-to-contact step below (so the contact-force scale during
         # the press matches the runtime controller, not the stiff quick-reset grasp gains).
         self.task_prop_gains = self.default_gains
@@ -1174,6 +1166,14 @@ class FlatSurfaceFollowEnv(ForgeEnv):
 
         # Bookkeeping AFTER the press so the first step's finite-difference velocities start at ~0
         # from the FINAL (pressed) pose, not the pre-descent one.
+        self.prev_joint_pos = self.joint_pos[:, 0:7].clone()
+        self.prev_fingertip_pos = self.fingertip_midpoint_pos.clone()
+        self.prev_fingertip_quat = self.fingertip_midpoint_quat.clone()
+
+        self.actions = torch.zeros_like(self.actions)
+        self.prev_actions = torch.zeros_like(self.actions)
+
+        self.ee_angvel_fd[:, :] = 0.0
         self.ee_linvel_fd[:, :] = 0.0
 
         physics_sim_view.set_gravity(carb.Float3(*self.cfg.sim.gravity))

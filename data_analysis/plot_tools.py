@@ -885,6 +885,17 @@ SURFACE_STIFFNESS_TAGS = {
     "normal":      "Impedance_Stiffness/k_normal_mean",
 }
 
+# Principal stiffnesses (eigenvalues of the applied position-K block, frame-free), logged
+# as _k_native. With the surface-frame DIAGONAL above they recover the stiffness-oval TILT
+# without any new logging: M = Q diag(principal) Qᵀ with diag(M) = (k_along, k_cross,
+# k_normal) known, so the (along, normal) block's rotation off the surface axes is fixed by
+# the two block eigenvalues and the two diagonal entries (see plot_surface_stiffness_ellipses).
+PRINCIPAL_STIFFNESS_TAGS = {
+    "x": "Impedance_Stiffness/principal_x_mean",
+    "y": "Impedance_Stiffness/principal_y_mean",
+    "z": "Impedance_Stiffness/principal_z_mean",
+}
+
 
 def plot_surface_stiffness_scatter(data: dict, style: PlotStyle,
                                    x_tag=SURFACE_STIFFNESS_TAGS["along_track"],
@@ -937,69 +948,159 @@ def plot_surface_stiffness_scatter(data: dict, style: PlotStyle,
 def plot_surface_stiffness_ellipses(data: dict, style: PlotStyle,
                                     normal_tag=SURFACE_STIFFNESS_TAGS["normal"],
                                     along_tag=SURFACE_STIFFNESS_TAGS["along_track"],
+                                    cross_tag=SURFACE_STIFFNESS_TAGS["cross_track"],
+                                    principal_tags=PRINCIPAL_STIFFNESS_TAGS,
+                                    tilt_mode="inplane",
                                     groups=None, reduce="mean_tail", selection_metric=None,
                                     ncols=None, figsize_per=(2.3, 2.3),
                                     color_by_normal=False, ghost=False, ghost_normal=None,
                                     scale_mode="max", cmap="viridis"):
     """Cartoon of the stiffness "oval" in the surface plane, one panel per controller.
 
-    Each oval shows only two of the three surface directions -- the SURFACE NORMAL on
-    the vertical axis (semi-axis = k_normal) and the ALONG-TRACK direction horizontally
-    (semi-axis = k_along_track); cross-track is dropped so the shape reads as a clean
-    2-D profile of "how hard it presses down vs. how hard it resists along the path".
-    The surface frame is orthonormal by construction, so the ovals are upright (no tilt
-    term is logged, unlike the peg-axis version). Phaseless analogue of
-    :func:`plot_stiffness_ellipses`. Returns the Figure.
+    Each oval shows two of the three surface directions -- the SURFACE NORMAL on the
+    vertical axis and the ALONG-TRACK direction horizontally (cross-track is dropped) --
+    so the shape reads as a clean 2-D profile of "how hard it presses down vs. how hard
+    it resists along the path". Phaseless, surface-frame analogue of
+    :func:`plot_stiffness_ellipses_coupling`. Returns the Figure.
+
+    TILT (reconstructed, no extra logging). No method authors K in the surface frame
+    (baselines are diagonal in the EEF frame, rotated modes in their own interaction
+    frame), so the applied stiffness resolved onto [along, cross, normal] is generally NOT
+    diagonal -- its eigenframe is rotated off the surface axes. That rotation is recovered
+    from quantities ALREADY logged: the eigenvalues ``principal_{x,y,z}`` of K and the
+    surface-frame diagonal ``(k_along, k_cross, k_normal) = diag(Rₛᵤᵣfᵀ K Rₛᵤᵣf)``. Writing
+    ``M = Q·diag(principal)·Qᵀ`` with ``diag(M)`` known, the eigenvalue nearest ``k_cross``
+    is taken as the cross-track (shared) axis and the other two ``λ₊ ≥ λ₋`` are the
+    (along, normal) block's eigenvalues, so the block is fixed up to a sign by ::
+
+        cos(2·psi) = (k_normal − k_along) / (λ₊ − λ₋)          psi ∈ [0°, 90°]
+        semi-axes  = λ₊ (major, along the psi-tilted axis), λ₋ (minor)
+
+    ``psi`` is the tilt of the stiffer principal axis off the surface NORMAL. This is exact
+    when the eigenframe rotation lies in the along-normal plane (a pitch about cross-track,
+    the physically dominant case: ``k_cross`` then equals one eigenvalue). Only ``|psi|`` is
+    recovered (the left/right sign is cosmetic) -- the same trade the peg-axis coupling
+    version makes. ``λ₊ = λ₋`` (isotropic) collapses to a circle; ``psi = 0`` reproduces the
+    upright oval (``k_normal`` vertical, ``k_along`` horizontal), so surface-aligned
+    baselines stay upright and only genuine off-surface rotation tilts.
+
+    ``tilt_mode`` selects which rotation the tilt shows (see the reconstruction comment for
+    the exact formulas): ``"inplane"`` (default) is the full (along, normal) eigen-tilt
+    described above; ``"zaxis"`` shows ONLY the polar tilt of the authored normal axis
+    (principal_z) off the true surface normal, ignoring any tangential-plane spin -- a
+    single-DOF Rayleigh inversion that is exact under tangential isotropy and needs only
+    k_normal + the eigenvalues.
 
     Cues (composable), matching the peg version:
 
     * ``color_by_normal``: fill each oval by its *true* k_normal via ``cmap`` + shared
       colorbar, so panels separate by colour even when the shapes look alike.
     * ``ghost``: draw a reference oval (dashed grey) in every panel as a fixed anchor.
-      Defaults to the grand-mean oval; pass ``ghost_normal`` (true stiffness units) to
-      anchor on a fixed circle of that radius instead.
-    * ``scale_mode``: ``"max"`` normalizes both semi-axes by the global largest value
+      Defaults to the grand-mean (upright) oval; pass ``ghost_normal`` (true stiffness
+      units) to anchor on a fixed circle of that radius instead.
+    * ``scale_mode``: ``"max"`` normalizes the semi-axes by the global largest value
       (true geometry); ``"range"`` affine-maps the global [min, max] over ALL semi-axis
       values onto [0.25, 1.0] so small differences between panels pop.
     """
     groups = groups if groups is not None else list(data.keys())
-    n = dl.summarize_tag(data, normal_tag, reduce=reduce, ci_z=style.ci_z,
-                         step_ceiling=style.step_ceiling, selection_metric=selection_metric)
-    al = dl.summarize_tag(data, along_tag, reduce=reduce, ci_z=style.ci_z,
-                          step_ceiling=style.step_ceiling, selection_metric=selection_metric)
+    _sm = lambda tag: dl.summarize_tag(data, tag, reduce=reduce, ci_z=style.ci_z,
+                                       step_ceiling=style.step_ceiling,
+                                       selection_metric=selection_metric)
+    n = _sm(normal_tag)
+    al = _sm(along_tag)
+    cr = _sm(cross_tag)
+    px, py, pz = _sm(principal_tags["x"]), _sm(principal_tags["y"]), _sm(principal_tags["z"])
 
-    normal_vals = [n[g][0] for g in n]
-    vals = normal_vals + [al[g][0] for g in al]
+    # Reconstruct each oval as (semi_v, semi_h, angle_deg) in TRUE units, per tilt_mode. semi_v
+    # is the semi-axis drawn on the (angle-tilted) near-vertical axis, semi_h across it; angle is
+    # measured off the surface normal (vertical). angle=0 => semi_v vertical, semi_h horizontal.
+    # Groups missing the principal tags fall back to the upright oval. tilted_any flags whether any
+    # panel could actually tilt (principals present) so the caption can flag the fallback.
+    #
+    # tilt_mode="inplane": the FULL (along, normal) eigen-tilt. The eigenvalue closest to k_cross
+    #   is the shared cross-track axis; the other two are this block's eigenvalues lam+ >= lam-,
+    #   and the major-axis tilt is fixed by the diagonal split
+    #       cos(2*psi) = (k_normal - k_along)/(lam+ - lam-).
+    #   Assumes the eigenframe rotation lies in the along-normal plane (a pitch about cross-track).
+    #
+    # tilt_mode="zaxis": ONLY the polar tilt of the authored normal axis (principal_z) off the true
+    #   surface normal, ignoring any tangential-plane spin. k_normal = ez^T K ez is a Rayleigh
+    #   quotient, so with the tangential eigenvalues taken equal (lam_t = mean(principal_x,
+    #   principal_y)) it inverts EXACTLY to
+    #       cos^2(theta) = (k_normal - lam_t)/(principal_z - lam_t).
+    #   semi_v = principal_z (the normal-axis stiffness, leaning theta off vertical), semi_h = lam_t.
+    #   Only needs k_normal + the eigenvalues (not k_along), and drops the along-normal-plane
+    #   assumption. Ill-conditioned when principal_z ~ lam_t (normal barely distinguishable from
+    #   tangential) -> theta undefined, drawn upright.
+    ell = {}          # group -> (semi_v, semi_h, angle_deg, has_principals)
+    tilted_any = False
+    for g in n:
+        if g not in al:
+            continue
+        k_n, k_a = n[g][0], al[g][0]
+        have_p = all(g in s for s in (cr, px, py, pz))
+        if have_p and tilt_mode == "zaxis":
+            tilted_any = True
+            lam_n = pz[g][0]                                          # authored normal-axis stiffness
+            lam_t = 0.5 * (px[g][0] + py[g][0])                       # tangential mean (transverse iso.)
+            denom = lam_n - lam_t
+            if abs(denom) > 0.02 * max(lam_n, lam_t, 1.0):
+                cos2 = np.clip((k_n - lam_t) / denom, 0.0, 1.0)
+                angle = float(np.rad2deg(np.arccos(np.sqrt(cos2))))  # [0, 90], normal axis off vertical
+            else:
+                angle = 0.0                                          # ill-conditioned -> upright
+            semi_v, semi_h = lam_n, lam_t                            # normal-axis vertical (tilted), tangent across
+        elif have_p:                                                 # tilt_mode == "inplane"
+            tilted_any = True
+            evals = sorted((px[g][0], py[g][0], pz[g][0]))
+            j = int(np.argmin([abs(e - cr[g][0]) for e in evals]))   # cross-track (shared) axis
+            block = [evals[i] for i in range(3) if i != j]           # (along, normal) eigenvalues
+            lam_m, lam_p = block[0], block[1]                        # minor <= major
+            denom = lam_p - lam_m
+            cos2 = np.clip((k_n - k_a) / denom, -1.0, 1.0) if denom > 1e-9 else 1.0
+            angle = float(np.rad2deg(0.5 * np.arccos(cos2)))         # [0, 90], major off normal
+            semi_v, semi_h = lam_p, lam_m                            # major vertical (tilted), minor across
+        else:
+            semi_v, semi_h = k_n, k_a                                # upright fallback (no principals)
+            angle = 0.0
+        ell[g] = (max(semi_v, 0.0), max(semi_h, 0.0), angle, have_p)
+
+    vals = [v for g in ell for v in ell[g][:2]]                 # pool semi-axes for scaling
     range_note = None
     if scale_mode == "range" and vals:
         gmin, gmax = min(vals), max(vals)
         span = (gmax - gmin) or 1.0
         to_disp = lambda v: 0.25 + 0.75 * (v - gmin) / span
         range_note = (f"Range-stretched scale: semi-axis 0.25 = {gmin:.0f}, "
-                      f"1.0 = {gmax:.0f} (stiffness units, global min/max over both axes)")
+                      f"1.0 = {gmax:.0f} (stiffness units, global min/max over eigen-axes)")
     else:
         scale = max(vals) if vals else 1.0
         to_disp = lambda v: v / scale
 
+    normal_vals = [n[g][0] for g in n]
     sm = None
     if color_by_normal and normal_vals:
         norm = mpl.colors.Normalize(vmin=min(normal_vals), vmax=max(normal_vals))
         sm = mpl.cm.ScalarMappable(norm=norm, cmap=plt.get_cmap(cmap))
 
+    # Ghost reference oval (semi-vertical, semi-horizontal, angle_deg): upright by construction.
     ghost_params = None
     if ghost and ghost_normal is not None:
-        ghost_params = (float(ghost_normal), float(ghost_normal))
+        ghost_params = (float(ghost_normal), float(ghost_normal), 0.0)
     elif ghost and normal_vals:
         ghost_params = (float(np.mean(normal_vals)),
-                        float(np.mean([al[g][0] for g in al])))
+                        float(np.mean([al[g][0] for g in al])), 0.0)
 
     t = np.linspace(0, 2 * np.pi, 100)
 
-    def _oval_xy(k_normal, k_along):
-        # k_along along the horizontal (surface tangent), k_normal along the vertical.
-        return k_along * np.cos(t), k_normal * np.sin(t)
+    def _ellipse_xy(semi_v, semi_h, ang):
+        # semi_v along the (ang-tilted) vertical major axis, semi_h across it; ang measured
+        # from the surface normal (vertical). ang=0 -> semi_v vertical, semi_h horizontal.
+        ex, ey = semi_h * np.cos(t), semi_v * np.sin(t)
+        return (ex * np.cos(ang) - ey * np.sin(ang),
+                ex * np.sin(ang) + ey * np.cos(ang))
 
-    plotted = [g for g in groups if g in n and g in al]
+    plotted = [g for g in groups if g in ell]
     ncols = ncols if ncols is not None else max(1, len(plotted))
     nrows = max(1, (len(plotted) + ncols - 1) // ncols)
     fig, axes = plt.subplots(nrows, ncols,
@@ -1021,23 +1122,44 @@ def plot_surface_stiffness_ellipses(data: dict, style: PlotStyle,
         ax.plot([0, 0], [-1.1, 1.1], color="0.6", linestyle=":", linewidth=1)
         ax.plot([-1.1, 1.1], [0, 0], color="0.85", linestyle="-", linewidth=1, zorder=0)
         if ghost_params is not None:
-            gx, gy = _oval_xy(to_disp(ghost_params[0]), to_disp(ghost_params[1]))
+            gx, gy = _ellipse_xy(to_disp(ghost_params[0]), to_disp(ghost_params[1]),
+                                 np.deg2rad(ghost_params[2]))
             ax.plot(gx, gy, color="0.7", linestyle="--", linewidth=1.0, zorder=1)
-        kn = to_disp(n[group][0])
-        ka = to_disp(al[group][0])
-        xr, yr = _oval_xy(kn, ka)
+        semi_v, semi_h, angle_deg, has_p = ell[group]
+        # The tilt sign is cosmetic (only the magnitude is recovered). A near-circular oval has no
+        # defined principal direction, so draw it upright and skip the label.
+        big, small = max(semi_v, semi_h), min(semi_v, semi_h)
+        near_circular = not (big > 1e-9 and (big - small) / big >= 0.02)
+        draw_ang = 0.0 if near_circular else np.deg2rad(angle_deg)
+        xr, yr = _ellipse_xy(to_disp(semi_v), to_disp(semi_h), draw_ang)
         fill = sm.to_rgba(n[group][0]) if sm is not None else outline
         ax.fill(xr, yr, color=fill, alpha=0.6 if sm is not None else 0.35, zorder=2)
         ax.plot(xr, yr, color=outline, linewidth=1.2, zorder=3)
+        # Tilt annotation (deg off the surface normal): the eigenframe rotation ("inplane") or the
+        # normal-axis polar tilt ("zaxis"). Skipped for a near-circular oval (relative eccentricity
+        # < 2%), where the direction is undefined -- keeps an isotropic baseline from being labelled
+        # with a spurious angle. Fallback (no principals) is drawn upright.
+        if has_p and not near_circular:
+            ax.text(1.12, 1.12, f"{angle_deg:.0f}°", ha="right", va="top",
+                    fontsize=7, color=outline, zorder=5)
         ax.set_title(style.name(group), fontsize=9)
     if sm is not None:
         sm.set_array([])
         fig.colorbar(sm, ax=axes.ravel().tolist(), shrink=0.6,
                      label="k_normal (true units)")
-    fig.suptitle("Surface-frame stiffness oval  (vertical = normal, horizontal = along-track)")
+    _tilt_desc = ("normal-axis polar tilt off the surface normal" if tilt_mode == "zaxis"
+                  else "eigenframe rotation off the surface axes")
+    fig.suptitle("Surface-frame stiffness oval  (vertical = normal, horizontal = along-track; "
+                 f"tilt = {_tilt_desc})")
     if not color_by_normal:
         fig.tight_layout()
-    if range_note:
-        fig.subplots_adjust(bottom=max(fig.subplotpars.bottom, 0.06))
-        fig.text(0.5, 0.01, range_note, ha="center", va="bottom", fontsize=8, color="0.3")
+    notes = [nt for nt in (range_note,
+             (None if tilted_any else
+              "No principal_{x,y,z} tags in these runs -> ovals drawn upright; the eigenframe "
+              "tilt cannot be reconstructed from the surface diagonal alone.")) if nt]
+    if notes:
+        fig.subplots_adjust(bottom=max(fig.subplotpars.bottom, 0.04 + 0.03 * len(notes)))
+        for i, nt in enumerate(notes):
+            fig.text(0.5, 0.01 + 0.03 * (len(notes) - 1 - i), nt,
+                     ha="center", va="bottom", fontsize=8, color="0.3")
     return fig
