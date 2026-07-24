@@ -1,0 +1,25 @@
+# Smoke-test overlay: loss-of-contact fragile failure on the surface-following task.
+# Deep-merged over glued_surface/1_fixed.yaml:
+#   python learning/runner.py \
+#     --config configs/exp_cfgs/glued_surface/1_fixed.yaml \
+#     --overlay configs/exp_cfgs/tests/require_contact_surface_test.yaml --headless
+#
+# Isolates the NEW require_contact failure mode: the peg is UNBREAKABLE (break_force=-1) so the
+# only fragile termination is loss-of-contact-after-contact. A random early policy touches the
+# surface then drifts off, so "Fragile / Contact Loss" should fire. Short run, few envs, wandb off.
+
+runner_cfg:
+  num_envs: 16
+  num_agents: 1
+  total_timesteps: 400
+  fragile_peg_enabled: true
+  efficient_reset_enabled: true
+  require_contact_enabled: true
+  direction_break_force: false
+  break_force: -1.0              # unbreakable — isolate the loss-of-contact failure
+
+sac_cfg:
+  learning_starts: 50
+  tensorboard: true
+  experiment:
+    wandb: false

@@ -1,0 +1,24 @@
+# Smoke-test overlay: directional fragile peg on the surface-following task.
+# Deep-merged over glued_surface/1_fixed.yaml:
+#   python learning/runner.py \
+#     --config configs/exp_cfgs/glued_surface/1_fixed.yaml \
+#     --overlay configs/exp_cfgs/tests/fragile_directional_surface_test.yaml --headless
+#
+# Enables the NEW directional break (break_force = [shear, normal]); thresholds are set
+# deliberately low so pegs break shortly after contact — this exercises the projection +
+# per-env efficient-reset path, not a trained policy. Short run, few envs, wandb off.
+
+runner_cfg:
+  num_envs: 16
+  num_agents: 1
+  total_timesteps: 400
+  fragile_peg_enabled: true
+  efficient_reset_enabled: true
+  direction_break_force: true
+  break_force: [2.0, 3.0]        # [shear_force, normal_force] in Newtons
+
+sac_cfg:
+  learning_starts: 50
+  tensorboard: true
+  experiment:
+    wandb: false

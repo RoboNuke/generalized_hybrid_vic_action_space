@@ -233,13 +233,44 @@ class RunnerCfg:
     Requires :attr:`efficient_reset_enabled` (broken envs reset out of sync, which the native
     Factory/Forge ``_reset_idx`` — written assuming all envs reset together — cannot handle)."""
 
-    break_force: float = -1.0
-    """Contact-force magnitude (N) on ``force_sensor_smooth[:, :3]`` at/above which a fragile
-    peg breaks. ``-1.0`` = unbreakable (mapped to a huge value internally). When positive it
-    ALSO caps the FORGE per-env *threshold force*: ``contact_penalty_threshold_range[1]`` is
-    clamped to ``break_force`` before ``gym.make`` so the sampled threshold force (used in the
-    obs ``force_threshold`` and the contact-penalty reward) can never exceed the break force.
-    Only used when :attr:`fragile_peg_enabled`."""
+    break_force: float | tuple[float, float] = -1.0
+    """Break threshold(s) in Newtons, read off ``force_sensor_smooth[:, :3]`` (world-frame
+    contact force). Meaning depends on :attr:`direction_break_force`:
+
+    * ``direction_break_force=False`` (default): a SCALAR. The peg breaks when the force
+      MAGNITUDE ``‖force_sensor_smooth[:, :3]‖`` reaches this value. ``-1.0`` = unbreakable
+      (mapped to a huge value internally).
+    * ``direction_break_force=True``: a length-2 array ``[shear_force, normal_force]``. The
+      measured force is projected onto the peg's long axis; the axial (normal) component
+      magnitude is tested against ``normal_force`` and the residual perpendicular (shear)
+      component magnitude against ``shear_force``. Either exceedance breaks the peg. A
+      component set to ``-1.0`` disables breaking in that direction.
+
+    When positive it ALSO caps the FORGE per-env *threshold force*:
+    ``contact_penalty_threshold_range[1]`` is clamped to the break force (the smaller of the
+    two in directional mode) before ``gym.make`` so the sampled threshold force (used in the
+    obs ``force_threshold`` and the contact-penalty reward) can never exceed it. Only used
+    when :attr:`fragile_peg_enabled`."""
+
+    direction_break_force: bool = False
+    """Break the peg directionally (axial "normal" vs perpendicular "shear") instead of by raw
+    force magnitude. When True, :attr:`break_force` must be a length-2 ``[shear, normal]`` array
+    and :class:`~wrappers.sensors.fragile_object_wrapper.FragileObjectWrapper` projects the
+    measured contact force onto the held peg's long axis (its local +z rotated to world by
+    ``held_quat``): the axial component magnitude is compared to ``normal`` and the residual
+    perpendicular component magnitude to ``shear``. Requires :attr:`fragile_peg_enabled` and a
+    task that exposes ``held_quat`` (Forge / AutoMate-Assembly / FlatSurfaceFollow)."""
+
+    require_contact_enabled: bool = False
+    """Additional fragile-peg failure mode: the peg must STAY in contact once it has touched.
+    Each step :class:`~wrappers.sensors.fragile_object_wrapper.FragileObjectWrapper` checks the
+    per-axis contact bool ``env.in_contact`` (from the contact-sensor wrapper): if an env has
+    been in contact in at least one direction earlier this episode but now reads out of contact
+    on ALL axes, it terminates as if the peg broke. The check only ARMS after the env's first
+    contact (the peg spawns above the surface and must descend), and the per-env latch resets
+    each episode. Requires :attr:`fragile_peg_enabled` and the contact-sensor wrapper
+    (``sensor_cfg.contact.enabled=True``, which populates ``env.in_contact``). Independent of
+    :attr:`break_force` — works even with an unbreakable peg (``break_force=-1``)."""
 
     efficient_reset_enabled: bool = False
     """Use the efficient per-env reset (Forge / Factory / AutoMate-Assembly only). Installs
@@ -288,4 +319,26 @@ class RunnerCfg:
                 "RunnerCfg.fragile_peg_enabled=True requires efficient_reset_enabled=True: "
                 "broken pegs reset individual envs mid-episode, which the native "
                 "Factory/Forge _reset_idx (written assuming all envs reset together) corrupts."
+            )
+        # Directional break: break_force must be [shear, normal]; scalar mode must stay scalar.
+        _bf_is_seq = isinstance(self.break_force, (list, tuple))
+        if self.direction_break_force:
+            if not self.fragile_peg_enabled:
+                raise ValueError(
+                    "RunnerCfg.direction_break_force=True requires fragile_peg_enabled=True."
+                )
+            if not _bf_is_seq or len(self.break_force) != 2:
+                raise ValueError(
+                    "RunnerCfg.direction_break_force=True requires break_force to be a length-2 "
+                    f"[shear_force, normal_force] array, got {self.break_force!r}."
+                )
+        elif _bf_is_seq:
+            raise ValueError(
+                "RunnerCfg.break_force must be a scalar unless direction_break_force=True; "
+                f"got a sequence {self.break_force!r}."
+            )
+        if self.require_contact_enabled and not self.fragile_peg_enabled:
+            raise ValueError(
+                "RunnerCfg.require_contact_enabled=True requires fragile_peg_enabled=True "
+                "(the loss-of-contact failure mode lives in the fragile-peg wrapper)."
             )

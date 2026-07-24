@@ -146,34 +146,41 @@ def build_env(
     if runner_cfg.fragile_peg_enabled or runner_cfg.efficient_reset_enabled:
         _is_forge = runner_cfg.task.startswith("Isaac-Forge-")
         _is_factory = runner_cfg.task.startswith("Isaac-Factory-")
-        if not (_is_forge or _is_factory or is_automate_assembly):
+        _is_surface = runner_cfg.task.startswith("Isaac-FlatSurfaceFollow-")
+        if not (_is_forge or _is_factory or is_automate_assembly or _is_surface):
             raise ValueError(
                 "runner_cfg.fragile_peg_enabled / efficient_reset_enabled require a "
-                f"Forge/Factory/AutoMate-Assembly task, but task is {runner_cfg.task!r}."
+                "Forge/Factory/AutoMate-Assembly/FlatSurfaceFollow task, but task is "
+                f"{runner_cfg.task!r}."
             )
-        if runner_cfg.fragile_peg_enabled and not (_is_forge or is_automate_assembly):
+        if runner_cfg.fragile_peg_enabled and not (_is_forge or is_automate_assembly or _is_surface):
             raise ValueError(
                 "runner_cfg.fragile_peg_enabled requires a force-sensor-bearing task "
-                "(Isaac-Forge-* or AutoMate-Assembly); stock Factory has no force sensing, "
-                f"but task is {runner_cfg.task!r}."
+                "(Isaac-Forge-*, AutoMate-Assembly, or Isaac-FlatSurfaceFollow-*); stock "
+                f"Factory has no force sensing, but task is {runner_cfg.task!r}."
             )
         # Cap the FORGE per-env threshold force at break_force: both the obs force_threshold
         # and the contact-penalty reward read contact_penalty_thresholds, which must never
-        # exceed the force that breaks the peg. No-op for tasks without the field.
-        if (
-            runner_cfg.fragile_peg_enabled
-            and runner_cfg.break_force > 0.0
-            and hasattr(env_cfg, "task")
-            and hasattr(env_cfg.task, "contact_penalty_threshold_range")
+        # exceed the force that breaks the peg. In directional mode break_force is a
+        # [shear, normal] pair — cap at the smaller (most-easily-broken direction). No-op for
+        # tasks without the field (e.g. the surface task).
+        if runner_cfg.fragile_peg_enabled and hasattr(env_cfg, "task") and hasattr(
+            env_cfg.task, "contact_penalty_threshold_range"
         ):
-            _rng = list(env_cfg.task.contact_penalty_threshold_range)
-            _rng[1] = min(_rng[1], runner_cfg.break_force)
-            _rng[0] = min(_rng[0], _rng[1])
-            env_cfg.task.contact_penalty_threshold_range = _rng
-            print(
-                f"[runner] fragile peg: capped contact_penalty_threshold_range to {_rng} "
-                f"(break_force={runner_cfg.break_force} N)."
-            )
+            if runner_cfg.direction_break_force:
+                _positive = [f for f in runner_cfg.break_force if f > 0.0]
+                _cap = min(_positive) if _positive else -1.0
+            else:
+                _cap = runner_cfg.break_force
+            if _cap > 0.0:
+                _rng = list(env_cfg.task.contact_penalty_threshold_range)
+                _rng[1] = min(_rng[1], _cap)
+                _rng[0] = min(_rng[0], _rng[1])
+                env_cfg.task.contact_penalty_threshold_range = _rng
+                print(
+                    f"[runner] fragile peg: capped contact_penalty_threshold_range to {_rng} "
+                    f"(break_force cap={_cap} N)."
+                )
 
     # Push the controller config's ctrl fields onto env_cfg.ctrl so the base controller
     # (and factory_control_utils) see the YAML-overridable gains. ControlCfg subclasses the
@@ -602,13 +609,31 @@ def build_env(
     # (terminate) any env whose smoothed contact force reaches break_force. The break itself
     # triggers a per-env reset handled by the efficient-reset wrapper above.
     if runner_cfg.fragile_peg_enabled:
+        # The loss-of-contact failure mode reads env.in_contact, which only exists when the
+        # contact-sensor wrapper is installed. Fail fast with a clear message.
+        if runner_cfg.require_contact_enabled and not contact_enabled:
+            raise ValueError(
+                "runner_cfg.require_contact_enabled=True needs the contact-sensor wrapper "
+                "(sensor_cfg.contact.enabled=True) — it populates env.in_contact, which the "
+                "loss-of-contact break reads. Enable the contact sensor or disable "
+                "require_contact_enabled."
+            )
         from wrappers.sensors.fragile_object_wrapper import FragileObjectWrapper
         env = FragileObjectWrapper(
-            env, break_force=runner_cfg.break_force, num_agents=runner_cfg.num_agents
+            env,
+            break_force=runner_cfg.break_force,
+            direction_break_force=runner_cfg.direction_break_force,
+            require_contact=runner_cfg.require_contact_enabled,
+            num_agents=runner_cfg.num_agents,
         )
-        print(
-            f"[runner] fragile-peg wrapper attached (break_force={runner_cfg.break_force} N)."
+        _mode = (
+            f"directional [shear, normal]={list(runner_cfg.break_force)} N"
+            if runner_cfg.direction_break_force
+            else f"magnitude break_force={runner_cfg.break_force} N"
         )
+        if runner_cfg.require_contact_enabled:
+            _mode += " + require-contact"
+        print(f"[runner] fragile-peg wrapper attached ({_mode}).")
 
     # Contact-sensor wrapper (logging-only): sits at the same layer as the control
     # wrappers (inside the scorer/IsaacLabWrapper) so the per-axis in-contact flags it
