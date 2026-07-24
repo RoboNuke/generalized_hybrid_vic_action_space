@@ -69,6 +69,9 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # Contact flag (set each _compute); init here so interaction_frame_world() is safe if the
         # controller queries the stiffness frame before the first _compute.
         self.in_contact_any = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        # Count of envs whose reset IK didn't converge (set in randomize_initial_state); logged as
+        # a "Stats /" metric every step. 0 until the first full reset.
+        self._reset_ik_nonconverged = 0
         # Per-episode desired normal force (N), sampled in _reset_idx, observed by the policy.
         self.desired_force = torch.zeros((self.num_envs,), device=self.device)
         # Pace schedule clock (s): TIME since first contact — advances by the env step dt every step
@@ -527,6 +530,12 @@ class FlatSurfaceFollowEnv(ForgeEnv):
                 torch.full_like(self.measured_normal_force, float("nan")),
             )
             self.extras.setdefault("to_log", {})["Force / Normal Measured (stat)"] = masked_force.detach()
+            # Reset-IK non-convergence COUNT, in the "Stats /" family next to the GPU/host-memory
+            # stats. Emitted every step (constant across envs) so block_agent's env-mean recovers the
+            # count and it shows as a continuous line holding the last full reset's value.
+            self.extras["to_log"]["Stats / Reset IK non-converged"] = torch.full(
+                (self.num_envs,), float(self._reset_ik_nonconverged), device=self.device
+            )
 
     # ------------------------------------------------------------------
     # Observations (all EEF-frame): goal-relative pose (sign-aligned) + EEF vel/force
@@ -1214,7 +1223,11 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             self._robot.write_joint_state_to_sim(jp, torch.zeros_like(jp), env_ids=bad_envs)
             self._robot.reset()
             self.step_sim_no_action()
-        if bad_envs.shape[0] > 0:
+        # Track the count of envs whose reset IK never converged (best-effort spawn). Logged every
+        # step as a "Stats /" metric (next to the GPU/host-memory stats) so it's monitorable in
+        # wandb/TB — normally 0; a spike flags unreachable spawn_align/grasp-tilt headings.
+        self._reset_ik_nonconverged = int(bad_envs.shape[0])
+        if self._reset_ik_nonconverged > 0:
             print(
                 f"[flat_surface] reset IK did not converge for {bad_envs.shape[0]}/{env_ids.shape[0]} "
                 f"env(s) after {_IK_MAX_ATTEMPTS} attempts; accepting best-effort spawn pose (likely an "
