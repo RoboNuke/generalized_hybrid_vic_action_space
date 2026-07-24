@@ -9,7 +9,7 @@ runner_cfg:
   agent_type: sac
   num_envs: 512
   num_agents: 3
-  total_timesteps: 20_000
+  total_timesteps: 50_000
   eval_timesteps: 75
   memory_size: 1_000_000
   seed: -1
@@ -25,7 +25,7 @@ runner_cfg:
   fragile_peg_enabled: true
   efficient_reset_enabled: true
   direction_break_force: true
-  break_force: [1000, 15]                      # scalar N (magnitude) when direction_break_force=false;
+  break_force: [1000, 20]                    # scalar N (magnitude) when direction_break_force=false;
                                          # set to [shear_N, normal_N] when direction_break_force=true
   require_contact_enabled: true
   # Surface-task params on FlatSurfaceFollowTask via dotted env_cfg overrides.
