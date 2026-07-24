@@ -23,7 +23,6 @@ keypoint_servo_cfg:
   off_track_offset: 0.0
   normal_offset: 0.002           # 2 mm off the surface along surface_normal
   fix_orientation: true
-  fixed_rpy_deg: [180.0, 0.0, 0.0]   # world Euler XYZ (illustrative fixed EEF orientation for the test)
 
 sac_cfg:
   learning_starts: 50

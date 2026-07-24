@@ -43,10 +43,9 @@ class KeypointServoCfg:
     """Constant offset (m) added to the target along ``env.surface_normal`` (surface normal)."""
 
     fix_orientation: bool = False
-    """When True, the wrapper ALSO takes over the rotation dims (3:6), driving the EEF toward the
-    constant world orientation :attr:`fixed_rpy_deg` every step (no offset is ever applied to
-    orientation). When False, the policy keeps the orientation dims."""
-
-    fixed_rpy_deg: list = dataclasses.field(default_factory=lambda: [0.0, 0.0, 0.0])
-    """Target EEF orientation [roll, pitch, yaw] in DEGREES, a WORLD-frame Euler-XYZ angle
-    (``quat_from_euler_xyz``, matching the env's convention). Only used when :attr:`fix_orientation`."""
+    """When True, the wrapper ALSO takes over the rotation dims (3:6) and HOLDS each env's INITIAL
+    (spawn) EEF orientation — captured at reset and maintained for the whole episode (no offset is
+    ever applied to orientation). This keeps whatever the reset set up (the grasp tilt that keeps the
+    peg on the surface, plus the x-axis heading from ``task.spawn_align_eef_x_to_path``); a constant
+    world orientation would instead level the wrist and lift the peg off the plate. When False, the
+    policy keeps the orientation dims."""

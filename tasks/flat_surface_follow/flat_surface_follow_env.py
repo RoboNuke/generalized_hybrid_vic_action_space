@@ -44,6 +44,18 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             for order in (cfg.obs_order, cfg.state_order):
                 if "ft_torque_eef" not in order:
                     order.append("ft_torque_eef")
+        # Configurable PhysX position-solver iterations. Set BEFORE super().__init__() builds the
+        # sim: the scene cap clamps every body, and the robot articulation's own count governs the
+        # glued cylinder (a link on it) — the plate is kinematic, so these two set the realized
+        # tip-plate contact iterations. (Honors a task.solver_position_iteration_count override,
+        # applied before gym.make.)
+        _spic = int(getattr(cfg.task, "solver_position_iteration_count", 192))
+        cfg.sim.physx.max_position_iteration_count = _spic
+        _robot_spawn = getattr(cfg.robot, "spawn", None)
+        for _props in ("articulation_props", "rigid_props"):
+            _p = getattr(_robot_spawn, _props, None)
+            if _p is not None and hasattr(_p, "solver_position_iteration_count"):
+                _p.solver_position_iteration_count = _spic
         super().__init__(cfg, render_mode, **kwargs)
         # Interaction-frame axes (recomputed every _compute_intermediate_values). Initialized to a
         # world-aligned frame (x=+x path, y=+y lateral, z=+z normal) so interaction_frame_world() is
@@ -276,6 +288,24 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         )
 
         self._robot = Articulation(self.cfg.robot)
+        # Drive the spawned plate mesh from the task fields so an env_cfg_override on
+        # plate_length / plate_width / plate_thickness actually resizes it. The env's path
+        # geometry already reads these fields (plate_length/thickness); the CuboidCfg.size was
+        # the one place still baked from the module constant. _setup_scene runs during gym.make,
+        # AFTER build_env applies env_cfg_overrides, so cfg_task reflects any override here.
+        self.cfg_task.fixed_asset.spawn.size = (
+            float(self.cfg_task.plate_length),
+            float(self.cfg_task.plate_width),
+            float(self.cfg_task.plate_thickness),
+        )
+        # Same story for friction: the spawn materials bake the module defaults and this env never
+        # calls factory set_friction, so drive them from the task fields (config-overridable). PhysX
+        # combines the plate's and cylinder's coefficients by their friction_combine_mode (default
+        # "average"): realized mu = 0.5*(plate_friction + held_friction).
+        self.cfg_task.fixed_asset.spawn.physics_material.static_friction = float(self.cfg_task.plate_friction)
+        self.cfg_task.fixed_asset.spawn.physics_material.dynamic_friction = float(self.cfg_task.plate_friction)
+        self.cfg_task.held_asset.spawn.physics_material.static_friction = float(self.cfg_task.held_friction)
+        self.cfg_task.held_asset.spawn.physics_material.dynamic_friction = float(self.cfg_task.held_friction)
         self._fixed_asset = RigidObject(self.cfg_task.fixed_asset)
         self._held_asset = RigidObject(self.cfg_task.held_asset)
 
@@ -1110,6 +1140,32 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         flip_z_quat = torch.tensor([0.0, 0.0, 1.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
         zeros3 = torch.zeros((self.num_envs, 3), device=self.device)
         held_rel_pos, held_rel_quat = self.get_handheld_asset_relative_pose()  # (pos, quat) — tilt-aware
+
+        # Optionally set the grasp's free roll so the EEF x-axis is as parallel as possible to the
+        # travel direction path_dir. CONTROL happens in the EEF frame, so we align the EEF x (not the
+        # peg-tip x). The cylinder is axisymmetric, so its spin about its own axis is a free DOF: we
+        # spin held_quat_des about the peg axis (cyl_axis), which leaves the peg pose (tip position +
+        # tilt) unchanged and rotates the derived EEF orientation (held o held_rel o flip_z) by the
+        # same world rotation. Picking the spin that lands the EEF x's component ⊥ the peg axis on
+        # path_dir maximizes EEF_x · path_dir. With ZERO grasp tilt the EEF x is ⊥ the peg axis, so it
+        # aligns exactly (and equals the peg-tip x); as the grasp PITCH grows the EEF x tilts off that
+        # plane, so the best-aligned EEF x is only as parallel as the pitch allows (residual ≈ the
+        # grasp pitch). cyl_axis is invariant under this spin, so held_center_pos below is unchanged.
+        if self.cfg_task.spawn_align_eef_x_to_path:
+            axis = cyl_axis / torch.linalg.norm(cyl_axis, dim=-1, keepdim=True).clamp_min(1e-8)
+            x_hat = torch.tensor([1.0, 0.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
+            eef_quat0 = torch_utils.quat_mul(                                 # provisional EEF orientation
+                torch_utils.quat_mul(held_quat_des, held_rel_quat), flip_z_quat)
+            eef_x = quat_apply(eef_quat0, x_hat)                             # (E,3) EEF x-axis (world)
+            u = eef_x - (eef_x * axis).sum(-1, keepdim=True) * axis          # EEF x   projected ⊥ axis
+            w = path_dir - (path_dir * axis).sum(-1, keepdim=True) * axis    # path_dir projected ⊥ axis
+            u = u / torch.linalg.norm(u, dim=-1, keepdim=True).clamp_min(1e-8)
+            w = w / torch.linalg.norm(w, dim=-1, keepdim=True).clamp_min(1e-8)
+            cos = (u * w).sum(-1).clamp(-1.0, 1.0)                           # (E,)
+            sin = (torch.cross(u, w, dim=-1) * axis).sum(-1)                 # (E,) signed about axis
+            roll = torch.atan2(sin, cos)                                     # (E,) eef roll to apply
+            held_quat_des = torch_utils.quat_mul(torch_utils.quat_from_angle_axis(roll, axis), held_quat_des)
+
         held_center_pos = p_tip + 0.5 * H * cyl_axis                          # (E,3) cylinder body origin
         _q1, _t1 = torch_utils.tf_combine(held_quat_des, held_center_pos, held_rel_quat, held_rel_pos)
         target_quat_all, target_pos_all = torch_utils.tf_combine(_q1, _t1, flip_z_quat, zeros3)

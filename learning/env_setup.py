@@ -639,7 +639,7 @@ def build_env(
         from wrappers.controllers.keypoint_servo_wrapper import KeypointServoActionWrapper
         env = KeypointServoActionWrapper(env, keypoint_servo_cfg)
         _ori = (
-            f"fixed orientation rpy={list(keypoint_servo_cfg.fixed_rpy_deg)} deg"
+            "holding captured spawn EEF orientation"
             if keypoint_servo_cfg.fix_orientation
             else "policy-controlled orientation"
         )

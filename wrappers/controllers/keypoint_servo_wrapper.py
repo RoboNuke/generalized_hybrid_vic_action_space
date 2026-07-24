@@ -26,14 +26,18 @@ world-axis unit vectors. Clipping caps the per-step motion at ``pos_threshold`` 
 controller re-multiplies by it), giving a proportional servo — exact when close, saturated
 when far. The pose action still passes through the control wrapper's EMA smoothing.
 
-Orientation (optional ``fix_orientation``) — drive the EEF to a constant world orientation:
+Orientation (optional ``fix_orientation``) — HOLD each env's initial (spawn) EEF orientation:
 
-    q_target    = quat_from_euler_xyz(fixed_rpy_deg)               # world Euler XYZ
+    q_target[e] = fingertip_midpoint_quat[e]  captured at reset (episode_length_buf == 0)
     dq_eef      = eef_quat^-1 o q_target                           # body-frame delta
     action[3:6] = clip(axis_angle(dq_eef) / rot_threshold, -1, 1)
 
-No offset is ever added to orientation. When ``fix_orientation`` is off the policy keeps the
-rotation dims.
+The target is the FULL spawn orientation (all 3 rotations), snapshotted per-env the first control
+step after a full OR per-env reset and then held for the rest of the episode. This keeps whatever
+the reset set up — including the x-axis heading from ``spawn_align_eef_x_to_path`` and the grasp
+tilt that keeps the peg on the surface — rather than a constant world rpy (which would level the
+wrist and lift the peg off the plate). No offset is ever added to orientation. When
+``fix_orientation`` is off the policy keeps the rotation dims.
 
 Action-space surgery: the taken-over dims are a contiguous FRONT block — ``pos`` (0:3) always,
 plus ``rot`` (3:6) when ``fix_orientation`` — so the wrapper is agnostic to whatever
@@ -44,8 +48,6 @@ reconstructed here before it reaches the control wrapper.
 """
 
 from __future__ import annotations
-
-import math
 
 import gymnasium as gym
 import numpy as np
@@ -89,11 +91,13 @@ class KeypointServoActionWrapper(gym.ActionWrapper):
         # Number of contiguous FRONT dims this wrapper takes over: pos (3), + rot (3) if fixing it.
         self._n_override = 6 if self._fix_orientation else 3
 
-        # Constant world-frame target orientation (Euler XYZ, degrees -> rad), (1,4), expanded per step.
+        # Per-env orientation hold target (E,4): each env's INITIAL (spawn) EEF orientation, latched at
+        # reset. Initialized to identity; (re)captured for any env whose episode_length_buf is 0 (fresh
+        # full or per-env reset) in _capture_reset_orientation. Holding the captured spawn orientation
+        # keeps the peg on the surface (a constant world rpy would level the wrist and lift the peg off).
         if self._fix_orientation:
-            rpy = [math.radians(float(v)) for v in cfg.fixed_rpy_deg]
-            r, p, y = (torch.tensor([v], dtype=torch.float32, device=self.device) for v in rpy)
-            self._q_target = torch_utils.quat_from_euler_xyz(r, p, y)  # (1,4)
+            self._q_target = torch.zeros((self.num_envs, 4), device=self.device)
+            self._q_target[:, 0] = 1.0                                # identity until first capture
         else:
             self._q_target = None
 
@@ -165,11 +169,24 @@ class KeypointServoActionWrapper(gym.ActionWrapper):
         total_eef = rotate_vec_to_eef(disp_world, env.fingertip_midpoint_quat)  # (E,3) into EEF frame
         return torch.clamp(total_eef / env.pos_threshold, -1.0, 1.0)
 
+    def _capture_reset_orientation(self) -> None:
+        """Latch each freshly-reset env's current (spawn) EEF orientation as the hold target.
+
+        ``episode_length_buf == 0`` marks the first control step after a full OR per-env reset — the
+        EEF is still at its reset pose (this runs pre-physics, before the policy's action is applied),
+        so we snapshot ``fingertip_midpoint_quat`` there. It stays fixed for the rest of the episode
+        (the buffer becomes >=1 after this step), so the target is exactly the spawn orientation.
+        """
+        env = self.unwrapped
+        fresh = env.episode_length_buf == 0                                  # (E,) bool
+        if fresh.any():
+            self._q_target[fresh] = env.fingertip_midpoint_quat[fresh].detach().clone()
+
     def _rot_action(self) -> torch.Tensor:
-        """EEF-frame, threshold-normalized rotation action (E,3) driving the EEF to the fixed quat."""
+        """EEF-frame, threshold-normalized rotation action (E,3) driving the EEF to the held quat."""
         env = self.unwrapped
         eef_quat = env.fingertip_midpoint_quat                               # (E,4)
-        q_target = self._q_target.expand(self.num_envs, 4)                   # (E,4)
+        q_target = self._q_target                                            # (E,4) per-env spawn orient.
         # Body-frame delta: target = eef o dq  =>  dq = eef^-1 o target.
         dq = torch_utils.quat_mul(torch_utils.quat_conjugate(eef_quat), q_target)
         # Canonicalize to the positive-w hemisphere so axis_angle gives the SHORTEST rotation.
@@ -181,6 +198,8 @@ class KeypointServoActionWrapper(gym.ActionWrapper):
         """Prepend the computed pose block onto the policy's (reduced) action -> full-width vector."""
         if not self._validated:
             self._validate()
+        if self._fix_orientation:
+            self._capture_reset_orientation()                               # latch spawn orient. on reset
         head = self._pos_action()
         if self._fix_orientation:
             head = torch.cat((head, self._rot_action()), dim=1)             # (E,6)

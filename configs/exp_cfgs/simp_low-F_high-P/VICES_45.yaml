@@ -10,7 +10,7 @@ runner_cfg:
   num_envs: 512
   num_agents: 3
   total_timesteps: 20_000
-  eval_timesteps: 150
+  eval_timesteps: 75
   memory_size: 1_000_000
   seed: -1
   glue_peg_to_gripper: true              # rigidly weld the held cylinder to the gripper (generalized weld)
@@ -25,7 +25,7 @@ runner_cfg:
   fragile_peg_enabled: true
   efficient_reset_enabled: true
   direction_break_force: true
-  break_force: [1000, 10]                      # scalar N (magnitude) when direction_break_force=false;
+  break_force: [1000, 15]                      # scalar N (magnitude) when direction_break_force=false;
                                          # set to [shear_N, normal_N] when direction_break_force=true
   require_contact_enabled: true
   # Surface-task params on FlatSurfaceFollowTask via dotted env_cfg overrides.
@@ -33,8 +33,8 @@ runner_cfg:
     task.desired_speed_cm_s: 5.0
     task.force_desired_min: 5.0
     task.force_desired_max: 5.0
-    task.orientation_desired_angle_deg: 10.0
-    task.plate_tilt_range_deg: 10.0
+    task.orientation_desired_angle_deg: 0.0
+    task.plate_tilt_range_deg: 0.0
     # Held-cylinder spawn: TIP 1 mm above the starting keypoint (along the surface normal), peg straight
     # up/down (no rotation), no jitter. Each DOF has a mean + std; std == 0 => mean used exactly (no
     # sampling). pos = surface-local (x=along-path, y=cross-track, z=normal, m); orn = WORLD-frame
@@ -43,6 +43,7 @@ runner_cfg:
     task.spawn_tip_pos_std: [0.0, 0.0, 0.0]
     task.spawn_orn_mean_deg: [0.0, 0.0, 0.0]   # cylinder spawns straight (perpendicular to the surface); the reset AUTO-COMPENSATES for the grasp tilt (the eef/wrist absorbs it), so leave this zero
     task.spawn_orn_std_deg: [0.0, 0.0, 0.0]
+    task.spawn_align_eef_x_to_path: true   # spin the grasp at spawn so the EEF x-axis points along path_dir; the keypoint-servo fix_orientation then holds this
     task.observe_eef_torque: false
     task.terminate_on_lag: false
     task.terminate_on_success: true
@@ -72,6 +73,20 @@ runner_cfg:
     # --- Surface (plate) spawn randomness. plate_tilt_range_deg is set above. ---
     task.plate_pos_noise: [0.00, 0.00, 0.00]     # world-frame per-axis +/- spawn jitter (m)
     task.plate_yaw_range_deg: 360.0              # in-plane yaw randomization (deg)
+    # --- Plate geometry: drives the actual spawned plate mesh (not just the path math). ---
+    task.plate_length: 0.20                      # along the near->far traverse direction (m)
+    task.plate_width: 0.20                       # across the path (m)
+    task.plate_thickness: 0.02                   # (m)
+    # --- Contact friction (static == dynamic) on each object. PhysX combines the two by the
+    #     "average" mode, so the realized tip-plate coefficient = 0.5*(plate_friction + held_friction). ---
+    task.plate_friction: 0.75                    # plate (fixed asset)
+    task.held_friction: 0.75                     # cylinder (held asset)
+    # --- Sim timing + solver (physics resolution vs speed). sim.dt and episode_length_s are
+    #     top-level env_cfg overrides (NOT under task.). Control/env step = sim.dt * decimation(8);
+    #     env steps per episode = episode_length_s / (sim.dt * 8). ---
+    sim.dt: 0.008333333333333333                 # physics step (s) = 1/120
+    episode_length_s: 5.0                       # episode length (s); 10 / (1/120*8) = 150 env steps
+    task.solver_position_iteration_count: 192    # PhysX position iters (scene cap + robot/cylinder); lower = faster
 
 loss_cfg:
   supervised_selection_enabled: false
@@ -161,8 +176,8 @@ controller_cfg:
   # ---- shared per-axis bounds [x,y,z,Rx,Ry,Rz], geometric scaling k = lo*(hi/lo)^((a+1)/2) ----
   # A lower bound < ~1e-6 disables that channel (k=0) instead of producing NaN, so use > 0 for
   # meaningful variable impedance. Translation and rotation differ ~10x, hence the split values.
-  gain_min: [500, 500, 500, 20, 20, 20] # pose stiffness K (position x3, rotation x3)
-  gain_max: [900, 900, 900, 40, 40, 40] 
+  gain_min: [300, 300, 100, 20, 20, 20] # pose stiffness K (position x3, rotation x3)
+  gain_max: [4000, 4000, 2000, 40, 40, 40] 
 
   # Policy commands the pose stiffness directly, so disable the base Forge env's per-reset
   # multiplicative gain randomization (default [0.41]x6) to avoid randomizing on top of the
@@ -187,7 +202,7 @@ controller_cfg:
   # scaled by rot_action_bounds, instead of the default yaw-only map (roll/pitch forced to 0).
   # When true, also set the actor's force_zero_action_dims=null so Rx/Ry are learnable, and
   # tune rot_action_bounds (it now governs the orientation cone). Wrapper control types only.
-  full_orientation_control: false
+  full_orientation_control: true
   orientation_obs_mode: "6d_rot_mat"   # standardized: same orientation obs across all methods
 
   # ---- rotation action scaling (rot_action_bounds REMOVED) ----
@@ -223,10 +238,9 @@ sensor_cfg:
 keypoint_servo_cfg:
   # Surface keypoint-servo action override: when enabled, the wrapper drives the held-cylinder tip
   # toward the setpoint keypoint (+ constant surface-frame offsets), taking over the pose dims (and,
-  # with fix_orientation, the rotation dims -> fixed_rpy_deg). All at defaults; enable + tune.
+  # with fix_orientation, the rotation dims -> hold the captured spawn EEF orientation). All at defaults; enable + tune.
   enabled: true                # -> true to hand the pose dims to the servo
   along_track_offset: 0.0       # m along env.path_dir (start->goal travel direction)
   off_track_offset: 0.0         # m along env.d_lat (in-plane lateral, n x d)
-  normal_offset: 0.01            # m along env.surface_normal
-  fix_orientation: true        # -> true to also fix the EEF orientation to fixed_rpy_deg
-  fixed_rpy_deg: [3.14159, 0.0, 3.14159]  # world-frame [roll, pitch, yaw] deg EEF target (used iff fix_orientation)
+  normal_offset: -0.01            # m along env.surface_normal
+  fix_orientation: true        # -> true to hold each env's captured spawn EEF orientation

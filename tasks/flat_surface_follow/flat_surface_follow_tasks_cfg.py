@@ -73,6 +73,22 @@ class FlatSurfaceFollowTask(ForgeTask):
     plate_yaw_range_deg: float = 360.0           # full in-plane orientation randomization
     plate_tilt_range_deg: float = 10.0           # small roll/pitch cone off world +z (see note)
 
+    # --- Contact friction (static == dynamic) applied to each object's spawned material.
+    # Overridable via env_cfg_overrides; wired to the spawned materials in
+    # FlatSurfaceFollowEnv._setup_scene (the spawn cfgs below bake the module defaults, and the
+    # surface env does not call factory set_friction). PhysX combines the two contacting materials
+    # by their friction_combine_mode, which is the default "average" here, so the REALIZED contact
+    # coefficient = 0.5 * (plate_friction + held_friction). ---
+    plate_friction: float = 0.75                 # plate (fixed asset) friction
+    held_friction: float = 0.75                  # cylinder (held asset) friction
+
+    # PhysX position-solver iterations for the tip-plate contact. Applied in
+    # FlatSurfaceFollowEnv.__init__ (before the sim is built) to the PhysX scene cap AND the robot
+    # articulation (the glued cylinder is a link on it; the plate is kinematic), so this one knob
+    # governs the realized contact iterations. Higher = less interpenetration / more accurate but
+    # slower; 192 is the Factory default. Overridable via env_cfg_overrides.
+    solver_position_iteration_count: int = 192
+
     # --- Held-cylinder spawn pose (NO force controller: the TIP is placed directly, then the arm
     #     is IK'd to match). The reset geometry is used only to POSITION the spawn — no privileged
     #     info reaches the policy. The cylinder TIP is placed at a configurable offset from the
@@ -94,6 +110,16 @@ class FlatSurfaceFollowTask(ForgeTask):
     # spins the (axisymmetric) cylinder about vertical.
     spawn_orn_mean_deg: list = [0.0, 10.0, 0.0]    # default: 10 deg pitch off world-vertical
     spawn_orn_std_deg: list = [0.0, 0.0, 0.0]      # per-axis Gaussian std (deg); 0 => fixed at the mean
+    # When True, at spawn pick the grasp's free roll (the cylinder is axisymmetric — its spin about its
+    # own axis is a free DOF) so the EEF x-axis is as parallel as possible to the travel direction
+    # path_dir. CONTROL runs in the EEF frame, so this aligns the EEF x (not the peg-tip x). The spin is
+    # about the peg axis, so it leaves the peg pose (tip position + tilt) untouched and only re-heads the
+    # eef. With NO grasp tilt (rel_grasp_rot_init_deg all zero) the EEF x is perpendicular to the peg
+    # axis and aligns exactly (there it also equals the peg-tip x); as the grasp PITCH grows the EEF x
+    # tilts out of that plane so it can only be made as parallel as the pitch allows (residual angle ≈
+    # the grasp pitch). Default False (legacy: a fixed world heading, random relative to the yaw-
+    # randomized path direction).
+    spawn_align_eef_x_to_path: bool = False
 
     # --- Reset press-to-contact: after the peg is spawned (above the surface) and gripped, PRESS it
     #     toward the surface until each env reads in contact, then latch it in place, so episodes
