@@ -1172,8 +1172,16 @@ class FlatSurfaceFollowEnv(ForgeEnv):
 
         # IK the arm to the FIXED fingertip target; reseed the arm for any env that didn't converge
         # and retry. Targets are NOT re-sampled on retry, so the spawn distribution stays unbiased.
+        # BOUNDED retry (critical): the target is fixed AND the reseed pose is a constant, so a
+        # non-converging env retries the SAME solve deterministically — an unbounded loop would spin
+        # FOREVER on a single env whose target the arm can't reach to 1e-3 (e.g. an unreachable
+        # spawn_align_eef_x_to_path heading under yaw randomization, or a steep grasp-tilt wrist
+        # target). That hangs the WHOLE run at reset before any training step — the sim stays alive
+        # (only omni.datastore GC keeps ticking) and nothing reaches wandb/TB. Cap the attempts and
+        # accept the stragglers' best-effort pose; the reset press-to-contact still settles them.
         bad_envs = env_ids.clone()
-        while True:
+        _IK_MAX_ATTEMPTS = 25
+        for _ik_attempt in range(_IK_MAX_ATTEMPTS):
             pos_error, aa_error = self.set_pos_inverse_kinematics(
                 ctrl_target_fingertip_midpoint_pos=target_pos_all,
                 ctrl_target_fingertip_midpoint_quat=target_quat_all,
@@ -1187,6 +1195,14 @@ class FlatSurfaceFollowEnv(ForgeEnv):
                 break
             self._set_franka_to_default_pose(
                 joints=[0.00871, -0.10368, -0.00794, -1.49139, -0.00083, 1.38774, 0.0], env_ids=bad_envs
+            )
+        if bad_envs.shape[0] > 0:
+            print(
+                f"[flat_surface] reset IK did not converge for {bad_envs.shape[0]}/{env_ids.shape[0]} "
+                f"env(s) after {_IK_MAX_ATTEMPTS} attempts; accepting best-effort spawn pose (likely an "
+                f"unreachable spawn_align_eef_x_to_path / grasp-tilt heading). Reset press-to-contact "
+                f"still seats them.",
+                flush=True,
             )
 
         self.step_sim_no_action()
