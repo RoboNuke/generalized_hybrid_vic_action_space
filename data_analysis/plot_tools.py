@@ -986,7 +986,10 @@ def plot_surface_stiffness_ellipses(data: dict, style: PlotStyle,
 
     ``tilt_mode`` selects which rotation the tilt shows (see the reconstruction comment for
     the exact formulas): ``"inplane"`` (default) is the full (along, normal) eigen-tilt
-    described above; ``"zaxis"`` shows ONLY the polar tilt of the authored normal axis
+    described above; ``"none"`` does NO reconstruction at all -- every oval is drawn upright
+    with semi-axes ``k_normal`` (vertical) and ``k_along`` (horizontal), i.e. the raw
+    surface-frame diagonal, so it agrees with the scatter/table and a 45deg-tilted anisotropic
+    K reads as near-circular; ``"zaxis"`` shows ONLY the polar tilt of the authored normal axis
     (principal_z) off the true surface normal, ignoring any tangential-plane spin -- a
     single-DOF Rayleigh inversion that is exact under tangential isotropy and needs only
     k_normal + the eigenvalues.
@@ -1039,7 +1042,16 @@ def plot_surface_stiffness_ellipses(data: dict, style: PlotStyle,
             continue
         k_n, k_a = n[g][0], al[g][0]
         have_p = all(g in s for s in (cr, px, py, pz))
-        if have_p and tilt_mode == "zaxis":
+        if tilt_mode == "none":
+            # No rotation at all: draw the raw surface-frame diagonal as an UPRIGHT oval,
+            # semi_v = k_normal (vertical), semi_h = k_along (horizontal) -- exactly what the
+            # scatter/table show. A 45deg-tilted anisotropic K (e.g. VICES_45) therefore reads
+            # as near-CIRCULAR here even though its true eigen-oval is elongated: the tilt has
+            # moved the anisotropy into the (unshown) off-diagonal term.
+            semi_v, semi_h = k_n, k_a
+            angle = 0.0
+            have_p = False                                       # suppress the tilt-angle annotation
+        elif have_p and tilt_mode == "zaxis":
             tilted_any = True
             lam_n = pz[g][0]                                          # authored normal-axis stiffness
             lam_t = 0.5 * (px[g][0] + py[g][0])                       # tangential mean (transverse iso.)
@@ -1147,14 +1159,15 @@ def plot_surface_stiffness_ellipses(data: dict, style: PlotStyle,
         sm.set_array([])
         fig.colorbar(sm, ax=axes.ravel().tolist(), shrink=0.6,
                      label="k_normal (true units)")
-    _tilt_desc = ("normal-axis polar tilt off the surface normal" if tilt_mode == "zaxis"
+    _tilt_desc = ("NONE -- raw surface-frame diagonal, upright" if tilt_mode == "none"
+                  else "normal-axis polar tilt off the surface normal" if tilt_mode == "zaxis"
                   else "eigenframe rotation off the surface axes")
     fig.suptitle("Surface-frame stiffness oval  (vertical = normal, horizontal = along-track; "
                  f"tilt = {_tilt_desc})")
     if not color_by_normal:
         fig.tight_layout()
     notes = [nt for nt in (range_note,
-             (None if tilted_any else
+             (None if (tilted_any or tilt_mode == "none") else
               "No principal_{x,y,z} tags in these runs -> ovals drawn upright; the eigenframe "
               "tilt cannot be reconstructed from the surface diagonal alone.")) if nt]
     if notes:
