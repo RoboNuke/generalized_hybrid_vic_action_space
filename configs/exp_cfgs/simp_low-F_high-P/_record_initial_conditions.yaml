@@ -1,0 +1,49 @@
+# _record_initial_conditions.yaml — DIAGNOSTIC recorder that renders ONLY the post-reset initial
+# state of the surface task, once per reset, holding each for 1 s. No policy, no physics stepping —
+# purely to inspect the spawn/initial conditions across many envs. Each tile is one env; the top-down
+# inset shows red-x START, green-o GOAL, and a blue dot at the spawn peg tip (a correct spawn puts the
+# dot on the red x). Reflects the NEW spawn behaviour (reset_press_to_contact OFF -> peg spawns 1 mm
+# above the plate).
+#
+#   python learning/record.py \
+#     --agent_dir runs/wandb/simp_lowF_highP_base2/VICES_0/0 \
+#     --record_config configs/exp_cfgs/simp_low-F_high-P/_record_initial_conditions.yaml \
+#     --headless --checkpoint_step best
+
+controller_cfg:
+  visualize_rotation_frame: false
+  visualize_peg_tip_frame: false
+  visualize_eef_frame: false
+  visualize_stiffness_ellipsoid: false
+
+runner_cfg:
+  num_agents: 1
+  num_envs: 1                # SINGLE env per view (one spawn at a time)
+  memory_size: 50_000
+  env_cfg_overrides:
+    # Show the NEW initial conditions: no reset press, peg spawns 1 mm above the plate.
+    task.reset_press_to_contact: false
+    task.terminate_on_lag: false
+    task.terminate_on_success: false
+
+sac_cfg:
+  recorder:
+    enabled: true                  # triggers TiledCamera injection in build_env
+    reset_snapshots: true          # reset N times; hold the robot still and step, capturing each frame
+    reset_snapshots_count: 100     # number of resets
+    reset_snapshots_hold_s: 1.0    # 1 s = 15 physics steps captured per reset (robot held at spawn pose)
+    surface_overlays: true         # force/height read-outs + top-down inset (accumulating spawn-tip trace)
+    ball_diameter_frac: 1.0
+    video_format: mp4
+    num_trajectories: 16           # unused by reset_snapshots; kept for cfg symmetry
+    # Render/quality settings from _record_video.yaml:
+    width: 560
+    height: 720
+    camera_pos: [1.0, 0.0, 0.35]
+    camera_quat: [-0.3535534, 0.6123724, 0.6123724, -0.3535534]
+    focal_length: 24.0
+    focus_distance: 0.05
+    horizontal_aperture: 20.955
+    clipping_range: [0.1, 20.0]
+    fps: 15
+    output_subdir: videos

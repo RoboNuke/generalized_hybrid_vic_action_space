@@ -215,10 +215,17 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         _, start = torch_utils.tf_combine(self.fixed_quat, self.fixed_pos, ident, start_local)
         _, goal = torch_utils.tf_combine(self.fixed_quat, self.fixed_pos, ident, goal_local)
 
+        # All three basis vectors are explicitly renormalized to UNIT length: they feed dot-product
+        # projections (progress = dp·path_dir, cross_track = dp·d_lat, normal force = f·normal), so a
+        # non-unit basis (fixed_quat drift makes the rotated normal slightly off unit; a cross product
+        # of near-orthonormal inputs has magnitude sin(θ)≈1 but not exactly) would scale those
+        # projections and bias the reward/keypoint gates.
         normal = self._rotate_vec(self.fixed_quat, torch.tensor([0.0, 0.0, 1.0], device=self.device))
+        normal = normal / torch.linalg.norm(normal, dim=-1, keepdim=True).clamp_min(1e-8)
         path_dir = goal - start
         path_dir = path_dir / torch.linalg.norm(path_dir, dim=-1, keepdim=True).clamp_min(1e-8)
         cross_dir = torch.cross(normal, path_dir, dim=-1)
+        cross_dir = cross_dir / torch.linalg.norm(cross_dir, dim=-1, keepdim=True).clamp_min(1e-8)
         return start, goal, normal, path_dir, cross_dir
 
     def _surface_normal_and_dir_at(self, query_pos):
@@ -371,6 +378,7 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # held_pos +/- (H/2)*cyl_axis. The CONTACT tip is the lower end (smaller projection onto the
         # plate normal) — sign-robust, independent of which way the grasp leaves held-frame +z.
         self.cyl_axis = self._rotate_vec(self.held_quat, torch.tensor([0.0, 0.0, 1.0], device=self.device))
+        self.cyl_axis = self.cyl_axis / torch.linalg.norm(self.cyl_axis, dim=-1, keepdim=True).clamp_min(1e-8)
         half = 0.5 * self.cfg_task.held_asset_cfg.height
         end_plus = self.held_pos + half * self.cyl_axis
         end_minus = self.held_pos - half * self.cyl_axis
@@ -392,9 +400,15 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # return the LOCAL normal (surface gradient) + local tangent there. Flat plate => plate
         # constants, so this is numerically identical to before for the flat surface.
         normal, path_dir = self._surface_normal_and_dir_at(self.contact_point)
+        # Renormalize the local frame to UNIT length before it feeds the projections below
+        # (progress, cross_track, normal force, axis-vs-normal angle) — a non-flat-surface override
+        # may return a non-unit gradient/tangent, and d_lat = n×d is only unit when n⊥d exactly.
+        normal = normal / torch.linalg.norm(normal, dim=-1, keepdim=True).clamp_min(1e-8)
+        path_dir = path_dir / torch.linalg.norm(path_dir, dim=-1, keepdim=True).clamp_min(1e-8)
         self.surface_normal = normal
         self.path_dir = path_dir
         self.d_lat = torch.cross(normal, path_dir, dim=-1)                    # d_lat = n x d (in-plane lateral)
+        self.d_lat = self.d_lat / torch.linalg.norm(self.d_lat, dim=-1, keepdim=True).clamp_min(1e-8)
         self.cross_dir = self.d_lat
 
         # Ideal path p0 -> p_g. path_dir is the (local) travel direction at the contact point.
@@ -1055,16 +1069,51 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         rand_flips = torch.rand(self.num_envs) > 0.5
         self.flip_quats[rand_flips] = -1.0
 
-    def randomize_initial_state(self, env_ids):
-        """Place the plate at a random orientation and the cylinder with its TIP at a configurable
-        pose relative to the STARTING KEYPOINT (NO force-controlled contact — we spawn the tip a
-        configurable height above the surface and let the policy establish contact)."""
-        physics_sim_view = sim_utils.SimulationContext.instance().physics_sim_view
-        physics_sim_view.set_gravity(carb.Float3(0.0, 0.0, 0.0))
+    def _spawn_fingertip_target(self, pos_off, orn_off, start, path_dir, cross_dir, normal):
+        """Fingertip (wrist) target pose that seats the peg TIP at ``start + surface-local pos_off``
+        with world-frame rpy ``orn_off``, inverting the (tilt-aware) rigid grip. The board/surface
+        frame is fixed, so only ``pos_off`` / ``orn_off`` change across IK retries — this recomputes the
+        target cheaply each time a straggler's spawn pose is re-sampled. The offset is surface-local
+        (x = along-path, y = cross-track, z = surface normal); the zero-offset cylinder orientation is
+        the peg straight down (world +z), and ``spawn_align_eef_x_to_path`` spins the free grasp roll so
+        the EEF x-axis is as parallel to ``path_dir`` as the grasp tilt allows (tip pose unchanged).
+        Returns ``(target_pos (E,3), target_quat (E,4))``.
+        """
+        R_surf = torch.stack([path_dir, cross_dir, normal], dim=-1)          # (E,3,3) world<-surface
+        q_surf = quat_from_matrix(R_surf)                                     # (E,4)
+        p_tip = start + quat_apply(q_surf, pos_off)                           # desired TIP position (world)
+        held_quat_des = torch_utils.quat_from_euler_xyz(orn_off[:, 0], orn_off[:, 1], orn_off[:, 2])
+        z_hat = torch.tensor([0.0, 0.0, 1.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
+        cyl_axis = quat_apply(held_quat_des, z_hat)                          # (E,3) tip->grip
+        H = self.cfg_task.held_asset_cfg.height
+        flip_z_quat = torch.tensor([0.0, 0.0, 1.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
+        zeros3 = torch.zeros((self.num_envs, 3), device=self.device)
+        held_rel_pos, held_rel_quat = self.get_handheld_asset_relative_pose()  # tilt-aware grip
+        if self.cfg_task.spawn_align_eef_x_to_path:
+            axis = cyl_axis / torch.linalg.norm(cyl_axis, dim=-1, keepdim=True).clamp_min(1e-8)
+            x_hat = torch.tensor([1.0, 0.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
+            eef_quat0 = torch_utils.quat_mul(                                 # provisional EEF orientation
+                torch_utils.quat_mul(held_quat_des, held_rel_quat), flip_z_quat)
+            eef_x = quat_apply(eef_quat0, x_hat)                             # (E,3) EEF x-axis (world)
+            u = eef_x - (eef_x * axis).sum(-1, keepdim=True) * axis          # EEF x   projected ⊥ axis
+            w = path_dir - (path_dir * axis).sum(-1, keepdim=True) * axis    # path_dir projected ⊥ axis
+            u = u / torch.linalg.norm(u, dim=-1, keepdim=True).clamp_min(1e-8)
+            w = w / torch.linalg.norm(w, dim=-1, keepdim=True).clamp_min(1e-8)
+            cos = (u * w).sum(-1).clamp(-1.0, 1.0)                           # (E,)
+            sin = (torch.cross(u, w, dim=-1) * axis).sum(-1)                 # (E,) signed about axis
+            roll = torch.atan2(sin, cos)                                     # (E,) eef roll to apply
+            held_quat_des = torch_utils.quat_mul(torch_utils.quat_from_angle_axis(roll, axis), held_quat_des)
+        held_center_pos = p_tip + 0.5 * H * cyl_axis                          # (E,3) cylinder body origin
+        _q1, _t1 = torch_utils.tf_combine(held_quat_des, held_center_pos, held_rel_quat, held_rel_pos)
+        target_quat_all, target_pos_all = torch_utils.tf_combine(_q1, _t1, flip_z_quat, zeros3)
+        return target_pos_all, target_quat_all
 
+    def _randomize_plate_pose(self, env_ids):
+        """Sample + write a random plate (fixed-asset) pose for ``env_ids``: center + in-plane position
+        noise, full yaw + a small roll/pitch tilt cone. Also refreshes the fixed-asset position
+        observation noise. Called once per reset for all envs, and again per IK-retry for the stragglers
+        (a fresh board orientation, so the arm gets a new, reachable spawn target)."""
         n = len(env_ids)
-
-        # (1) Plate pose: center + in-plane noise; full yaw + small roll/pitch tilt cone.
         fixed_state = self._fixed_asset.data.default_root_state.clone()[env_ids]
         rs = torch.rand((n, 3), dtype=torch.float32, device=self.device)
         pos_rand = (2.0 * (rs - 0.5)) @ torch.diag(
@@ -1091,6 +1140,15 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         )
         self.init_fixed_pos_obs_noise[env_ids] = fixed_pos_noise
 
+    def randomize_initial_state(self, env_ids):
+        """Place the plate at a random orientation and the cylinder with its TIP at a configurable
+        pose relative to the STARTING KEYPOINT (NO force-controlled contact — we spawn the tip a
+        configurable height above the surface and let the policy establish contact)."""
+        physics_sim_view = sim_utils.SimulationContext.instance().physics_sim_view
+        physics_sim_view.set_gravity(carb.Float3(0.0, 0.0, 0.0))
+
+        # (1) Plate pose: random orientation (yaw + tilt cone) + in-plane position noise.
+        self._randomize_plate_pose(env_ids)
         self.step_sim_no_action()
 
         # (2) Surface frame + endpoints (env-relative). All envs reset together.
@@ -1118,76 +1176,17 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # the step-0 observation setpoint is ALSO k0 (held there until first contact, see
         # _compute_intermediate_values), so the peg descends straight down onto k0, then the setpoint
         # advances one keypoint at a time as it drags.
-        start_kp = start                                                     # (E,3) k0 (near-edge center)
+        # Fingertip target seating the tip at the sampled spawn pose (recomputed per IK retry below).
+        target_pos_all, target_quat_all = self._spawn_fingertip_target(
+            pos_off, orn_off, start, path_dir, cross_dir, normal)
 
-        # Surface-frame rotation (world<-surface): columns [along-path, cross-track, normal]. Used only
-        # to map the POSITION offset, which is surface-local so that "z above the plate" = along the
-        # normal (perpendicular distance) and x/y = along/across the path.
-        R_surf = torch.stack([path_dir, cross_dir, normal], dim=-1)          # (E,3,3)
-        q_surf = quat_from_matrix(R_surf)                                     # (E,4)
-
-        # Desired TIP position: starting keypoint + surface-local offset rotated into world.
-        p_tip = start_kp + quat_apply(q_surf, pos_off)                        # (E,3)
-        # Desired cylinder orientation: WORLD-frame roll/pitch/yaw. The zero-offset pose is the peg
-        # straight up/down (axis along world +z, tip down) — INDEPENDENT of the surface orientation,
-        # which the policy does not know a priori. cyl_axis points from the tip toward the grip.
-        held_quat_des = torch_utils.quat_from_euler_xyz(orn_off[:, 0], orn_off[:, 1], orn_off[:, 2])  # (E,4) world<-cyl
-        z_hat = torch.tensor([0.0, 0.0, 1.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
-        cyl_axis = quat_apply(held_quat_des, z_hat)                          # (E,3)
-
-        # Fingertip target = the exact inverse of the seating in step (4):
-        #   held = (fingertip ∘ flip_z) ∘ inverse(held_rel)   [step (4)]
-        #   =>  fingertip = held ∘ held_rel ∘ flip_z
-        # where held = the desired cylinder BODY pose (center at tip + (H/2)·cyl_axis, orientation
-        # held_quat_des) and held_rel = get_handheld_asset_relative_pose() (which now carries the
-        # fixed grasp TILT). Because held_rel absorbs the grasp tilt, the IK gives the eef/wrist a
-        # DIFFERENT target while the cylinder still seats at held_quat_des (perpendicular to the
-        # surface for the zero-offset pose) — the reset auto-compensates for the grasp tilt. For a
-        # zero tilt (identity held_rel) this reduces EXACTLY to the old
-        # (held_quat_des ∘ flip_z, p_tip + (H - fingerpad)·cyl_axis).
-        H = self.cfg_task.held_asset_cfg.height
-        flip_z_quat = torch.tensor([0.0, 0.0, 1.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
-        zeros3 = torch.zeros((self.num_envs, 3), device=self.device)
-        held_rel_pos, held_rel_quat = self.get_handheld_asset_relative_pose()  # (pos, quat) — tilt-aware
-
-        # Optionally set the grasp's free roll so the EEF x-axis is as parallel as possible to the
-        # travel direction path_dir. CONTROL happens in the EEF frame, so we align the EEF x (not the
-        # peg-tip x). The cylinder is axisymmetric, so its spin about its own axis is a free DOF: we
-        # spin held_quat_des about the peg axis (cyl_axis), which leaves the peg pose (tip position +
-        # tilt) unchanged and rotates the derived EEF orientation (held o held_rel o flip_z) by the
-        # same world rotation. Picking the spin that lands the EEF x's component ⊥ the peg axis on
-        # path_dir maximizes EEF_x · path_dir. With ZERO grasp tilt the EEF x is ⊥ the peg axis, so it
-        # aligns exactly (and equals the peg-tip x); as the grasp PITCH grows the EEF x tilts off that
-        # plane, so the best-aligned EEF x is only as parallel as the pitch allows (residual ≈ the
-        # grasp pitch). cyl_axis is invariant under this spin, so held_center_pos below is unchanged.
-        if self.cfg_task.spawn_align_eef_x_to_path:
-            axis = cyl_axis / torch.linalg.norm(cyl_axis, dim=-1, keepdim=True).clamp_min(1e-8)
-            x_hat = torch.tensor([1.0, 0.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
-            eef_quat0 = torch_utils.quat_mul(                                 # provisional EEF orientation
-                torch_utils.quat_mul(held_quat_des, held_rel_quat), flip_z_quat)
-            eef_x = quat_apply(eef_quat0, x_hat)                             # (E,3) EEF x-axis (world)
-            u = eef_x - (eef_x * axis).sum(-1, keepdim=True) * axis          # EEF x   projected ⊥ axis
-            w = path_dir - (path_dir * axis).sum(-1, keepdim=True) * axis    # path_dir projected ⊥ axis
-            u = u / torch.linalg.norm(u, dim=-1, keepdim=True).clamp_min(1e-8)
-            w = w / torch.linalg.norm(w, dim=-1, keepdim=True).clamp_min(1e-8)
-            cos = (u * w).sum(-1).clamp(-1.0, 1.0)                           # (E,)
-            sin = (torch.cross(u, w, dim=-1) * axis).sum(-1)                 # (E,) signed about axis
-            roll = torch.atan2(sin, cos)                                     # (E,) eef roll to apply
-            held_quat_des = torch_utils.quat_mul(torch_utils.quat_from_angle_axis(roll, axis), held_quat_des)
-
-        held_center_pos = p_tip + 0.5 * H * cyl_axis                          # (E,3) cylinder body origin
-        _q1, _t1 = torch_utils.tf_combine(held_quat_des, held_center_pos, held_rel_quat, held_rel_pos)
-        target_quat_all, target_pos_all = torch_utils.tf_combine(_q1, _t1, flip_z_quat, zeros3)
-
-        # IK the arm to the FIXED fingertip target; reseed the arm for any env that didn't converge
-        # and retry. Targets are NOT re-sampled on retry, so the spawn distribution stays unbiased.
-        # BOUNDED retry (critical): the target is fixed AND the reseed pose is a constant, so a
-        # non-converging env retries the SAME solve deterministically — an unbounded loop would spin
-        # FOREVER on a single env whose target the arm can't reach to 1e-3 (e.g. an unreachable
-        # spawn_align_eef_x_to_path heading under yaw randomization, or a steep grasp-tilt wrist
-        # target). That hangs the WHOLE run at reset before any training step — the sim stays alive
-        # (only omni.datastore GC keeps ticking) and nothing reaches wandb/TB. Cap the attempts and
-        # accept the stragglers' best-effort pose; the reset press-to-contact still settles them.
+        # IK the arm to the fingertip target. On non-convergence we DO NOT let the joint error grow:
+        # instead, mirroring FactoryEnv/ForgeEnv's reset-and-retry strategy, each straggler gets a
+        # completely FRESH spawn — a RE-SAMPLED plate (new board orientation), a rebuilt surface frame +
+        # fingertip target, and its arm RESET to the default pose (clean, known-good seed). A new board
+        # orientation is far more robust than nudging the spawn pose (a single unreachable yaw simply
+        # gets replaced), so the IK converges to the exact target in a couple of attempts. Bounded only
+        # as a safety net.
         bad_envs = env_ids.clone()
         _IK_MAX_ATTEMPTS = 25
         _default_joints = torch.tensor(
@@ -1206,33 +1205,32 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             bad_envs = bad_envs[any_bad.nonzero(as_tuple=False).squeeze(-1)]
             if bad_envs.shape[0] == 0:
                 break
-            # RESEED the stragglers to the default arm pose PLUS random joint noise (growing with the
-            # attempt), so each retry restarts the IK from a DIFFERENT configuration. The fingertip
-            # TARGET is held fixed (unbiased spawn), so reseeding to a CONSTANT pose just retries the
-            # identical deterministic solve — which is why some spawn_align headings never converged
-            # (8% best-effort). The redundant 7-DOF arm can reach almost any EEF heading from SOME
-            # config; noisy restarts let the IK find it and hit the EXACT desired pose (no heading
-            # bias). Mirrors Factory's randomized-retry (which perturbs the target instead).
-            n = bad_envs.shape[0]
+            # RE-SAMPLE the stragglers' plate to a new board orientation, rebuild the surface frame +
+            # fingertip target (spawn pose stays surface-local), then reset their arm to the default
+            # seed so the next IK is a clean re-solve of a fresh, reachable target.
+            self._randomize_plate_pose(bad_envs)
+            self.step_sim_no_action()
+            start, goal, normal, path_dir, cross_dir = self._surface_frame()
+            self.fixed_pos_obs_frame[:] = start
+            target_pos_all, target_quat_all = self._spawn_fingertip_target(
+                pos_off, orn_off, start, path_dir, cross_dir, normal)
             jp = self._robot.data.default_joint_pos[bad_envs].clone()
-            noise = (torch.rand((n, 7), device=self.device) * 2.0 - 1.0) * (0.15 * (1 + _ik_attempt))
-            jp[:, :7] = _default_joints.unsqueeze(0) + noise
+            jp[:, :7] = _default_joints.unsqueeze(0)
             jp[:, 7:] = _gripper_w
             self.ctrl_target_joint_pos[bad_envs, :] = jp
             self._robot.set_joint_position_target(self.ctrl_target_joint_pos[bad_envs], env_ids=bad_envs)
             self._robot.write_joint_state_to_sim(jp, torch.zeros_like(jp), env_ids=bad_envs)
             self._robot.reset()
             self.step_sim_no_action()
-        # Track the count of envs whose reset IK never converged (best-effort spawn). Logged every
-        # step as a "Stats /" metric (next to the GPU/host-memory stats) so it's monitorable in
-        # wandb/TB — normally 0; a spike flags unreachable spawn_align/grasp-tilt headings.
+        # Track the count of envs whose reset IK never converged (best-effort spawn). Logged every step
+        # as a "Stats /" metric (next to the GPU/host-memory stats) so it's monitorable in wandb/TB —
+        # should be ~0 now that a fresh board + default reseed is tried each retry.
         self._reset_ik_nonconverged = int(bad_envs.shape[0])
         if self._reset_ik_nonconverged > 0:
             print(
                 f"[flat_surface] reset IK did not converge for {bad_envs.shape[0]}/{env_ids.shape[0]} "
-                f"env(s) after {_IK_MAX_ATTEMPTS} attempts; accepting best-effort spawn pose (likely an "
-                f"unreachable spawn_align_eef_x_to_path / grasp-tilt heading). Reset press-to-contact "
-                f"still seats them.",
+                f"env(s) after {_IK_MAX_ATTEMPTS} attempts (board re-sample + default reseed); accepting "
+                f"best-effort spawn pose.",
                 flush=True,
             )
 
@@ -1390,7 +1388,14 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             latched_quat[stuck] = press_quat[stuck]
 
         # Hold everything at its latched pose for a few steps so the last-settled envs damp to ~0
-        # velocity before the state is cached / gravity is restored.
+        # velocity before the state is cached / gravity is restored. After each hold step we HARD-ZERO
+        # the arm + held-asset velocities: the descent leaves the peg carrying downward kinetic energy
+        # that otherwise rebounds it off the surface in the first live steps (tripping the
+        # loss-of-contact break). We keep the COMPRESSED press seat (``latched_pos`` leads into the
+        # surface, so it still reads in-contact) and remove ONLY the velocity, so the cached donor
+        # state starts at rest at a genuine in-contact press. The final loop iteration ends on the
+        # zero, so the state read into the efficient-reset cache is velocity-free.
+        zero_root_vel = torch.zeros((self.num_envs, 6), device=self.device)
         for _ in range(3):
             self.generate_ctrl_signals(
                 ctrl_target_fingertip_midpoint_pos=latched_pos,
@@ -1398,6 +1403,10 @@ class FlatSurfaceFollowEnv(ForgeEnv):
                 ctrl_target_gripper_dof_pos=0.0,
             )
             self.step_sim_no_action()
+            self._robot.write_joint_state_to_sim(
+                self._robot.data.joint_pos, torch.zeros_like(self._robot.data.joint_vel)
+            )
+            self._held_asset.write_root_velocity_to_sim(zero_root_vel)
 
     def _reset_contact_mask(self):
         """Per-env in-contact bool that stops the reset press (freshly refreshed).

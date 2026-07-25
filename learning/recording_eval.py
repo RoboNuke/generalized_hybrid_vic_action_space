@@ -495,11 +495,29 @@ def collect_annotated_ranked(
     print(f"[record] annotated-ranked: collecting >= {num_trajectories} trajectories "
           f"({num_episodes} ep x {num_envs} envs), then best/median/worst {rows}x{cols}", flush=True)
 
+    # Per-tile STATUS indicator (drawn bottom-right of each tile): in-progress until the trajectory
+    # ends, then its terminal cause. Determined at termination from is_success + the fragile wrapper's
+    # per-env break flags in env.extras["to_log"].
+    _ST_INPROG, _ST_DONE, _ST_BROKE, _ST_LOST = 0, 1, 2, 3
+    _STATUS_LABEL = {_ST_INPROG: "in-progress", _ST_DONE: "completed",
+                     _ST_BROKE: "broke peg", _ST_LOST: "lost-contact"}
+    _STATUS_COLOR = {_ST_INPROG: (180, 180, 185), _ST_DONE: (60, 200, 90),
+                     _ST_BROKE: (225, 70, 70), _ST_LOST: (240, 160, 50)}
+
+    def _read_flag(info, key):
+        # The fragile wrapper stashes per-env break flags in extras["to_log"], but the reward-
+        # decomposition scorer MOVES them into info["per_env_to_log"] and CLEARS to_log every step —
+        # so read them from the per-step info dict here (reading uenv.extras would see them cleared).
+        petl = info.get("per_env_to_log") if isinstance(info, dict) else None
+        v = petl.get(key) if isinstance(petl, dict) else None
+        return v.detach().cpu().numpy() if v is not None else np.zeros(num_envs)
+
     # Per-trajectory stores, indexed GLOBALLY across episodes (like collect_and_record).
     coll_frames: list[torch.Tensor] = []
     coll_returns: list[float] = []
     coll_term: list[int] = []
     coll_succ: list[bool] = []
+    coll_status: list[int] = []                       # terminal status per trajectory (see _ST_* below)
     coll_fsq: list[np.ndarray] = []; coll_osq: list[np.ndarray] = []
     coll_fN: list[np.ndarray] = [];  coll_ang: list[np.ndarray] = []
     coll_tru: list[np.ndarray] = []; coll_trv: list[np.ndarray] = []
@@ -518,6 +536,7 @@ def collect_annotated_ranked(
             returns = torch.zeros(num_envs, dtype=torch.float32)
             term_step = np.full(num_envs, T - 1, dtype=np.int64)
             success = np.zeros(num_envs, dtype=bool)
+            status = np.full(num_envs, _ST_INPROG, dtype=np.int64)      # terminal status per env
             fsq = np.zeros((num_envs, T), np.float32); osq = np.zeros((num_envs, T), np.float32)
             fN = np.zeros((num_envs, T), np.float32);  ang = np.zeros((num_envs, T), np.float32)
             tru = np.zeros((num_envs, T), np.float32); trv = np.zeros((num_envs, T), np.float32)
@@ -601,6 +620,17 @@ def collect_annotated_ranked(
                     succ = info.get("is_success", None)
                     if isinstance(succ, torch.Tensor):
                         success[idx] = succ.view(-1).bool().cpu().numpy()[idx]
+                    # Terminal status: success -> completed; else the fragile break cause (loss-of-contact
+                    # takes precedence over the force break); a plain time-out leaves it in-progress.
+                    _cl = _read_flag(info, "Fragile / Contact Loss") > 0.5
+                    _pb = _read_flag(info, "Fragile / Peg Break") > 0.5
+                    for e in idx:
+                        if success[e]:
+                            status[e] = _ST_DONE
+                        elif _cl[e]:
+                            status[e] = _ST_LOST
+                        elif _pb[e]:
+                            status[e] = _ST_BROKE
                     env_done[idx] = True
                 state = _resolve_state(env, obs)
                 if env_done.all():
@@ -609,7 +639,7 @@ def collect_annotated_ranked(
             for e in range(num_envs):                                    # harvest this episode's trajectories
                 coll_frames.append(frames[e].clone())
                 coll_returns.append(float(returns[e])); coll_term.append(int(term_step[e]))
-                coll_succ.append(bool(success[e]))
+                coll_succ.append(bool(success[e])); coll_status.append(int(status[e]))
                 coll_fsq.append(fsq[e].copy()); coll_osq.append(osq[e].copy())
                 coll_fN.append(fN[e].copy());   coll_ang.append(ang[e].copy())
                 coll_tru.append(tru[e].copy()); coll_trv.append(trv[e].copy())
@@ -658,15 +688,19 @@ def collect_annotated_ranked(
             di = disp_term[j]; q = min(t, di)                            # freeze finished trajectories (pre-reset)
             frame = coll_frames[j][q].numpy()
             border = (45, 200, 95) if (coll_succ[j] and t >= di) else None
+            # Status indicator (bottom-right): in-progress until the tile freezes, then its terminal cause.
+            _st = coll_status[j] if t >= di else _ST_INPROG
             if overlays:
                 ins = inset_cache[j][min(q // K, len(inset_cache[j]) - 1)]
                 tiles.append(sv.compose_tile(
                     frame, float(coll_fsq[j][q]), float(coll_osq[j][q]), ins, border,
                     force_text=f"{coll_fN[j][q]:.1f}N", orn_text=f"{coll_ang[j][q]:+.0f}°",
                     force_fill=float(coll_fN[j][q] / (2.0 * coll_desforce[j])),
-                    orn_fill=float(coll_ang[j][q] / 30.0)))
+                    orn_fill=float(coll_ang[j][q] / 30.0),
+                    status_label=_STATUS_LABEL[_st], status_color=_STATUS_COLOR[_st]))
             else:
-                tiles.append(frame if border is None else sv.compose_tile(frame, 0, 0, None, border))
+                tiles.append(sv.compose_tile(frame, 0, 0, None, border,
+                                             status_label=_STATUS_LABEL[_st], status_color=_STATUS_COLOR[_st]))
         gframe = sv.montage(tiles, rows, cols)
         if video is None:
             video = np.zeros((Tmax,) + gframe.shape, dtype=np.uint8)
@@ -676,4 +710,158 @@ def collect_annotated_ranked(
     vid_path = write_video(video, vid_base, fps=int(recorder_cfg.fps), fmt=fmt)
     print(f"[record] wrote annotated-ranked video {vid_path} "
           f"({Tmax} frames, {rows}x{cols} of {len(coll_frames)} trajectories)", flush=True)
+    return vid_path
+
+
+def collect_reset_snapshots(
+    *,
+    env: Any,
+    agent: Any,                                 # accepted for call-site symmetry; UNUSED (no policy)
+    recorder_cfg: Any,
+    camera: Any,
+    max_episode_length: int,                    # accepted for symmetry; unused
+    num_trajectories: int,                      # accepted for symmetry; unused
+    output_dir: str,
+    gif_name: str = "initial_conditions.mp4",
+) -> str:
+    """Reset the env ``reset_snapshots_count`` times; for EACH reset HOLD the robot at its spawn
+    fingertip pose (no policy) and step the sim ``reset_snapshots_hold_s`` * fps physics steps,
+    capturing every step — so any INITIAL spawn DYNAMICS (a first-step pop, contact jitter, or slow
+    settle) are visible even though the robot is commanded to stay put. Designed for ONE env per view
+    (set num_envs=1); with >1 env it tiles them.
+
+    The top-down inset ACCUMULATES the peg-tip trace over the held steps: a stable spawn stays a dot on
+    the red-x START, drift/bounce draws a short path. red-x = START, green-o = GOAL. The gauge read-outs
+    show the (near-zero) spawn contact force and the tip height above the surface (mm). The in-scene USD
+    markers (keypoint balls + goal + setpoint) are drawn too. Surface-task only. Returns the mp4 path.
+    """
+    import math
+    from learning import surface_viz as sv
+    from wrappers.recording_grid import write_video
+
+    uenv = env.unwrapped
+    if not hasattr(uenv, "viz_snapshot"):
+        raise RuntimeError("reset_snapshots requires FlatSurfaceFollowEnv (env.viz_snapshot missing).")
+
+    num_envs = int(env.num_envs)
+    overlays = bool(getattr(recorder_cfg, "surface_overlays", True))
+    ball_frac = float(getattr(recorder_cfg, "ball_diameter_frac", 1.0))
+    n_resets = int(getattr(recorder_cfg, "reset_snapshots_count", 8))
+    hold_s = float(getattr(recorder_cfg, "reset_snapshots_hold_s", 1.0))
+    fps = int(recorder_cfg.fps)
+    hold_frames = max(1, int(round(hold_s * fps)))
+    cols = int(math.ceil(math.sqrt(num_envs)))
+    rows = int(math.ceil(num_envs / cols))
+    dt = float(uenv.physics_dt)
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"[record] reset-dynamics: {n_resets} resets x {hold_frames} held steps, "
+          f"{num_envs} env(s) ({rows}x{cols}), robot held at spawn pose", flush=True)
+
+    # env.reset() only re-randomizes ONCE on this env stack; repeated calls are a no-op (the varied
+    # rollouts elsewhere come from mid-episode auto-resets, which route through _reset_idx). So drive a
+    # true fresh spawn each iteration by calling the (monkeypatched) _reset_idx on ALL envs directly.
+    import torch as _torch
+    all_ids = _torch.arange(uenv.num_envs, device=uenv.device)
+
+    markers = goal_marker = pace_marker = None
+    set_camera_active(camera, True)
+    out_frames: list[np.ndarray] = []
+    try:
+        env.reset()                                                    # one-time init reset
+        for r in range(n_resets):
+            uenv._reset_idx(all_ids)                                    # force a fresh full re-randomization
+            uenv._compute_intermediate_values(dt)
+            snap = uenv.viz_snapshot()
+
+            spacing = float(snap["keypoint_spacing"])
+            k = int(snap["keypoints_total"].min().item())
+            radius = spacing * ball_frac / 2.0
+            normal = snap["surface_normal"].numpy()
+            env_origins = uenv.scene.env_origins.detach().cpu().numpy()
+            base = sv.keypoint_world_positions(snap["start_w"], snap["path_dir"], spacing, k)
+            base = base + env_origins[:, None, :]
+            goal_radius = radius * 4.0
+            goal_lift = normal * goal_radius
+            if markers is None:                                          # create USD prims once
+                markers = sv.KeypointBallMarkers("/World/Visuals/surface_keypoints", radius=radius)
+                goal_marker = sv.GoalMarker("/World/Visuals/surface_goal", radius=goal_radius)
+                pace_marker = sv.GoalMarker("/World/Visuals/surface_pace", radius=goal_radius, opacity=0.4)
+            markers.set_positions((base + normal[:, None, :] * radius).reshape(-1, 3))
+            tracker = sv.KeypointStatusTracker(num_envs, k, spacing)     # all keypoints fresh at reset
+            markers.update(tracker.marker_indices())
+            gidx = np.full(num_envs, k - 1)
+            goal_marker.update(base[np.arange(num_envs), gidx] + goal_lift)
+            start_w_env = snap["start_w"].numpy() + env_origins
+            pace_marker.update(start_w_env + snap["s_ref"].numpy()[:, None] * snap["path_dir"].numpy() + goal_lift)
+
+            # Per-env inset frame (fixed for this reset) + spawn tip, for the accumulating trace.
+            start_w = snap["start_w"].numpy(); goal_w = snap["goal_w"].numpy()
+            u_dir = snap["path_dir"].numpy(); v_dir = snap["d_lat"].numpy()
+            center = 0.5 * (start_w + goal_w)
+            su, svv = sv.project_uv(start_w, center, u_dir, v_dir)
+            gu, gvv = sv.project_uv(goal_w, center, u_dir, v_dir)
+            half = 0.5 * snap["path_length"].numpy()
+            tu0, tv0 = sv.project_uv(snap["tip_w"].numpy(), center, u_dir, v_dir)
+
+            # HOLD target = the spawn fingertip pose. Commanding it every step keeps the robot put, so
+            # anything that moves is spawn dynamics (physics), not control.
+            hold_pos = uenv.fingertip_midpoint_pos.clone()
+            hold_quat = uenv.fingertip_midpoint_quat.clone()
+            tr_u = [[float(tu0[e])] for e in range(num_envs)]
+            tr_v = [[float(tv0[e])] for e in range(num_envs)]
+            tr_c = [[bool(snap["in_contact"].numpy()[e])] for e in range(num_envs)]
+            tr_o = [[bool(abs(tu0[e]) <= half[e] and abs(tv0[e]) <= half[e])] for e in range(num_envs)]
+            max_drift = np.zeros(num_envs)
+
+            for s in range(hold_frames):
+                uenv.generate_ctrl_signals(
+                    ctrl_target_fingertip_midpoint_pos=hold_pos,
+                    ctrl_target_fingertip_midpoint_quat=hold_quat,
+                    ctrl_target_gripper_dof_pos=0.0,
+                )
+                uenv.step_sim_no_action()                               # steps physics (+ refreshes state); no render
+                for _ in range(2):                                      # render for the camera (1-frame latency)
+                    uenv.sim.render()
+                try:
+                    camera.update(0.0)
+                except TypeError:
+                    camera.update()
+                rgb = read_camera_rgb(camera)                           # (E,H,W,3) uint8
+                snap = uenv.viz_snapshot()
+                tu, tv = sv.project_uv(snap["tip_w"].numpy(), center, u_dir, v_dir)
+                fsq = snap["force_squash"].numpy(); osq = snap["orn_squash"].numpy()
+                fN = snap["force_N"].numpy(); tipd = snap["tip_surface_dist"].numpy()
+                incontact = snap["in_contact"].numpy()
+
+                tiles = []
+                for e in range(num_envs):
+                    tr_u[e].append(float(tu[e])); tr_v[e].append(float(tv[e]))
+                    tr_c[e].append(bool(incontact[e]))
+                    tr_o[e].append(bool(abs(tu[e]) <= half[e] and abs(tv[e]) <= half[e]))
+                    max_drift[e] = max(max_drift[e], float(np.hypot(tu[e] - tu0[e], tv[e] - tv0[e])))
+                    frame = rgb[e].numpy()
+                    if overlays:
+                        ins = sv.topdown_inset(
+                            np.array(tr_u[e]), np.array(tr_v[e]),
+                            np.array(tr_c[e]), np.array(tr_o[e]),
+                            np.array([su[e], svv[e]]), np.array([gu[e], gvv[e]]),
+                            float(half[e]), float(half[e]))
+                        tiles.append(sv.compose_tile(
+                            frame, float(fsq[e]), float(osq[e]), ins, None,
+                            force_text=f"{fN[e]:.1f}N", orn_text=f"{tipd[e]*1000:.1f}mm",
+                            force_fill=float(max(fN[e], 0.0) / 10.0), orn_fill=0.0))
+                    else:
+                        tiles.append(frame)
+                out_frames.append(sv.montage(tiles, rows, cols))
+            print(f"[record] reset {r + 1}/{n_resets}: spawn tip height (mm) "
+                  f"mean={snap['tip_surface_dist'].numpy().mean()*1000:.1f}  "
+                  f"max in-plane tip drift over hold (mm) = {max_drift.max()*1000:.2f}", flush=True)
+    finally:
+        set_camera_active(camera, False)
+
+    video = np.stack(out_frames)
+    vid_base = os.path.join(output_dir, os.path.splitext(gif_name)[0])
+    vid_path = write_video(video, vid_base, fps=fps, fmt=getattr(recorder_cfg, "video_format", "mp4"))
+    print(f"[record] wrote reset-snapshots video {vid_path} "
+          f"({n_resets} resets x {hold_frames} frames, {rows}x{cols} envs)", flush=True)
     return vid_path

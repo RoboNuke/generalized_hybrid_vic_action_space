@@ -200,13 +200,15 @@ def _paste(dst, src, x, y):
 
 
 def compose_tile(frame, force_squash, orn_squash, inset, border_rgb=None, pad=6,
-                 force_text=None, orn_text=None, force_fill=None, orn_fill=None):
+                 force_text=None, orn_text=None, force_fill=None, orn_fill=None,
+                 status_label=None, status_color=None):
     """One annotated tile: [force gauge | orientation gauge | frame], both gauges on the LEFT, with
     the top-down inset pasted into the frame's bottom-left corner. Gauge COLOUR = squash closeness;
     the FORCE gauge fills from the bottom (force_fill in [0,1], empty at <=0, target tick at desired)
     and the ANGLE gauge fills from the centre (orn_fill in [-1,1], up/down by sign). force_text /
-    orn_text are the physical read-outs. Optional coloured border."""
-    from PIL import Image
+    orn_text are the physical read-outs. Optional coloured border. ``status_label`` (with
+    ``status_color`` RGB) draws a status pill in the frame's BOTTOM-RIGHT corner."""
+    from PIL import Image, ImageDraw, ImageFont
 
     frame = np.asarray(frame, dtype=np.uint8).copy()
     H, W = frame.shape[:2]
@@ -218,6 +220,22 @@ def compose_tile(frame, force_squash, orn_squash, inset, border_rgb=None, pad=6,
         b = 6
         frame[:b, :] = border_rgb; frame[-b:, :] = border_rgb
         frame[:, :b] = border_rgb; frame[:, -b:] = border_rgb
+    if status_label:                                 # status pill in the BOTTOM-RIGHT corner
+        img = Image.fromarray(frame); d = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype("DejaVuSans-Bold.ttf", 22)
+        except Exception:
+            font = ImageFont.load_default()
+        try:
+            tb = d.textbbox((0, 0), status_label, font=font); tw_, th_ = tb[2] - tb[0], tb[3] - tb[1]
+        except Exception:
+            tw_, th_ = d.textsize(status_label, font=font)
+        mx, my = 8, 6
+        bx1, by1 = W - pad, H - pad
+        bx0, by0 = bx1 - tw_ - 2 * mx, by1 - th_ - 2 * my
+        d.rectangle([bx0, by0, bx1, by1], fill=tuple(status_color) if status_color else (180, 180, 185))
+        d.text((bx0 + mx, by0 + my - 2), status_label, fill=(20, 20, 22), font=font)
+        frame = np.asarray(img, dtype=np.uint8)
     fg = draw_gauge(H, force_squash, "F", text=force_text, fill=force_fill, mode="bar", target_frac=0.5)
     og = draw_gauge(H, orn_squash, "A", text=orn_text, fill=orn_fill, mode="center")
     tile = np.concatenate([fg, og, frame], axis=1)

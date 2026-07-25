@@ -104,6 +104,19 @@ class RecorderCfg:
     inset) drawn on the RANKED selection. This is the annotated viz layered on top of best/median/
     worst, rather than an unranked single rollout (``stills_grid``)."""
 
+    reset_snapshots: bool = False
+    """Surface-task diagnostic (mutually exclusive with ``stills_grid`` / ``annotated_ranked``). When
+    True, ``record.py`` resets the env ``reset_snapshots_count`` times and renders ONLY each post-reset
+    INITIAL state (no policy, no physics stepping), holding each for ``reset_snapshots_hold_s`` seconds.
+    All ``num_envs`` are tiled; each inset shows red-x START, green-o GOAL, and a blue dot at the spawn
+    peg tip — a purely-for-inspection clip of the spawn/initial conditions."""
+
+    reset_snapshots_count: int = 8
+    """Number of resets to render for ``reset_snapshots`` (one held frame block per reset)."""
+
+    reset_snapshots_hold_s: float = 1.0
+    """Seconds to hold each reset's initial-state frame on screen (``reset_snapshots``)."""
+
     surface_overlays: bool = True
     """When ``stills_grid`` is on, draw the surface-follow overlays (force/orientation gauges +
     top-down path inset) on each tile. The in-scene keypoint balls are added separately by the

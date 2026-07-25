@@ -685,7 +685,9 @@ def main(argv: list[str] | None = None) -> None:
                 "--record_agent_dir requires sac_cfg.recorder.enabled=true so the recorder "
                 "TiledCamera is injected into the scene (set it in your --overlay record config)."
             )
-        from learning.recording_eval import collect_and_record, collect_annotated_ranked, collect_stills_grid
+        from learning.recording_eval import (
+            collect_and_record, collect_annotated_ranked, collect_stills_grid, collect_reset_snapshots,
+        )
         from wrappers.recording import CAMERA_KEY
 
         rc = 0
@@ -722,7 +724,17 @@ def main(argv: list[str] | None = None) -> None:
             print(f"[record] agent_dir={args.record_agent_dir}  num_trajectories={n_traj}  "
                   f"num_envs={env.num_envs}  max_ep_len={max_ep_len}  out_dir={out_dir}", flush=True)
 
-            if bool(getattr(sac_cfg.recorder, "stills_grid", False)):
+            if bool(getattr(sac_cfg.recorder, "reset_snapshots", False)):
+                gif_path = collect_reset_snapshots(
+                    env=env,
+                    agent=agent,
+                    recorder_cfg=sac_cfg.recorder,
+                    camera=camera,
+                    max_episode_length=max_ep_len,
+                    num_trajectories=int(n_traj),
+                    output_dir=out_dir,
+                )
+            elif bool(getattr(sac_cfg.recorder, "stills_grid", False)):
                 gif_path = collect_stills_grid(
                     env=env,
                     agent=agent,

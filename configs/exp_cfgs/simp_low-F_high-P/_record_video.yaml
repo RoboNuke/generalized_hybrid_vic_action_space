@@ -33,6 +33,13 @@ runner_cfg:
     task.terminate_on_success: false
     task.force_desired_min: 5.0
     task.force_desired_max: 5.0
+    # New initial state: spawn the peg 1 mm above the plate (no reset press) with a small in-plane
+    # spawn noise. Informative (not perfect) — shows how the trained policy handles a not-pre-seated,
+    # slightly-jittered start.
+    task.reset_press_to_contact: false
+    task.spawn_tip_pos_mean: [0.0, 0.0, 0.0005]   # 0.5mm above the plate
+    task.spawn_tip_pos_std: [0.001, 0.001, 0.0]
+    task.keypoint_track_tol: 0.005                # 5mm on-track gate
 
 sac_cfg:
   recorder:
@@ -41,7 +48,9 @@ sac_cfg:
     surface_overlays: true         # keypoint balls + force/orientation gauges + top-down path inset
     ball_diameter_frac: 1.0        # diameter = keypoint spacing (enlarged for legibility)
     video_format: mp4
-    num_trajectories: 48           # collect 48, select best-4/median-4/worst-4
+    num_trajectories: 24           # = num_envs -> ONE episode, so every trajectory is a FRESH spawn.
+                                   # (env.reset() only re-randomizes on its first call; a 2nd episode
+                                   # would start from stale end-of-episode-1 states -> garbage worst tiles.)
     # Render/quality settings from _record.yaml:
     width: 560                     # per-tile RGB width  (2.5x of 240, 4:3 preserved)
     height: 720                    # per-tile RGB height (2.5x of 180, 4:3 preserved)
