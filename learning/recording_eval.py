@@ -632,10 +632,18 @@ def collect_annotated_ranked(
     # Render the FULL episode length (not just up to the longest selected trajectory) so every video
     # is the same task-length clip; trajectories that ended early freeze at their last frame (q below).
     Tmax = T
+    # Freeze/trim index: a trajectory that ends at step `coll_term[j]` (fragile break, loss-of-contact,
+    # or time-out) has that FINAL captured frame/snapshot contaminated — Isaac Lab resets the env
+    # in-step on terminated|truncated, so the camera + viz_snapshot at `coll_term[j]` already show the
+    # POST-reset state (fresh random plate yaw, tip back at the start). Left in, it renders as a tile
+    # that "jumps mid-plate" / freezes on a rotated frame. Freeze one frame earlier so the tile holds
+    # its last clean pre-reset state instead. (Costs at most one frame off a trajectory that never
+    # reset, which is imperceptible.)
+    disp_term = {j: max(0, int(coll_term[j]) - 1) for j in sel}
     inset_cache: dict[int, list] = {}
     if overlays:
         for j in sel:
-            di = int(coll_term[j]); cache = []
+            di = disp_term[j]; cache = []
             for tt in range(0, di + 1, K):
                 cache.append(sv.topdown_inset(
                     coll_tru[j][: tt + 1], coll_trv[j][: tt + 1], coll_trc[j][: tt + 1], coll_tro[j][: tt + 1],
@@ -647,7 +655,7 @@ def collect_annotated_ranked(
     for t in range(Tmax):
         tiles = []
         for j in sel:
-            di = int(coll_term[j]); q = min(t, di)                       # freeze finished trajectories
+            di = disp_term[j]; q = min(t, di)                            # freeze finished trajectories (pre-reset)
             frame = coll_frames[j][q].numpy()
             border = (45, 200, 95) if (coll_succ[j] and t >= di) else None
             if overlays:
