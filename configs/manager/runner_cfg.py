@@ -272,6 +272,13 @@ class RunnerCfg:
     (``sensor_cfg.contact.enabled=True``, which populates ``env.in_contact``). Independent of
     :attr:`break_force` — works even with an unbreakable peg (``break_force=-1``)."""
 
+    require_contact_grace_steps: int = 5
+    """Grace period (in env steps) at the start of each episode during which the loss-of-contact
+    break (:attr:`require_contact_enabled`) is suppressed, so the reset-press rebound / contact
+    vibration can settle before it can terminate. The earliest loss-of-contact failure is step
+    ``grace + 1`` (default 5 -> earliest failure at step 6). 0 disables the grace. Applies ONLY to
+    the loss-of-contact mode; the force break (:attr:`break_force`) is unaffected."""
+
     efficient_reset_enabled: bool = False
     """Use the efficient per-env reset (Forge / Factory / AutoMate-Assembly only). Installs
     :class:`~wrappers.sensors.efficient_reset_wrapper.EfficientResetWrapper`, which on a PARTIAL

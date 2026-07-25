@@ -685,6 +685,7 @@ def build_env(
             break_force=runner_cfg.break_force,
             direction_break_force=runner_cfg.direction_break_force,
             require_contact=runner_cfg.require_contact_enabled,
+            require_contact_grace_steps=runner_cfg.require_contact_grace_steps,
             num_agents=runner_cfg.num_agents,
         )
         _mode = (

@@ -26,7 +26,10 @@ force break — works even with an unbreakable peg): once an env has been in con
 ``env.in_contact`` reads True on any axis) at least once this episode, dropping out of contact on
 ALL axes terminates it as if the peg broke. The check ARMS only after first contact (the peg
 spawns above the surface and must descend first); the per-env "has contacted" latch resets each
-episode. Requires the contact-sensor wrapper (it populates ``env.in_contact``).
+episode. Requires the contact-sensor wrapper (it populates ``env.in_contact``). A configurable
+``require_contact_grace_steps`` (default 5) suppresses this break for the first N steps of each
+episode so the reset-press rebound / contact vibration can settle before it can terminate — the
+earliest loss-of-contact failure is step N+1 (the force break is unaffected by the grace).
 
 This wrapper only adds termination (no extra reward term — breaking just ends the episode): it
 monkeypatches the unwrapped env's ``_get_dones`` to OR a force-violation mask into the
@@ -71,6 +74,7 @@ class FragileObjectWrapper(gym.Wrapper):
         break_force,
         direction_break_force: bool = False,
         require_contact: bool = False,
+        require_contact_grace_steps: int = 5,
         num_agents: int = 1,
     ) -> None:
         super().__init__(env)
@@ -81,6 +85,14 @@ class FragileObjectWrapper(gym.Wrapper):
         self.num_agents = int(num_agents)
         self.direction_break_force = bool(direction_break_force)
         self.require_contact = bool(require_contact)
+        # Loss-of-contact grace: suppress the loss-of-contact break for the first
+        # `require_contact_grace_steps` steps of each episode so the reset-press rebound / contact
+        # vibration can settle before the check can terminate. episode_length_buf is incremented
+        # BEFORE _get_dones (direct_rl_env.step) and reset to 0 per-env on reset, so it reads 1 on
+        # the first step; suppressing buf <= grace lets the break first fire at step grace+1
+        # (grace=5 -> earliest loss-of-contact failure at step 6). 0 disables the grace. Applies
+        # ONLY to the loss-of-contact mode; the force break is unaffected.
+        self.require_contact_grace_steps = int(require_contact_grace_steps)
 
         if self.direction_break_force:
             shear, normal = float(break_force[0]), float(break_force[1])
@@ -180,9 +192,14 @@ class FragileObjectWrapper(gym.Wrapper):
         for a just-reset env, already reflects its post-reset out-of-contact spawn state).
         """
         in_contact_any = self.unwrapped.in_contact.any(dim=1)          # (E,) bool
-        # Arm the latch on (and including) the first contact.
+        # Arm the latch on (and including) the first contact — always, even during the grace window,
+        # so "has contacted this episode" stays correct; the grace only gates TERMINATION below.
         self._has_contacted = torch.logical_or(self._has_contacted, in_contact_any)
         violations = torch.logical_and(self._has_contacted, torch.logical_not(in_contact_any))
+        if self.require_contact_grace_steps > 0:
+            # No loss-of-contact break until buf > grace (earliest failure at step grace+1).
+            past_grace = self.unwrapped.episode_length_buf > self.require_contact_grace_steps
+            violations = torch.logical_and(violations, past_grace)
         return violations, {"Fragile / Contact Loss": violations.float()}
 
     def _wrapped_get_dones(self):
