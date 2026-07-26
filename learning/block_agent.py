@@ -689,7 +689,11 @@ class BlockAgent(Agent):
                             # Frontier: furthest any single rollout dragged (peak over the interval's
                             # finishing envs). The " (max)" suffix makes write_tracking_data reduce by
                             # max across the interval, so this is the true best rollout, not an average.
-                            if metric in ("keypoints_achieved", "keypoints_passed"):
+                            if metric in (
+                                "keypoints_achieved", "keypoints_passed",
+                                "keypoints_passed_off_contact", "keypoints_passed_off_track",
+                                "keypoints_passed_off_both",
+                            ):
                                 self._accum_scalar(i, f"drag_performance/{metric} (max)", vals.max())
 
             # Success-conditional per-episode stats: the dict key IS the full tag (e.g.

@@ -75,6 +75,7 @@ class FragileObjectWrapper(gym.Wrapper):
         direction_break_force: bool = False,
         require_contact: bool = False,
         require_contact_grace_steps: int = 5,
+        require_contact_debounce_steps: int = 3,
         num_agents: int = 1,
     ) -> None:
         super().__init__(env)
@@ -93,6 +94,13 @@ class FragileObjectWrapper(gym.Wrapper):
         # (grace=5 -> earliest loss-of-contact failure at step 6). 0 disables the grace. Applies
         # ONLY to the loss-of-contact mode; the force break is unaffected.
         self.require_contact_grace_steps = int(require_contact_grace_steps)
+        # Loss-of-contact DEBOUNCE: the peg must read out-of-contact on ALL axes for this many
+        # CONSECUTIVE steps before it counts as a contact-loss break, so a single-step sensor blip /
+        # bounce doesn't end the episode (the peg gets a chance to re-seat). Default 3. A value of 1
+        # is the old behaviour (any single off-contact step breaks). The per-env consecutive
+        # out-of-contact streak resets to 0 the moment contact is re-made (or on episode reset).
+        self.require_contact_debounce_steps = max(1, int(require_contact_debounce_steps))
+        self._ooc_streak = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
         if self.direction_break_force:
             shear, normal = float(break_force[0]), float(break_force[1])
@@ -122,6 +130,9 @@ class FragileObjectWrapper(gym.Wrapper):
         self._original_get_dones = None
         self._wrapper_initialized = False
         self._last_violations = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # Per-episode metric payload built in _wrapped_get_dones, merged into the env's
+        # per_env_episode_stat channel in step() (block_agent averages it over FINISHED episodes).
+        self._ep_stats: dict | None = None
 
         if hasattr(self.unwrapped, "extras") and "to_log" not in self.unwrapped.extras:
             self.unwrapped.extras["to_log"] = {}
@@ -153,16 +164,25 @@ class FragileObjectWrapper(gym.Wrapper):
             raise RuntimeError("[fragile] env has no _get_dones to wrap.")
         self._original_get_dones = self.unwrapped._get_dones
         self.unwrapped._get_dones = self._wrapped_get_dones
+        # Expose the break threshold(s) on the unwrapped env so the surface recorder can scale its
+        # force bar so the TOP is the (normal-axis) break force. In magnitude mode there is one
+        # scalar threshold on the total force; the normal component can't exceed it, so it doubles as
+        # the normal-axis cap. In directional mode the normal axis has its own threshold.
+        self.unwrapped.is_fragile = bool(self._fragile)
+        if self._fragile:
+            self.unwrapped.fragile_normal_break_force = (
+                self.normal_force if self.direction_break_force else self.break_force
+            )
+            if self.direction_break_force:
+                self.unwrapped.fragile_shear_break_force = self.shear_force
         self._wrapper_initialized = True
 
     # ----------------------------------------------------------------- dones
     def _compute_violations(self):
-        """Per-env FORCE break mask (and per-cause log breakdown) for the smoothed contact force.
+        """Per-env FORCE break masks for the smoothed contact force: (total, normal, shear).
 
-        The combined "Fragile / Peg Break" total (all causes) is emitted by the caller.
-        """
+        In magnitude mode ``normal``/``shear`` are None (no directional breakdown)."""
         force = self.unwrapped.force_sensor_smooth[:, :3]  # (E,3) world-frame force
-        to_log = {}
         if self.direction_break_force:
             # Peg long axis in WORLD frame: held body's local +z rotated by held_quat. Unit by
             # construction (held_quat is a unit quaternion); renormalize for numerical safety.
@@ -176,15 +196,13 @@ class FragileObjectWrapper(gym.Wrapper):
             normal_violation = axial_mag >= self.normal_force
             shear_violation = shear_mag >= self.shear_force
             violations = torch.logical_or(normal_violation, shear_violation)
-            to_log["Fragile / Break Normal"] = normal_violation.float()
-            to_log["Fragile / Break Shear"] = shear_violation.float()
-        else:
-            force_mag = torch.linalg.norm(force, dim=1)
-            violations = force_mag >= self.break_force
-        return violations, to_log
+            return violations, normal_violation, shear_violation
+        force_mag = torch.linalg.norm(force, dim=1)
+        violations = force_mag >= self.break_force
+        return violations, None, None
 
     def _contact_loss_violations(self):
-        """Per-env loss-of-contact break mask (and log series).
+        """Per-env loss-of-contact break mask.
 
         Arms per env only after its first in-contact reading this episode; once armed, dropping
         out of contact on every axis is a break. ``env.in_contact`` is the contact-sensor
@@ -195,58 +213,96 @@ class FragileObjectWrapper(gym.Wrapper):
         # Arm the latch on (and including) the first contact — always, even during the grace window,
         # so "has contacted this episode" stays correct; the grace only gates TERMINATION below.
         self._has_contacted = torch.logical_or(self._has_contacted, in_contact_any)
-        violations = torch.logical_and(self._has_contacted, torch.logical_not(in_contact_any))
+        armed_and_out = torch.logical_and(self._has_contacted, torch.logical_not(in_contact_any))
+        # Consecutive out-of-contact streak: +1 while armed AND out of contact, reset to 0 the moment
+        # contact is re-made (or not yet armed). A break counts only once the streak reaches the
+        # debounce length, so a transient one-step blip is tolerated and can re-seat.
+        self._ooc_streak = torch.where(
+            armed_and_out, self._ooc_streak + 1, torch.zeros_like(self._ooc_streak)
+        )
+        violations = self._ooc_streak >= self.require_contact_debounce_steps
         if self.require_contact_grace_steps > 0:
             # No loss-of-contact break until buf > grace (earliest failure at step grace+1).
             past_grace = self.unwrapped.episode_length_buf > self.require_contact_grace_steps
             violations = torch.logical_and(violations, past_grace)
-        return violations, {"Fragile / Contact Loss": violations.float()}
+        return violations
 
     def _wrapped_get_dones(self):
         terminated, time_out = self._original_get_dones()
         if not self._active:
+            self._ep_stats = None
             return terminated, time_out
 
-        # Clear the "has contacted" latch for envs that were reset at the end of the PREVIOUS
-        # step (they start the new episode out of contact and must re-arm on fresh contact).
+        # Clear the "has contacted" latch AND the out-of-contact streak for envs that were reset at
+        # the end of the PREVIOUS step (they start the new episode out of contact and must re-arm).
         self._has_contacted = torch.logical_and(
             self._has_contacted, torch.logical_not(self._reset_mask)
         )
+        self._ooc_streak = torch.where(
+            self._reset_mask, torch.zeros_like(self._ooc_streak), self._ooc_streak
+        )
 
-        violations = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        to_log = {}
+        z = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        violations = z
+        normal_violation = shear_violation = None
+        contact_violations = z
         if self._fragile:
-            force_violations, force_log = self._compute_violations()
+            force_violations, normal_violation, shear_violation = self._compute_violations()
             violations = torch.logical_or(violations, force_violations)
-            to_log.update(force_log)
         if self.require_contact:
-            contact_violations, contact_log = self._contact_loss_violations()
+            contact_violations = self._contact_loss_violations()
             violations = torch.logical_or(violations, contact_violations)
-            to_log.update(contact_log)
-
-        # Total break rate (all causes) -> the headline "Peg Break" series; per-cause tags above.
-        to_log["Fragile / Peg Break"] = violations.float()
         self._last_violations = violations
+
+        # PER-EPISODE metrics (NOT per-step): each entry is averaged by block_agent over the episodes
+        # that FINISH this step (mask = env.reset_buf, NaN-skipped) via per_env_episode_stat, merged in
+        # step(). A break fires on the episode's TERMINAL step, so the 0/1 flag over finishing episodes
+        # is the per-episode break RATE, and `episode_length_buf` at the break is the step it happened
+        # (NaN elsewhere -> the "... step" tags average the step ONLY over episodes of that cause).
+        buf = self.unwrapped.episode_length_buf.float()
+        nan = torch.full_like(buf, float("nan"))
+        ep = {
+            "Fragile / Peg Break": violations.float(),
+            "Fragile / Peg Break step": torch.where(violations, buf, nan),
+        }
+        if self.require_contact:
+            ep["Fragile / Contact Loss"] = contact_violations.float()
+            ep["Fragile / Contact Loss step"] = torch.where(contact_violations, buf, nan)
+        if self._fragile and self.direction_break_force:
+            ep["Fragile / Break Normal"] = normal_violation.float()
+            ep["Fragile / Break Shear"] = shear_violation.float()
+            ep["Fragile / Break Normal step"] = torch.where(normal_violation, buf, nan)
+            ep["Fragile / Break Shear step"] = torch.where(shear_violation, buf, nan)
+        self._ep_stats = ep
+
         terminated = torch.logical_or(terminated, violations)
         # Envs reset at the end of THIS step (DirectRLEnv resets terminated|time_out in-step);
         # remember them so their contact latch clears next step.
         self._reset_mask = torch.logical_or(terminated, time_out)
-        if hasattr(self.unwrapped, "extras"):
-            # Per-env break flags -> mean-reduced by the scorer to per-step break rates.
-            self.unwrapped.extras.setdefault("to_log", {}).update(to_log)
         return terminated, time_out
 
     # ------------------------------------------------------------------ gym
     def step(self, action):
         if not self._wrapper_initialized and hasattr(self.unwrapped, "_robot"):
             self._initialize_wrapper()
-        return super().step(action)
+        out = super().step(action)
+        # Merge the per-episode fragile metrics (built in _wrapped_get_dones during the inner step)
+        # into the env's per_env_episode_stat channel. block_agent averages these over the episodes
+        # that finished this step (mask = reset_buf) -> per-episode break rates + average break step.
+        ep = self._ep_stats
+        if ep and isinstance(out[-1], dict):
+            info = out[-1]
+            info.setdefault("per_env_episode_stat", {}).update(ep)
+            info.setdefault("per_env_episode_stat_mask", self.unwrapped.reset_buf.clone())
+        self._ep_stats = None
+        return out
 
     def reset(self, **kwargs):
         out = super().reset(**kwargs)
-        # A full reset re-spawns every env out of contact — clear the loss-of-contact latch so
-        # the check re-arms only on fresh contact (per-env done resets are handled in _get_dones).
+        # A full reset re-spawns every env out of contact — clear the loss-of-contact latch + streak
+        # so the check re-arms only on fresh contact (per-env done resets are handled in _get_dones).
         self._has_contacted.zero_()
+        self._ooc_streak.zero_()
         self._reset_mask.zero_()
         if not self._wrapper_initialized and hasattr(self.unwrapped, "_robot"):
             self._initialize_wrapper()

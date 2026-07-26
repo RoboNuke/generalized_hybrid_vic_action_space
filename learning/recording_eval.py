@@ -279,6 +279,9 @@ def collect_stills_grid(
     orn_sq = np.zeros((num_envs, T), dtype=np.float32)
     force_N = np.zeros((num_envs, T), dtype=np.float32)       # gauge read-out: measured force (N)
     angle_dev = np.zeros((num_envs, T), dtype=np.float32)     # gauge read-out: deg off desired angle
+    shear_N = np.zeros((num_envs, T), dtype=np.float32)       # read-out: shear force (N)
+    cross_m = np.zeros((num_envs, T), dtype=np.float32)       # read-out: cross-track error (m)
+    pace_ms = np.zeros((num_envs, T), dtype=np.float32)       # read-out: along-track speed (m/s)
     tr_u = np.zeros((num_envs, T), dtype=np.float32)
     tr_v = np.zeros((num_envs, T), dtype=np.float32)
     tr_c = np.zeros((num_envs, T), dtype=bool)
@@ -288,7 +291,7 @@ def collect_stills_grid(
     env_done = np.zeros(num_envs, dtype=bool)
 
     markers = None
-    tracker = None
+    cur_status = cur_setpoint = None   # keypoint status/goal read from the env snapshot (authoritative)
     const = {}  # per-env plate constants for the inset (filled at t=0)
     cur_s_ref = np.zeros(num_envs, dtype=np.float32)  # latest time-based pace arc length (for pace marker)
 
@@ -297,9 +300,9 @@ def collect_stills_grid(
     state = _resolve_state(env, obs)
     try:
         for t in range(T):
-            if markers is not None:                                  # colour balls from status so far
-                markers.update(tracker.marker_indices())
-                gidx = np.clip(tracker.setpoint_idx - 1, 0, k - 1)   # current goal keypoint per env
+            if markers is not None:                                  # colour balls from the env's status so far
+                markers.update(cur_status[:, :k].reshape(-1).astype(np.int64))
+                gidx = np.clip(cur_setpoint - 1, 0, k - 1)           # current goal keypoint per env
                 goal_marker.update(base[np.arange(num_envs), gidx] + goal_lift)
                 pace_marker.update(start_w_env + cur_s_ref[:, None] * path_dir_np + goal_lift)
             actions, _ = agent.act(obs, state, timestep=10**9, timesteps=10**9)
@@ -329,8 +332,12 @@ def collect_stills_grid(
                 pace_marker = sv.GoalMarker("/World/Visuals/surface_pace", radius=goal_radius, opacity=0.4)
                 start_w_env = snap["start_w"].numpy() + env_origins          # (E,3) path start, on surface
                 path_dir_np = snap["path_dir"].numpy()                       # (E,3)
-                tracker = sv.KeypointStatusTracker(num_envs, k, spacing)
+                kpst = np.zeros((num_envs, T, k), dtype=np.uint8)             # per-frame keypoint status (minimap)
                 des_force = np.maximum(snap["desired_force_N"].numpy(), 1e-6)  # (E,) force-gauge scale
+                track_tol = float(snap["keypoint_track_tol"])
+                v_des = float(snap["desired_speed"])
+                bf_t = snap.get("break_force_N")                             # present only when the peg is fragile
+                break_force = bf_t.numpy() if bf_t is not None else None
                 # Plate frame per env for the top-down inset.
                 start_w = snap["start_w"].numpy(); goal_w = snap["goal_w"].numpy()
                 u_dir = snap["path_dir"].numpy(); v_dir = snap["d_lat"].numpy()
@@ -340,6 +347,7 @@ def collect_stills_grid(
                 half = 0.5 * snap["path_length"].numpy()             # square plate: half_u == half_v
                 const = dict(center=center, u=u_dir, v=v_dir, start_uv=np.stack([su, svv], 1),
                              goal_uv=np.stack([gu, gvv], 1), half=half)
+                kp_uv = _keypoint_uv(const["start_uv"], const["goal_uv"], half, spacing, k)   # (E,k,2)
 
             # tip projection for the inset trace
             tu, tv = sv.project_uv(snap["tip_w"].numpy(), const["center"], const["u"], const["v"])
@@ -349,6 +357,9 @@ def collect_stills_grid(
             orn_sq[alive, t] = snap["orn_squash"].numpy()[alive]
             force_N[alive, t] = snap["force_N"].numpy()[alive]
             angle_dev[alive, t] = snap["angle_dev_deg"].numpy()[alive]
+            shear_N[alive, t] = snap["shear_force_N"].numpy()[alive]
+            cross_m[alive, t] = snap["cross_track"].numpy()[alive]
+            pace_ms[alive, t] = snap["along_track_speed"].numpy()[alive]
             tr_u[alive, t] = tu[alive]; tr_v[alive, t] = tv[alive]
             tr_c[alive, t] = snap["in_contact"].numpy()[alive]
             tr_o[alive, t] = over[alive]
@@ -357,7 +368,9 @@ def collect_stills_grid(
                 frames[torch.from_numpy(alive_idx), t] = rgb[torch.from_numpy(alive_idx)]
 
             cur_s_ref = snap["s_ref"].numpy()                        # for next step's pace-marker update
-            tracker.update(snap["progress"].numpy(), snap["in_contact"].numpy())
+            cur_status = snap["keypoint_status"].numpy()            # authoritative env status after this step
+            cur_setpoint = snap["setpoint_kp_idx"].numpy()
+            kpst[:, t, :] = cur_status[:, :k]
 
             term_now = _coerce_done(terminated).cpu().numpy()
             trunc_now = _coerce_done(truncated).cpu().numpy()
@@ -385,14 +398,19 @@ def collect_stills_grid(
             inset = sv.topdown_inset(
                 tr_u[e, : di + 1], tr_v[e, : di + 1], tr_c[e, : di + 1], tr_o[e, : di + 1],
                 const["start_uv"][e], const["goal_uv"][e], float(const["half"][e]), float(const["half"][e]),
+                keypoint_uv=kp_uv[e], keypoint_status=kpst[e, di],
             )
         border = (45, 200, 95) if success[e] else None
         if overlays:
+            ffill, ftf = _force_bar(float(force_N[e, di]), float(des_force[e]),
+                                    None if break_force is None else float(break_force[e]))
+            readouts = _build_readouts(force_sq[e, di], force_N[e, di], shear_N[e, di], des_force[e],
+                                       pace_ms[e, di], v_des, cross_m[e, di], track_tol)
             tiles.append(sv.compose_tile(
                 frame, float(force_sq[e, di]), float(orn_sq[e, di]), inset, border,
                 force_text=f"{force_N[e, di]:.1f}N", orn_text=f"{angle_dev[e, di]:+.0f}°",
-                force_fill=float(force_N[e, di] / (2.0 * des_force[e])),
-                orn_fill=float(angle_dev[e, di] / 30.0)))
+                force_fill=ffill, orn_fill=float(angle_dev[e, di] / 30.0),
+                force_target_frac=ftf, readouts=readouts))
         else:
             tiles.append(frame if border is None else sv.compose_tile(frame, 0, 0, None, border))
 
@@ -422,7 +440,8 @@ def collect_stills_grid(
                     cache.append(sv.topdown_inset(
                         tr_u[e, : tt + 1], tr_v[e, : tt + 1], tr_c[e, : tt + 1], tr_o[e, : tt + 1],
                         const["start_uv"][e], const["goal_uv"][e],
-                        float(const["half"][e]), float(const["half"][e])))
+                        float(const["half"][e]), float(const["half"][e]),
+                        keypoint_uv=kp_uv[e], keypoint_status=kpst[e, tt]))
             inset_cache.append(cache or [None])
 
         video = None
@@ -435,11 +454,15 @@ def collect_stills_grid(
                 border = (45, 200, 95) if (success[e] and t >= di) else None
                 if overlays:
                     ins = inset_cache[e][min(q // K, len(inset_cache[e]) - 1)]
+                    ffill, ftf = _force_bar(float(force_N[e, q]), float(des_force[e]),
+                                            None if break_force is None else float(break_force[e]))
+                    readouts = _build_readouts(force_sq[e, q], force_N[e, q], shear_N[e, q], des_force[e],
+                                               pace_ms[e, q], v_des, cross_m[e, q], track_tol)
                     tiles_t.append(sv.compose_tile(
                         frame, float(force_sq[e, q]), float(orn_sq[e, q]), ins, border,
                         force_text=f"{force_N[e, q]:.1f}N", orn_text=f"{angle_dev[e, q]:+.0f}°",
-                        force_fill=float(force_N[e, q] / (2.0 * des_force[e])),
-                        orn_fill=float(angle_dev[e, q] / 30.0)))
+                        force_fill=ffill, orn_fill=float(angle_dev[e, q] / 30.0),
+                        force_target_frac=ftf, readouts=readouts))
                 else:
                     tiles_t.append(frame if border is None else sv.compose_tile(frame, 0, 0, None, border))
             gframe = sv.montage(tiles_t, rows, cols)
@@ -453,6 +476,52 @@ def collect_stills_grid(
             out_path = vid_path  # nothing else written; return the mp4 path
 
     return out_path
+
+
+def _build_readouts(force_sq, fN, shr, desF, pac, vdes, xtr, tol):
+    """Four raw-value read-out lines for the bottom-right of a tile, each coloured green->red by how
+    close it is to ideal: current normal force, current shear force, along-track pace, cross-track
+    error. Returns a list of ``(text, rgb)`` for ``surface_viz.compose_tile(readouts=...)``.
+
+    Closeness: normal force reuses the reward's force squash; shear is ideal at 0 (scaled by the
+    desired normal force); pace is ideal at the desired speed; cross-track is ideal at 0 (scaled by
+    the keypoint on-track tolerance)."""
+    from learning import surface_viz as sv
+
+    ref_shear = max(float(desF), 1.0)
+    shear_close = float(np.clip(1.0 - abs(float(shr)) / ref_shear, 0.0, 1.0))
+    vdes_ = max(float(vdes), 1e-6)
+    pace_close = float(np.clip(1.0 - abs(float(pac) - float(vdes)) / vdes_, 0.0, 1.0))
+    tol_ = max(float(tol), 1e-6)
+    xtr_close = float(np.clip(1.0 - abs(float(xtr)) / tol_, 0.0, 1.0))
+    return [
+        (f"N: {float(fN):.1f}N",            sv.closeness_color(float(force_sq))),
+        (f"Shear: {float(shr):.1f}N",       sv.closeness_color(shear_close)),
+        (f"Pace: {float(pac) * 100:.1f}cm/s", sv.closeness_color(pace_close)),
+        (f"XTrk: {float(xtr) * 1000:+.0f}mm", sv.closeness_color(xtr_close)),
+    ]
+
+
+def _force_bar(fN, desF, break_force):
+    """Force-bar fill fraction + yellow-tick fraction. Fragile peg (break_force given): the bar TOP
+    is the break force and the yellow tick marks the desired force (off-centre). Non-fragile: legacy
+    scaling with the desired force at mid-bar. Returns ``(fill, target_frac)`` both in [0, 1]-ish."""
+    desF = max(float(desF), 1e-6)
+    if break_force is not None and float(break_force) > 1e-6:
+        brk = float(break_force)
+        return float(fN) / brk, desF / brk
+    return float(fN) / (2.0 * desF), 0.5
+
+
+def _keypoint_uv(start_uv, goal_uv, half, spacing, k):
+    """Per-env keypoint positions in plate (u, v) coordinates: keypoint j (1..k) sits at arc length
+    j*spacing along the start->goal segment. Returns ``(E, k, 2)``."""
+    start_uv = np.asarray(start_uv, dtype=np.float64)          # (E,2)
+    goal_uv = np.asarray(goal_uv, dtype=np.float64)            # (E,2)
+    L = np.maximum(2.0 * np.asarray(half, dtype=np.float64), 1e-6)   # (E,) path length
+    js = np.arange(1, k + 1, dtype=np.float64)                 # (k,)
+    frac = np.clip((js[None, :] * float(spacing)) / L[:, None], 0.0, 1.0)   # (E,k)
+    return start_uv[:, None, :] + frac[:, :, None] * (goal_uv - start_uv)[:, None, :]
 
 
 def collect_annotated_ranked(
@@ -505,11 +574,11 @@ def collect_annotated_ranked(
                      _ST_BROKE: (225, 70, 70), _ST_LOST: (240, 160, 50)}
 
     def _read_flag(info, key):
-        # The fragile wrapper stashes per-env break flags in extras["to_log"], but the reward-
-        # decomposition scorer MOVES them into info["per_env_to_log"] and CLEARS to_log every step —
-        # so read them from the per-step info dict here (reading uenv.extras would see them cleared).
-        petl = info.get("per_env_to_log") if isinstance(info, dict) else None
-        v = petl.get(key) if isinstance(petl, dict) else None
+        # The fragile wrapper publishes its per-env break flags in info["per_env_episode_stat"] (the
+        # per-episode channel). At an env's terminal step that env's flag is 1 iff it ended in this
+        # break cause, so reading it here for the just-finished env gives the terminal status.
+        pes = info.get("per_env_episode_stat") if isinstance(info, dict) else None
+        v = pes.get(key) if isinstance(pes, dict) else None
         return v.detach().cpu().numpy() if v is not None else np.zeros(num_envs)
 
     # Per-trajectory stores, indexed GLOBALLY across episodes (like collect_and_record).
@@ -524,6 +593,11 @@ def collect_annotated_ranked(
     coll_trc: list[np.ndarray] = []; coll_tro: list[np.ndarray] = []
     coll_start_uv: list[np.ndarray] = []; coll_goal_uv: list[np.ndarray] = []
     coll_half: list[float] = [];     coll_desforce: list[float] = []
+    coll_shr: list[np.ndarray] = []; coll_xtr: list[np.ndarray] = []      # shear force (N), cross-track (m)
+    coll_pac: list[np.ndarray] = []; coll_kpst: list[np.ndarray] = []     # along-track speed (m/s), per-frame kp status
+    coll_kp_uv: list[np.ndarray] = []                                     # (k,2) keypoint plate positions
+    coll_break: list = []                                                 # per-traj normal break force (N) or None
+    coll_tol: list[float] = [];      coll_vdes: list[float] = []          # on-track tol (m), desired speed (m/s)
 
     # In-scene markers persist across episodes; positions/colours are re-set each reset.
     markers = goal_marker = pace_marker = None
@@ -541,15 +615,17 @@ def collect_annotated_ranked(
             fN = np.zeros((num_envs, T), np.float32);  ang = np.zeros((num_envs, T), np.float32)
             tru = np.zeros((num_envs, T), np.float32); trv = np.zeros((num_envs, T), np.float32)
             trc = np.zeros((num_envs, T), bool);       tro = np.zeros((num_envs, T), bool)
+            shr = np.zeros((num_envs, T), np.float32); xtr = np.zeros((num_envs, T), np.float32)
+            pac = np.zeros((num_envs, T), np.float32)
             env_done = np.zeros(num_envs, dtype=bool)
-            tracker = None; const = {}; des_force = None
+            cur_status = cur_setpoint = None; const = {}; des_force = None
             base = start_w_env = path_dir_np = goal_lift = None
             cur_s_ref = np.zeros(num_envs, np.float32)
 
             obs, _ = env.reset()
             state = _resolve_state(env, obs)
 
-            # Per-episode marker/tracker setup BEFORE the capture loop, from a POST-RESET snapshot,
+            # Per-episode marker/status setup BEFORE the capture loop, from a POST-RESET snapshot,
             # so the very FIRST captured frame already shows the fresh overlay (setpoint at k0, no
             # keypoints coloured, pace at the start). Previously this ran inside the t==0 branch
             # AFTER the first step, so frame 0 rendered the PREVIOUS episode's stale markers — the
@@ -572,8 +648,15 @@ def collect_annotated_ranked(
             markers.set_positions((base + normal[:, None, :] * radius).reshape(-1, 3))
             start_w_env = snap["start_w"].numpy() + env_origins
             path_dir_np = snap["path_dir"].numpy()
-            tracker = sv.KeypointStatusTracker(num_envs, k, spacing)
+            # Keypoint status/goal come straight from the env (authoritative) — no re-derivation here.
+            cur_status = snap["keypoint_status"].numpy()                # (E,Kmax) from the post-reset snapshot
+            cur_setpoint = snap["setpoint_kp_idx"].numpy()             # (E,) current goal keypoint index
+            kpst = np.zeros((num_envs, T, k), dtype=np.uint8)            # per-frame keypoint status (for the minimap)
             des_force = np.maximum(snap["desired_force_N"].numpy(), 1e-6)
+            track_tol = float(snap["keypoint_track_tol"])
+            v_des = float(snap["desired_speed"])
+            bf_t = snap.get("break_force_N")                            # present only when the peg is fragile
+            break_force = bf_t.numpy() if bf_t is not None else None
             start_w = snap["start_w"].numpy(); goal_w = snap["goal_w"].numpy()
             u_dir = snap["path_dir"].numpy(); v_dir = snap["d_lat"].numpy()
             center = 0.5 * (start_w + goal_w)
@@ -582,10 +665,11 @@ def collect_annotated_ranked(
             half = 0.5 * snap["path_length"].numpy()
             const = dict(center=center, u=u_dir, v=v_dir, start_uv=np.stack([su, svv], 1),
                          goal_uv=np.stack([gu, gvv], 1), half=half)
+            kp_uv = _keypoint_uv(const["start_uv"], const["goal_uv"], half, spacing, k)   # (E,k,2)
 
             for t in range(T):
-                markers.update(tracker.marker_indices())                 # fresh at t=0 (set BEFORE the step renders)
-                gidx = np.clip(tracker.setpoint_idx - 1, 0, k - 1)
+                markers.update(cur_status[:, :k].reshape(-1).astype(np.int64))   # env status, set BEFORE the step renders
+                gidx = np.clip(cur_setpoint - 1, 0, k - 1)
                 goal_marker.update(base[np.arange(num_envs), gidx] + goal_lift)
                 pace_marker.update(start_w_env + cur_s_ref[:, None] * path_dir_np + goal_lift)
                 actions, _ = agent.act(obs, state, timestep=10**9, timesteps=10**9)
@@ -600,6 +684,9 @@ def collect_annotated_ranked(
                 osq[alive, t] = snap["orn_squash"].numpy()[alive]
                 fN[alive, t] = snap["force_N"].numpy()[alive]
                 ang[alive, t] = snap["angle_dev_deg"].numpy()[alive]
+                shr[alive, t] = snap["shear_force_N"].numpy()[alive]
+                xtr[alive, t] = snap["cross_track"].numpy()[alive]
+                pac[alive, t] = snap["along_track_speed"].numpy()[alive]
                 tru[alive, t] = tu[alive]; trv[alive, t] = tv[alive]
                 trc[alive, t] = snap["in_contact"].numpy()[alive]
                 tro[alive, t] = over[alive]
@@ -609,7 +696,9 @@ def collect_annotated_ranked(
                     frames[ii, t] = rgb[ii]
                     returns[ii] += reward.detach().view(-1).float().cpu()[ii]
                 cur_s_ref = snap["s_ref"].numpy()
-                tracker.update(snap["progress"].numpy(), snap["in_contact"].numpy())
+                cur_status = snap["keypoint_status"].numpy()            # authoritative env status after this step
+                cur_setpoint = snap["setpoint_kp_idx"].numpy()
+                kpst[:, t, :] = cur_status[:, :k]                        # freeze-safe: rendered up to disp_term only
 
                 term_now = _coerce_done(terminated).cpu().numpy()
                 trunc_now = _coerce_done(truncated).cpu().numpy()
@@ -646,6 +735,10 @@ def collect_annotated_ranked(
                 coll_trc.append(trc[e].copy()); coll_tro.append(tro[e].copy())
                 coll_start_uv.append(const["start_uv"][e].copy()); coll_goal_uv.append(const["goal_uv"][e].copy())
                 coll_half.append(float(const["half"][e])); coll_desforce.append(float(des_force[e]))
+                coll_shr.append(shr[e].copy()); coll_xtr.append(xtr[e].copy()); coll_pac.append(pac[e].copy())
+                coll_kpst.append(kpst[e].copy()); coll_kp_uv.append(kp_uv[e].copy())
+                coll_break.append(float(break_force[e]) if break_force is not None else None)
+                coll_tol.append(track_tol); coll_vdes.append(v_des)
             del frames
             print(f"[record] episode {ep + 1}/{num_episodes} done — {len(coll_frames)} trajectories", flush=True)
     finally:
@@ -677,7 +770,8 @@ def collect_annotated_ranked(
             for tt in range(0, di + 1, K):
                 cache.append(sv.topdown_inset(
                     coll_tru[j][: tt + 1], coll_trv[j][: tt + 1], coll_trc[j][: tt + 1], coll_tro[j][: tt + 1],
-                    coll_start_uv[j], coll_goal_uv[j], coll_half[j], coll_half[j]))
+                    coll_start_uv[j], coll_goal_uv[j], coll_half[j], coll_half[j],
+                    keypoint_uv=coll_kp_uv[j], keypoint_status=coll_kpst[j][tt]))
             inset_cache[j] = cache or [None]
 
     fmt = getattr(recorder_cfg, "video_format", "mp4")
@@ -692,12 +786,17 @@ def collect_annotated_ranked(
             _st = coll_status[j] if t >= di else _ST_INPROG
             if overlays:
                 ins = inset_cache[j][min(q // K, len(inset_cache[j]) - 1)]
+                desF = coll_desforce[j]; fN_q = float(coll_fN[j][q])
+                force_fill, force_tf = _force_bar(fN_q, desF, coll_break[j])
+                readouts = _build_readouts(coll_fsq[j][q], fN_q, coll_shr[j][q], desF,
+                                           coll_pac[j][q], coll_vdes[j], coll_xtr[j][q], coll_tol[j])
                 tiles.append(sv.compose_tile(
                     frame, float(coll_fsq[j][q]), float(coll_osq[j][q]), ins, border,
-                    force_text=f"{coll_fN[j][q]:.1f}N", orn_text=f"{coll_ang[j][q]:+.0f}°",
-                    force_fill=float(coll_fN[j][q] / (2.0 * coll_desforce[j])),
-                    orn_fill=float(coll_ang[j][q] / 30.0),
-                    status_label=_STATUS_LABEL[_st], status_color=_STATUS_COLOR[_st]))
+                    force_text=f"{fN_q:.1f}N", orn_text=f"{coll_ang[j][q]:+.0f}°",
+                    force_fill=float(force_fill), orn_fill=float(coll_ang[j][q] / 30.0),
+                    force_target_frac=float(force_tf),
+                    status_label=_STATUS_LABEL[_st], status_color=_STATUS_COLOR[_st],
+                    readouts=readouts))
             else:
                 tiles.append(sv.compose_tile(frame, 0, 0, None, border,
                                              status_label=_STATUS_LABEL[_st], status_color=_STATUS_COLOR[_st]))
@@ -787,8 +886,7 @@ def collect_reset_snapshots(
                 goal_marker = sv.GoalMarker("/World/Visuals/surface_goal", radius=goal_radius)
                 pace_marker = sv.GoalMarker("/World/Visuals/surface_pace", radius=goal_radius, opacity=0.4)
             markers.set_positions((base + normal[:, None, :] * radius).reshape(-1, 3))
-            tracker = sv.KeypointStatusTracker(num_envs, k, spacing)     # all keypoints fresh at reset
-            markers.update(tracker.marker_indices())
+            markers.update(snap["keypoint_status"].numpy()[:, :k].reshape(-1).astype(np.int64))  # all unreached at reset
             gidx = np.full(num_envs, k - 1)
             goal_marker.update(base[np.arange(num_envs), gidx] + goal_lift)
             start_w_env = snap["start_w"].numpy() + env_origins

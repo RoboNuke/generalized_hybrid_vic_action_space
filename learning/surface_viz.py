@@ -3,81 +3,52 @@
 Split into two layers:
 
 * **In-scene** (:class:`KeypointBallMarkers`): a per-keypoint sphere drawn into the 3D scene (a real
-  USD ``PointInstancer``, so the offscreen recorder camera captures it). Blue = not yet reached,
-  green = ACHIEVED (crossed in contact, one-at-a-time), red = passed but not achieved. Diameter is
-  half the keypoint spacing. Needs Isaac, so it is imported lazily.
+  USD ``PointInstancer``, so the offscreen recorder camera captures it), one sphere prototype per
+  status code (see :data:`STATUS_RGB`). Diameter is half the keypoint spacing. Needs Isaac, so it is
+  imported lazily.
 
 * **2D compositing** (everything else): pure numpy / PIL / matplotlib, so it is unit-testable without
-  Isaac. :class:`KeypointStatusTracker` mirrors the env's achieve/pass logic from the per-step
-  (progress, in-contact) trace; :func:`draw_gauge` paints a red->green bar from a squashing value;
-  :func:`topdown_inset` renders the matplotlib top-down path; :func:`compose_tile` stacks a frame +
-  gauges + inset; :func:`montage` tiles the per-env stills into one grid image.
+  Isaac. :func:`draw_gauge` paints a red->green bar from a squashing value; :func:`topdown_inset`
+  renders the matplotlib top-down path (with keypoint status circles); :func:`compose_tile` stacks a
+  frame + gauges + inset; :func:`montage` tiles the per-env stills into one grid image.
+
+Per-keypoint achieve/pass STATUS is NOT computed here — it is owned by the env
+(``FlatSurfaceFollowEnv.keypoint_status``, same gate as the reward) and read from
+``viz_snapshot()``. The recorder only colours balls/circles from those codes.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-# Ball colours (RGB, 0-255). Index == the marker prototype index fed to marker_indices:
-# 0 blue (unreached), 1 green (achieved), 2 red (passed only), 3 dark purple (the CURRENT goal
-# keypoint — overrides status each frame and reverts to the status colour once passed).
-# 0 blue (unreached), 1 green (achieved), 2 red (passed only), 3 purple (goal/pace marker).
-BALL_RGB = np.array([[15, 35, 205], [40, 200, 90], [255, 25, 25], [120, 30, 175]], dtype=np.uint8)
-GOAL_IDX = 3
-_RED = np.array([220, 60, 50], dtype=np.float32)
-_GREEN = np.array([45, 200, 95], dtype=np.float32)
+# Keypoint status colours (RGB, 0-255). Index == the status code == the marker prototype index fed
+# to marker_indices. Five mutually high-contrast hues so the WHY of a miss is legible at a glance:
+#   0 white   — not yet passed
+#   1 green    — ACHIEVED (crossed while in contact AND on-track)
+#   2 orange   — passed but NOT in contact (on-track otherwise)
+#   3 cyan      — passed but OFF-TRACK (in contact otherwise, cross-track too large)
+#   4 red        — passed but BOTH off contact AND off-track
+STATUS_RGB = np.array(
+    [[235, 235, 235], [30, 220, 70], [255, 145, 0], [0, 210, 235], [235, 30, 30]], dtype=np.uint8
+)
+N_STATUS = STATUS_RGB.shape[0]
+# The moving CURRENT-goal / pace marker is a separate sphere in its own (magenta) hue, distinct from
+# all five status colours so it never reads as a keypoint state.
+GOAL_RGB = np.array([200, 40, 235], dtype=np.uint8)
+# Back-compat aliases (older callers referenced BALL_RGB / GOAL_IDX).
+BALL_RGB = STATUS_RGB
+GOAL_IDX = 0
+_RED = np.array([225, 45, 40], dtype=np.float32)
+_GREEN = np.array([40, 210, 80], dtype=np.float32)
+_YELLOW = (250, 225, 40)          # target / reference tick on the gauges (thick, high-contrast)
 
 
 # ----------------------------------------------------------------------------- status tracking
-class KeypointStatusTracker:
-    """Per-env, per-keypoint status from the (progress, in-contact) trace — mirrors the env.
-
-    Status codes (also the ball colour index): 0 = not yet reached, 1 = ACHIEVED (the step that
-    crossed it was in contact and crossed EXACTLY ONE keypoint), 2 = passed but not achieved
-    (crossed as part of a multi-keypoint jump or off contact). Achieved never downgrades.
-    """
-
-    def __init__(self, num_envs: int, k_per_env: int, spacing: float):
-        self.n = int(num_envs)
-        self.k = int(k_per_env)                       # keypoints tracked per env (1..k at arc j*spacing)
-        self.spacing = float(spacing)
-        # status[:, j] is keypoint j (1-based); column 0 is unused so index == keypoint number.
-        self.status = np.zeros((self.n, self.k + 1), dtype=np.uint8)
-        # Seed prev_progress at 0 (NOT at the first frame's progress) so the first update counts the
-        # crossing 0 -> progress and colours everything the peg is already past on frame 1 — matching
-        # the env's keypoints_passed (which resets prev_progress to 0). Otherwise those initial
-        # keypoints, already behind the peg when the tracker starts watching, stay stuck blue.
-        self.prev_progress = np.zeros(self.n, dtype=np.float64)
-        self.setpoint_idx = np.ones(self.n, dtype=int)   # current goal keypoint (1..k), coloured purple
-
-    def update(self, progress: np.ndarray, in_contact: np.ndarray) -> None:
-        progress = np.asarray(progress, dtype=np.float64).reshape(self.n)
-        in_contact = np.asarray(in_contact).reshape(self.n).astype(bool)
-        # Current goal keypoint = the next one ahead of the projected progress (mirrors the env's
-        # setpoint_kp_idx), RATCHETED so it only ever advances (never pulled back if the arm reverses).
-        new_setpoint = np.clip(np.floor(progress / self.spacing).astype(int) + 1, 1, self.k)
-        self.setpoint_idx = np.maximum(self.setpoint_idx, new_setpoint)
-        kp_prev = np.clip(np.floor(self.prev_progress / self.spacing).astype(int), 0, self.k)
-        kp_curr = np.clip(np.floor(progress / self.spacing).astype(int), 0, self.k)
-        for e in range(self.n):
-            a, b = kp_prev[e], kp_curr[e]
-            if b <= a:                                 # no forward crossing this step
-                continue
-            crossed = b - a
-            for j in range(a + 1, b + 1):              # keypoints newly crossed this step
-                if self.status[e, j] == 1:             # already achieved -> keep
-                    continue
-                if crossed == 1 and in_contact[e]:
-                    self.status[e, j] = 1              # clean single-keypoint drag in contact
-                else:
-                    self.status[e, j] = 2              # passed as part of a jump / off contact
-        self.prev_progress = progress.copy()
-
-    def marker_indices(self) -> np.ndarray:
-        """Flat (n*k,) int array of ball STATUS colour indices (0/1/2) for keypoints 1..k of every
-        env, env-major. The current goal is drawn as a SEPARATE moving marker, not by recolouring a
-        ball, so this returns pure status."""
-        return self.status[:, 1 : self.k + 1].reshape(-1).astype(np.int64)
+# NOTE: per-keypoint achieved/passed status is NOT tracked here. It is computed once in the env
+# (``FlatSurfaceFollowEnv._get_rewards`` -> ``self.keypoint_status``) with the exact gate the reward
+# uses, and read straight out of ``viz_snapshot()["keypoint_status"]`` (codes 0..4, see STATUS_RGB).
+# The recorder used to re-derive it from the (progress, in-contact) trace, which silently drifted
+# from the reward; keep the single source of truth in the env.
 
 
 # ----------------------------------------------------------------------------- geometry
@@ -105,6 +76,12 @@ def _blend_red_green(s: float) -> tuple[int, int, int]:
     return tuple(int(x) for x in c)
 
 
+def closeness_color(s: float) -> tuple[int, int, int]:
+    """Public red->green blend for the raw-value read-outs: ``s`` in [0,1], 1 = ideal (green), 0 =
+    far from ideal (red)."""
+    return _blend_red_green(s)
+
+
 def draw_gauge(height: int, color_value: float, label: str, width: int = 54, text: str | None = None,
                fill: float | None = None, mode: str = "bar", target_frac: float | None = None):
     """A vertical gauge (H, width, 3) uint8. Colour is red->green from ``color_value`` in [0,1] (the
@@ -126,12 +103,13 @@ def draw_gauge(height: int, color_value: float, label: str, width: int = 54, tex
         fill = color_value
     if mode == "center":
         cy = (by0 + by1) // 2
-        d.line([bx0, cy, bx1, cy], fill=(150, 150, 155))              # zero line at centre
         f = float(np.clip(fill, -1.0, 1.0))
         h = int(round((by1 - by0) / 2 * abs(f)))
         if h > 0:
             y0, y1 = (cy - h, cy) if f > 0 else (cy, cy + h)          # up = positive, down = negative
             d.rectangle([bx0 + 1, y0, bx1 - 1, y1], fill=col)
+        # Yellow reference line at the desired angle (centre = zero deviation), 3x thicker (was 1px).
+        d.line([bx0, cy, bx1, cy], fill=_YELLOW, width=3)
     else:  # bar (bottom-up)
         f = float(np.clip(fill, 0.0, 1.0))
         fill_h = int(round((by1 - by0) * f))
@@ -139,18 +117,23 @@ def draw_gauge(height: int, color_value: float, label: str, width: int = 54, tex
             d.rectangle([bx0 + 1, by1 - fill_h, bx1 - 1, by1 - 1], fill=col)
         if target_frac is not None:
             ty = int(round(by1 - (by1 - by0) * float(np.clip(target_frac, 0.0, 1.0))))
-            d.line([bx0, ty, bx1, ty], fill=(210, 210, 120))         # target tick
+            d.line([bx0, ty, bx1, ty], fill=_YELLOW, width=3)        # target tick, 3x thicker (was 1px)
     d.text((pad, 2), label, fill=(220, 220, 225))
     d.text((pad - 2, by1 - 12), text if text is not None else f"{color_value:.2f}", fill=(245, 245, 245))
     return np.asarray(img, dtype=np.uint8)
 
 
-def topdown_inset(trace_u, trace_v, contact, over, start_uv, goal_uv, half_u, half_v, px: int = 300):
+def topdown_inset(trace_u, trace_v, contact, over, start_uv, goal_uv, half_u, half_v, px: int = 300,
+                  keypoint_uv=None, keypoint_status=None):
     """Matplotlib top-down of the plate + tip path -> (px, px, 3) uint8.
 
     trace_u/trace_v/contact/over are per-step arrays for ONE env. Segments are drawn only between
-    consecutive steps that are BOTH over the surface; dark blue while in contact, light blue in air.
-    Goal = green circle, start = red x, ideal path = yellow dotted line along d.
+    consecutive steps that are BOTH over the surface; bright blue while in contact, light-grey in
+    air. HIGH-CONTRAST palette on a near-black plate, path drawn 3x thicker than before for
+    legibility. Goal = green circle, start = red x, ideal path = yellow dotted line along d.
+
+    ``keypoint_uv`` (k, 2) + ``keypoint_status`` (k,) draw the per-keypoint circles in their STATUS
+    colours (see :data:`STATUS_RGB`), mirroring the in-scene balls onto the minimap.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -163,28 +146,37 @@ def topdown_inset(trace_u, trace_v, contact, over, start_uv, goal_uv, half_u, ha
     ax.set_ylim(-half_v * m, half_v * m)
     ax.set_aspect("equal")
     ax.set_xticks([]); ax.set_yticks([])
-    ax.set_facecolor((0.12, 0.12, 0.14))
+    ax.set_facecolor((0.04, 0.04, 0.05))             # near-black plate for maximum path contrast
 
-    # Tabletop square (the thick white border).
+    # Tabletop square (a bright, thick white border).
     ax.add_patch(plt.Rectangle((-half_u, -half_v), 2 * half_u, 2 * half_v,
-                               fill=False, edgecolor=(0.9, 0.9, 0.92), lw=3.0))
-    # Ideal path along d (start -> goal), yellow dotted.
+                               fill=False, edgecolor=(1.0, 1.0, 1.0), lw=3.5))
+    # Ideal path along d (start -> goal), yellow dotted (thicker for contrast).
     ax.plot([start_uv[0], goal_uv[0]], [start_uv[1], goal_uv[1]],
-            linestyle=(0, (2, 2)), color=(0.95, 0.85, 0.15), lw=1.4, zorder=2)
+            linestyle=(0, (2, 2)), color=(1.0, 0.9, 0.1), lw=2.4, zorder=2)
+
+    # Keypoint circles in their status colours (drawn under the tip path so the live trace stays on
+    # top, but over the ideal line). Black edge so light-status balls still pop on the dark plate.
+    if keypoint_uv is not None and keypoint_status is not None:
+        kp = np.asarray(keypoint_uv, dtype=np.float64).reshape(-1, 2)
+        ks = np.asarray(keypoint_status).reshape(-1).astype(int)
+        if kp.shape[0]:
+            cols = STATUS_RGB[np.clip(ks, 0, N_STATUS - 1)] / 255.0
+            ax.scatter(kp[:, 0], kp[:, 1], s=110, c=cols, edgecolors=(0, 0, 0), lw=1.4, zorder=4)
 
     tu = np.asarray(trace_u); tv = np.asarray(trace_v)
     over = np.asarray(over, dtype=bool); contact = np.asarray(contact, dtype=bool)
-    light = (0.55, 0.75, 1.0); dark = (0.05, 0.20, 0.75)
+    air = (0.80, 0.82, 0.86); touch = (0.15, 0.6, 1.0)   # high-contrast: bright blue in contact, light grey in air
     for i in range(1, len(tu)):
         if not (over[i] and over[i - 1]):
             continue
-        col = dark if (contact[i] and contact[i - 1]) else light
-        ax.plot(tu[i - 1 : i + 1], tv[i - 1 : i + 1], color=col, lw=1.8, zorder=3,
+        col = touch if (contact[i] and contact[i - 1]) else air
+        ax.plot(tu[i - 1 : i + 1], tv[i - 1 : i + 1], color=col, lw=5.4, zorder=5,
                 solid_capstyle="round")
     # Start (red x) and goal (green circle).
-    ax.scatter([start_uv[0]], [start_uv[1]], marker="x", s=70, c=[(0.9, 0.15, 0.15)], lw=2.5, zorder=5)
-    ax.scatter([goal_uv[0]], [goal_uv[1]], marker="o", s=80, facecolors="none",
-               edgecolors=[(0.15, 0.85, 0.25)], lw=2.5, zorder=5)
+    ax.scatter([start_uv[0]], [start_uv[1]], marker="x", s=80, c=[(1.0, 0.2, 0.2)], lw=3.0, zorder=6)
+    ax.scatter([goal_uv[0]], [goal_uv[1]], marker="o", s=95, facecolors="none",
+               edgecolors=[(0.2, 0.95, 0.35)], lw=3.0, zorder=6)
 
     fig.canvas.draw()
     buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
@@ -201,13 +193,15 @@ def _paste(dst, src, x, y):
 
 def compose_tile(frame, force_squash, orn_squash, inset, border_rgb=None, pad=6,
                  force_text=None, orn_text=None, force_fill=None, orn_fill=None,
-                 status_label=None, status_color=None):
+                 status_label=None, status_color=None, force_target_frac=0.5, readouts=None):
     """One annotated tile: [force gauge | orientation gauge | frame], both gauges on the LEFT, with
     the top-down inset pasted into the frame's bottom-left corner. Gauge COLOUR = squash closeness;
-    the FORCE gauge fills from the bottom (force_fill in [0,1], empty at <=0, target tick at desired)
-    and the ANGLE gauge fills from the centre (orn_fill in [-1,1], up/down by sign). force_text /
-    orn_text are the physical read-outs. Optional coloured border. ``status_label`` (with
-    ``status_color`` RGB) draws a status pill in the frame's BOTTOM-RIGHT corner."""
+    the FORCE gauge fills from the bottom (force_fill in [0,1], empty at <=0, yellow target tick at
+    ``force_target_frac``) and the ANGLE gauge fills from the centre (orn_fill in [-1,1], up/down by
+    sign). force_text / orn_text are the physical read-outs. Optional coloured border. ``status_label``
+    (with ``status_color`` RGB) draws a status pill in the frame's BOTTOM-RIGHT corner. ``readouts`` is
+    an optional list of ``(text, rgb)`` lines stacked ABOVE that pill (same size), each colour-coded by
+    how close the value is to ideal."""
     from PIL import Image, ImageDraw, ImageFont
 
     frame = np.asarray(frame, dtype=np.uint8).copy()
@@ -220,23 +214,41 @@ def compose_tile(frame, force_squash, orn_squash, inset, border_rgb=None, pad=6,
         b = 6
         frame[:b, :] = border_rgb; frame[-b:, :] = border_rgb
         frame[:, :b] = border_rgb; frame[:, -b:] = border_rgb
-    if status_label:                                 # status pill in the BOTTOM-RIGHT corner
+    if status_label or readouts:                     # status pill + raw read-outs, BOTTOM-RIGHT corner
         img = Image.fromarray(frame); d = ImageDraw.Draw(img)
         try:
             font = ImageFont.truetype("DejaVuSans-Bold.ttf", 22)
         except Exception:
             font = ImageFont.load_default()
-        try:
-            tb = d.textbbox((0, 0), status_label, font=font); tw_, th_ = tb[2] - tb[0], tb[3] - tb[1]
-        except Exception:
-            tw_, th_ = d.textsize(status_label, font=font)
+
+        def _tsize(s):
+            try:
+                tb = d.textbbox((0, 0), s, font=font); return tb[2] - tb[0], tb[3] - tb[1]
+            except Exception:
+                return d.textsize(s, font=font)
+
         mx, my = 8, 6
         bx1, by1 = W - pad, H - pad
-        bx0, by0 = bx1 - tw_ - 2 * mx, by1 - th_ - 2 * my
-        d.rectangle([bx0, by0, bx1, by1], fill=tuple(status_color) if status_color else (180, 180, 185))
-        d.text((bx0 + mx, by0 + my - 2), status_label, fill=(20, 20, 22), font=font)
+        top = by1 + 4                                # running top edge; readouts stack upward from the pill
+        if status_label:
+            tw_, th_ = _tsize(status_label)
+            bx0, by0 = bx1 - tw_ - 2 * mx, by1 - th_ - 2 * my
+            d.rectangle([bx0, by0, bx1, by1], fill=tuple(status_color) if status_color else (180, 180, 185))
+            d.text((bx0 + mx, by0 + my - 2), status_label, fill=(20, 20, 22), font=font)
+            top = by0
+        if readouts:
+            gap = 4
+            for text, rgb in reversed(list(readouts)):   # draw bottom-up so the list reads top -> down
+                tw_, th_ = _tsize(text)
+                ry1 = top - gap
+                ry0 = ry1 - th_ - 2 * my
+                rx0 = bx1 - tw_ - 2 * mx
+                d.rectangle([rx0, ry0, bx1, ry1], fill=(18, 18, 20))   # dark backing keeps coloured text legible
+                d.text((rx0 + mx, ry0 + my - 2), text, fill=tuple(int(c) for c in rgb), font=font)
+                top = ry0
         frame = np.asarray(img, dtype=np.uint8)
-    fg = draw_gauge(H, force_squash, "F", text=force_text, fill=force_fill, mode="bar", target_frac=0.5)
+    fg = draw_gauge(H, force_squash, "F", text=force_text, fill=force_fill, mode="bar",
+                    target_frac=force_target_frac)
     og = draw_gauge(H, orn_squash, "A", text=orn_text, fill=orn_fill, mode="center")
     tile = np.concatenate([fg, og, frame], axis=1)
     return tile
@@ -261,10 +273,13 @@ def montage(tiles, rows: int, cols: int, gap: int = 6, bg=(15, 15, 18)):
 class KeypointBallMarkers:
     """Per-keypoint spheres drawn into the 3D scene (captured by the recorder camera).
 
-    Three sphere prototypes (blue/green/red); each keypoint instance selects one via marker_indices.
-    Positions are fixed for the episode (set in :meth:`set_positions`); only colours change per step.
-    Imported lazily because Isaac Lab markers require the app to have booted.
+    Five sphere prototypes, one per status code (see :data:`STATUS_RGB`); each keypoint instance
+    selects one via marker_indices. Positions are fixed for the episode (set in
+    :meth:`set_positions`); only colours change per step. Imported lazily because Isaac Lab markers
+    require the app to have booted.
     """
+
+    _NAMES = ("unreached", "achieved", "off_contact", "off_track", "off_both")
 
     def __init__(self, prim_path: str, radius: float):
         import isaaclab.sim as sim_utils
@@ -277,10 +292,9 @@ class KeypointBallMarkers:
                 visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=tuple(c / 255.0 for c in rgb)),
             )
 
-        cfg = VisualizationMarkersCfg(
-            prim_path=prim_path,
-            markers={"blue": _sphere(BALL_RGB[0]), "green": _sphere(BALL_RGB[1]), "red": _sphere(BALL_RGB[2])},
-        )
+        # Ordered dict: prototype index i (== status code) picks STATUS_RGB[i].
+        markers = {self._NAMES[i]: _sphere(STATUS_RGB[i]) for i in range(N_STATUS)}
+        cfg = VisualizationMarkersCfg(prim_path=prim_path, markers=markers)
         self._markers = VisualizationMarkers(cfg)
         self._translations = None
 
@@ -302,7 +316,7 @@ class GoalMarker:
     (opaque) and, at reduced opacity, the time-based PACE setpoint. Exaggerated (default 4x the
     keypoint-ball radius) so the moving target is easy to follow in the video."""
 
-    def __init__(self, prim_path: str, radius: float, color=tuple(BALL_RGB[GOAL_IDX]), opacity: float = 1.0):
+    def __init__(self, prim_path: str, radius: float, color=tuple(GOAL_RGB), opacity: float = 1.0):
         import isaaclab.sim as sim_utils
         from isaaclab.markers import VisualizationMarkers
         from isaaclab.markers.visualization_markers import VisualizationMarkersCfg

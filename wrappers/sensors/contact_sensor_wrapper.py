@@ -184,6 +184,13 @@ class ContactSensorWrapper(gym.Wrapper):
         self.num_envs = env.unwrapped.num_envs
         self._threshold = float(contact_cfg.contact_force_threshold)
         self._log_contact = bool(contact_cfg.log_contact_state)
+        # EMA-smooth the (unnoised) contact force before thresholding into in_contact, so the contact
+        # signal matches the smoothing on the Forge wrist force the break check reads (both then use
+        # the unnoised + EMA'd force). Same alpha as the Forge force sensor (ft_smoothing_factor,
+        # default 0.25); updated once per env-step, and reset per-episode so a stale reading from the
+        # previous episode never carries into a fresh spawn.
+        self._ema_alpha = float(getattr(getattr(self.unwrapped, "cfg", None), "ft_smoothing_factor", 0.25))
+        self._force_ema = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=self.device)
 
         # Resolve the held (sensor) + fixed (filter) contact-reporting body paths from the env-0
         # prototype (a real USD prim at this point) and put them in PhysX GLOB form ('env_*', no
@@ -255,7 +262,14 @@ class ContactSensorWrapper(gym.Wrapper):
         force_w = fmat.sum(dim=1)
         # Rotate into the EE / force-torque frame so per-axis flags align with the control axes.
         force_ee = quat_rotate_inverse(self.unwrapped.fingertip_midpoint_quat, force_w)
-        self.unwrapped.in_contact = force_ee.abs() > self._threshold  # (num_envs, 3) bool
+        # EMA-smooth (unnoised) before thresholding. Envs at the very start of an episode
+        # (episode_length_buf <= 1) seed the EMA with the raw reading so no history bleeds across the
+        # per-episode reset; everyone else blends alpha*raw + (1-alpha)*prev.
+        buf = getattr(self.unwrapped, "episode_length_buf", None)
+        fresh = (buf <= 1).unsqueeze(-1) if torch.is_tensor(buf) else True
+        blended = self._ema_alpha * force_ee + (1.0 - self._ema_alpha) * self._force_ema
+        self._force_ema = torch.where(fresh, force_ee, blended) if torch.is_tensor(buf) else force_ee
+        self.unwrapped.in_contact = self._force_ema.abs() > self._threshold  # (num_envs, 3) bool
         return True
 
     def _update_contact(self) -> None:
@@ -280,4 +294,8 @@ class ContactSensorWrapper(gym.Wrapper):
         return out
 
     def reset(self, **kwargs):
+        # Full reset re-spawns every env out of contact — clear the smoothed-force history so the
+        # first-step reading of the new episode starts fresh (the per-env buf<=1 seed handles
+        # mid-episode resets).
+        self._force_ema.zero_()
         return super().reset(**kwargs)

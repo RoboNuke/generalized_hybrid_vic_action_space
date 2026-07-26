@@ -122,6 +122,12 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # Furthest keypoint index achieved (gated); gates the once-per-keypoint reward (see _get_rewards).
         self.kp_ach_frontier = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         self.setpoint_kp_idx = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        # Per-keypoint status for the recorder overlay — the authoritative source (the recorder reads
+        # this rather than re-deriving achievement, so it can never drift from the reward gate).
+        # (E, Kmax) uint8; codes: 0 unreached, 1 achieved, 2 passed off-contact, 3 passed off-track,
+        # 4 passed off-contact AND off-track. Lazily sized in _get_rewards (Kmax is constant because
+        # path_length = plate_length); None until then / after a reset.
+        self.keypoint_status = None
         self.prev_progress = torch.zeros((self.num_envs,), device=self.device)
         self.prev_cross_track = torch.zeros((self.num_envs,), device=self.device)
         # Derived each _compute from L/(v*dt); placeholder until then.
@@ -690,7 +696,23 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # Physical read-outs for the gauges: measured normal force (N), and the tool-axis angle
         # relative to the DESIRED angle-off-normal (deg, signed: + = more tilted than commanded).
         angle_dev_deg = torch.rad2deg(self.angle_from_normal) - float(cfg.orientation_desired_angle_deg)
-        return {
+        # Shear (tangential) force magnitude: the part of the world reaction force NOT along the
+        # surface normal. |f_tangential| = sqrt(|f|^2 - f_normal^2). Same world FT vector the normal
+        # force is projected from, so the two are a consistent decomposition of the contact force.
+        f_vec = self.force_sensor_world_smooth[:, 0:3]
+        total_force = torch.linalg.norm(f_vec, dim=-1)
+        shear_force = torch.sqrt(torch.clamp(total_force**2 - self.measured_normal_force**2, min=0.0))
+        v_des = float(cfg.desired_speed_cm_s) / 100.0                          # cm/s -> m/s (ideal pace)
+        along_speed = getattr(self, "viz_along_track_speed", None)
+        if along_speed is None:
+            along_speed = torch.zeros_like(self.progress)
+        # Per-keypoint status (authoritative; the recorder colours balls/minimap straight from this).
+        # None before the first _get_rewards (e.g. the post-reset setup snapshot) -> all unreached.
+        kp_status = self.keypoint_status
+        if kp_status is None:
+            kp_status = torch.zeros((self.num_envs, int(self.keypoints_total.max().item())),
+                                    dtype=torch.uint8, device=self.device)
+        out = {
             "start_w": self.start_world.detach().cpu(),          # (E,3) near-edge center (path p0)
             "goal_w": self.goal_world.detach().cpu(),            # (E,3) far-edge center (goal)
             "path_dir": self.path_dir.detach().cpu(),            # (E,3) along-track unit dir d
@@ -700,6 +722,8 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "path_length": self.path_length.detach().cpu(),      # (E,) L
             "keypoints_total": self.keypoints_total.detach().cpu(),  # (E,) count
             "keypoint_spacing": float(self.keypoint_spacing),    # scalar (m)
+            "keypoint_status": kp_status.detach().cpu(),         # (E, Kmax) uint8 per-keypoint status code
+            "setpoint_kp_idx": self.setpoint_kp_idx.detach().cpu(),  # (E,) current goal keypoint index (1..k)
             "progress": self.progress.detach().cpu(),            # (E,) along-track arc length
             "s_ref": self.s_ref.detach().cpu(),                  # (E,) time-based PACE setpoint arc length
             "in_contact": self.in_contact_any.detach().cpu().bool(),  # (E,)
@@ -709,7 +733,19 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "desired_force_N": self.desired_force.detach().cpu(),        # (E,) target force, N
             "angle_dev_deg": angle_dev_deg.detach().cpu(),              # (E,) deg off the desired angle
             "tip_surface_dist": self.tip_surface_dist.detach().cpu(),  # (E,) signed height above surface
+            "cross_track": self.cross_track.detach().cpu(),            # (E,) signed lateral error, m
+            "keypoint_track_tol": float(cfg.keypoint_track_tol),        # scalar on-track tolerance, m
+            "shear_force_N": shear_force.detach().cpu(),               # (E,) tangential force magnitude, N
+            "along_track_speed": along_speed.detach().cpu(),          # (E,) along-track drag speed, m/s
+            "desired_speed": float(v_des),                             # scalar ideal along-track speed, m/s
         }
+        # Fragile-peg break threshold (exposed by FragileObjectWrapper onto the unwrapped env). When
+        # present and fragile, the recorder scales the force bar so its TOP is the normal break force.
+        if bool(getattr(self, "is_fragile", False)):
+            bf = getattr(self, "fragile_normal_break_force", None)
+            if bf is not None:
+                out["break_force_N"] = bf.detach().cpu()               # (E,) normal-axis break threshold, N
+        return out
 
     def _get_rewards(self):
         """Reward = bounded task terms + the Factory action penalties.
@@ -750,6 +786,21 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.kp_ach_frontier = torch.where(gate, torch.maximum(self.kp_ach_frontier, kp_curr), self.kp_ach_frontier)
         self.keypoints_achieved = (self.keypoints_achieved + newly_achieved).minimum(Ktot)
         self.keypoints_passed = torch.maximum(self.keypoints_passed, kp_curr)
+
+        # Per-keypoint status for the recorder (viz-only; computed from the SAME gate as above so it
+        # matches what the reward credits). Every boundary crossed this step (kp_prev, kp_curr] takes
+        # the step's code: 1 achieved when gated (in contact AND on-track), else 2 off-contact / 3
+        # off-track / 4 both. ACHIEVED is sticky — a later clean re-cross can upgrade a miss, but an
+        # achieved keypoint never downgrades. Kmax is constant (path_length = plate_length).
+        Kmax = int(Ktot.max().item())
+        if self.keypoint_status is None or self.keypoint_status.shape[1] != Kmax:
+            self.keypoint_status = torch.zeros((self.num_envs, Kmax), dtype=torch.uint8, device=self.device)
+        kp_idx = torch.arange(1, Kmax + 1, device=self.device)                 # (Kmax,) 1-based keypoint indices
+        crossed_now = (kp_idx.unsqueeze(0) > kp_prev.unsqueeze(1)) & (kp_idx.unsqueeze(0) <= kp_curr.unsqueeze(1))
+        miss = torch.where(~self.in_contact_any & ~on_track, 4, torch.where(~self.in_contact_any, 2, 3))
+        step_code = torch.where(gate, torch.ones_like(miss), miss).to(torch.uint8)   # (E,) this step's code
+        upd = crossed_now & (self.keypoint_status != 1)                        # don't downgrade an achieved keypoint
+        self.keypoint_status = torch.where(upd, step_code.unsqueeze(1), self.keypoint_status)
         # Success reward weight = fraction of keypoints achieved (partial credit for the drag).
         success_frac = self.keypoints_achieved.float() / self.keypoints_total.clamp_min(1).float()
 
@@ -888,6 +939,10 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # exactly what the keypoints count, so this speed is consistent with them.
         v_along_prog = (self.progress - self.prev_progress) / step_dt
         v_perp_prog = (self.cross_track - self.prev_cross_track) / step_dt
+        # Stash the along-track drag speed for the recorder overlay (viz_snapshot runs AFTER
+        # _get_rewards, where prev_progress has already rolled forward to this step's progress —
+        # so the recorder can't recompute the finite difference itself).
+        self.viz_along_track_speed = v_along_prog
         self.drag_count += c.long()
         for _n, _v in (("force", self.measured_normal_force), ("speed_d", v_along_prog),
                        ("speed_perp", v_perp_prog), ("theta", theta_deg)):
@@ -930,9 +985,17 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # "(max)" frontier over the interval.
         dcnt = self.drag_count.float().clamp_min(1.0)
         dhas = self.drag_count > 0
+        # Per-episode keypoint counts. keypoints_passed (frontier index) is UNCHANGED. The passed
+        # breakdown splits the non-achieved passes by cause from self.keypoint_status (same gate as
+        # keypoints_achieved): 2 = off contact, 3 = off track, 4 = both. By construction
+        # passed == achieved + passed_off_contact + passed_off_track + passed_off_both.
+        ks = self.keypoint_status
         drag = {
             "keypoints_achieved": self.keypoints_achieved.float(),
             "keypoints_passed": self.keypoints_passed.float(),
+            "keypoints_passed_off_contact": (ks == 2).sum(dim=1).float(),
+            "keypoints_passed_off_track": (ks == 3).sum(dim=1).float(),
+            "keypoints_passed_off_both": (ks == 4).sum(dim=1).float(),
         }
         for _n in self._drag_metrics:
             _m = getattr(self, f"drag_sum_{_n}") / dcnt
@@ -1052,6 +1115,7 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.keypoints_passed = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         self.kp_ach_frontier = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         self.setpoint_kp_idx = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)  # k0 until contact
+        self.keypoint_status = None                                  # realloc all-zero (unreached) on next _get_rewards
         self.prev_progress = torch.zeros((self.num_envs,), device=self.device)
         self.prev_cross_track = torch.zeros((self.num_envs,), device=self.device)
         self.drag_count = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)

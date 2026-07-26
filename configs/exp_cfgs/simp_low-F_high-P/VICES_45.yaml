@@ -29,6 +29,7 @@ runner_cfg:
                                          # set to [shear_N, normal_N] when direction_break_force=true
   require_contact_enabled: true
   require_contact_grace_steps: 7   # no loss-of-contact break for the first N steps; earliest failure at step N+1 (peg spawns 1mm above, descends into contact)
+  require_contact_debounce_steps: 3   # loss-of-contact must persist this many CONSECUTIVE steps to count (tolerates a 1-step bounce)
   # Surface-task params on FlatSurfaceFollowTask via dotted env_cfg overrides.
   env_cfg_overrides:
     task.desired_speed_cm_s: 5.0
@@ -178,8 +179,8 @@ controller_cfg:
   # ---- shared per-axis bounds [x,y,z,Rx,Ry,Rz], geometric scaling k = lo*(hi/lo)^((a+1)/2) ----
   # A lower bound < ~1e-6 disables that channel (k=0) instead of producing NaN, so use > 0 for
   # meaningful variable impedance. Translation and rotation differ ~10x, hence the split values.
-  gain_min: [300, 300, 100, 20, 20, 20] # pose stiffness K (position x3, rotation x3)
-  gain_max: [4000, 4000, 2000, 40, 40, 40] 
+  gain_min: [300, 300, 100, 150, 150, 150] # pose stiffness K (position x3, rotation x3)
+  gain_max: [4000, 4000, 2000, 150, 150, 150]  
 
   # Policy commands the pose stiffness directly, so disable the base Forge env's per-reset
   # multiplicative gain randomization (default [0.41]x6) to avoid randomizing on top of the

@@ -279,6 +279,13 @@ class RunnerCfg:
     ``grace + 1`` (default 5 -> earliest failure at step 6). 0 disables the grace. Applies ONLY to
     the loss-of-contact mode; the force break (:attr:`break_force`) is unaffected."""
 
+    require_contact_debounce_steps: int = 3
+    """Debounce for the loss-of-contact break (:attr:`require_contact_enabled`): the peg must read
+    out-of-contact on ALL axes for this many CONSECUTIVE steps before it counts as a contact loss,
+    so a single-step sensor blip / bounce doesn't end the episode (it can re-seat). The consecutive
+    out-of-contact streak resets to 0 the moment contact is re-made. Default 3; 1 = the old behaviour
+    (any single off-contact step breaks)."""
+
     efficient_reset_enabled: bool = False
     """Use the efficient per-env reset (Forge / Factory / AutoMate-Assembly only). Installs
     :class:`~wrappers.sensors.efficient_reset_wrapper.EfficientResetWrapper`, which on a PARTIAL
