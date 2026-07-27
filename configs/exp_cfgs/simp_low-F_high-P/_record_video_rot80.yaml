@@ -38,8 +38,7 @@ sac_cfg:
   recorder:
     enabled: true                  # triggers TiledCamera injection in build_env
     full_episode: true             # play full episodes for viewing (recorder-only, not env drift)
-    annotated_ranked: true         # collect -> rank best/median/worst -> annotated 3x4 grid mp4
-    surface_overlays: true         # keypoint balls + force/orientation gauges + top-down path inset
+    overlay: surface_tracking     # keypoint balls + force/orientation gauges + path minimap
     ball_diameter_frac: 1.0        # diameter = keypoint spacing (enlarged for legibility)
     video_format: mp4
     num_trajectories: 24           # = num_envs -> ONE episode, so every trajectory is a FRESH spawn.

@@ -86,55 +86,47 @@ class RecorderCfg:
     overlays) so it can never masquerade as the training env. Use the eval path, not the recorder,
     for any quantitative metric."""
 
-    stills_grid: bool = False
-    """Surface-task only. When True, ``learning/record.py`` runs ONE rollout and writes a single
-    ``grid_rows x grid_cols`` PNG montage of annotated still frames (one env per tile) instead of the
-    best/median/worst grid video. Each tile carries the surface overlays (keypoint balls in-scene,
-    a force gauge, an orientation gauge, and a matplotlib top-down path inset). num_envs should be
-    >= grid_rows*grid_cols so every tile is a distinct env."""
+    mode: str = "trajectories"
+    """WHAT to record — the single standalone-recorder dispatch (one collect path, no bespoke variants):
+      * "trajectories"    — collect >= ``num_trajectories`` episodes, rank best-4 / median-4 / worst-4
+                            by return, and write an annotated 3x4 grid mp4. The per-tile overlay is
+                            chosen by ``overlay`` below. This is the one-and-only trajectory recording.
+      * "reset_snapshots" — diagnostic: reset the env ``reset_snapshots_count`` times and render ONLY
+                            each post-reset INITIAL state (no policy, no physics stepping), holding
+                            ``reset_snapshots_hold_s`` s each. Tiles all ``num_envs``; for inspecting
+                            spawn / initial conditions."""
 
-    grid_rows: int = 4
-    grid_cols: int = 4
-    """Montage layout for ``stills_grid`` (rows x cols tiles)."""
-
-    stills_grid_video: bool = False
-    """When ``stills_grid`` is on, ALSO write a full mp4 of the same rollout (per-frame gauges +
-    a growing top-down path; the in-scene keypoint balls animate in the captured frames)."""
-
-    stills_grid_png: bool = True
-    """When ``stills_grid`` is on, write the PNG montage. Set False to write ONLY the mp4
-    (``stills_grid_video`` must then be on) — a pure video with no still montage."""
-
-    annotated_ranked: bool = False
-    """Surface-task only, and mutually exclusive with ``stills_grid``. When True, ``record.py``
-    collects >= ``num_trajectories`` full episodes, selects best-4 / median-4 / worst-4 by return
-    (the same ranking as the plain grid video), and writes an ANNOTATED 3x4 grid mp4 of the selected
-    12 — the surface overlays (in-scene keypoint balls + force/orientation gauges + top-down path
-    inset) drawn on the RANKED selection. This is the annotated viz layered on top of best/median/
-    worst, rather than an unranked single rollout (``stills_grid``)."""
-
-    reset_snapshots: bool = False
-    """Surface-task diagnostic (mutually exclusive with ``stills_grid`` / ``annotated_ranked``). When
-    True, ``record.py`` resets the env ``reset_snapshots_count`` times and renders ONLY each post-reset
-    INITIAL state (no policy, no physics stepping), holding each for ``reset_snapshots_hold_s`` seconds.
-    All ``num_envs`` are tiled; each inset shows red-x START, green-o GOAL, and a blue dot at the spawn
-    peg tip — a purely-for-inspection clip of the spawn/initial conditions."""
+    overlay: str = "none"
+    """WHICH task-specific overlay to draw on each grid tile. Registry-backed (see
+    ``learning/recording_eval.py::OVERLAY_RENDERERS``) so future tasks register their own by name:
+      * "surface_tracking" — surface-follow overlay: in-scene keypoint-status balls, force + orientation
+                             gauges, and the top-down path minimap. Requires ``env.viz_snapshot``.
+      * "none"             — plain frames, no overlay; works for ANY env (forge / peg / humanoid / ...)."""
 
     reset_snapshots_count: int = 8
-    """Number of resets to render for ``reset_snapshots`` (one held frame block per reset)."""
+    """Number of resets to render for ``mode='reset_snapshots'`` (one held frame block per reset)."""
 
     reset_snapshots_hold_s: float = 1.0
-    """Seconds to hold each reset's initial-state frame on screen (``reset_snapshots``)."""
-
-    surface_overlays: bool = True
-    """When ``stills_grid`` is on, draw the surface-follow overlays (force/orientation gauges +
-    top-down path inset) on each tile. The in-scene keypoint balls are added separately by the
-    recorder regardless. Turn off to get plain frames."""
+    """Seconds to hold each reset's initial-state frame on screen (``mode='reset_snapshots'``)."""
 
     ball_diameter_frac: float = 1.6
     """Keypoint-ball diameter as a fraction of the keypoint spacing. The spec value 0.5 renders ~1.6
     mm balls that are near-invisible from the recorder camera; the default here is enlarged for
     legibility. Lower it toward 0.5 for a physically faithful size."""
+
+    # ---- DEPRECATED (backward-compat only; IGNORED by the recorder) ----------------------------------
+    # Replaced by ``mode`` + ``overlay`` above. Kept ONLY so that already-snapshotted training
+    # config.yaml files (which serialized the full old RecorderCfg) still load under the strict
+    # ConfigManager — the standalone recorder never reads them. Do NOT set these in new configs; use
+    # ``mode`` (trajectories | reset_snapshots) and ``overlay`` (surface_tracking | none) instead.
+    annotated_ranked: bool = False
+    stills_grid: bool = False
+    stills_grid_video: bool = False
+    stills_grid_png: bool = True
+    grid_rows: int = 4
+    grid_cols: int = 4
+    reset_snapshots: bool = False
+    surface_overlays: bool = True
 
 
 @dataclasses.dataclass(kw_only=True)

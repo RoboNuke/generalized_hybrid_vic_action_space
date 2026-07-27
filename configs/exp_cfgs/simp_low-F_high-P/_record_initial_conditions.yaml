@@ -29,10 +29,10 @@ runner_cfg:
 sac_cfg:
   recorder:
     enabled: true                  # triggers TiledCamera injection in build_env
-    reset_snapshots: true          # reset N times; hold the robot still and step, capturing each frame
+    mode: reset_snapshots
+    overlay: surface_tracking
     reset_snapshots_count: 100     # number of resets
     reset_snapshots_hold_s: 1.0    # 1 s = 15 physics steps captured per reset (robot held at spawn pose)
-    surface_overlays: true         # force/height read-outs + top-down inset (accumulating spawn-tip trace)
     ball_diameter_frac: 1.0
     video_format: mp4
     num_trajectories: 16           # unused by reset_snapshots; kept for cfg symmetry

@@ -37,8 +37,7 @@ runner_cfg:
 sac_cfg:
   recorder:
     enabled: true                  # triggers TiledCamera injection in build_env
-    annotated_ranked: true         # collect -> rank best/median/worst -> annotated 3x4 grid mp4
-    surface_overlays: true         # keypoint balls + force/orientation gauges + top-down path inset
+    overlay: surface_tracking     # keypoint balls + force/orientation gauges + path minimap
     ball_diameter_frac: 1.0        # diameter = keypoint spacing (enlarged for legibility)
     video_format: mp4
     num_trajectories: 48           # collect 48, select best-4/median-4/worst-4

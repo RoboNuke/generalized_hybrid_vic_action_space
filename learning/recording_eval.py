@@ -83,7 +83,7 @@ def _resolve_state(env: Any, obs: torch.Tensor) -> torch.Tensor:
     return st if st is not None else obs
 
 
-def collect_and_record(
+def _collect_plain(
     *,
     env: Any,
     agent: Any,
@@ -111,20 +111,6 @@ def collect_and_record(
             "max_episode_length must be > 0 to size the per-episode frame buffer; "
             f"got {max_episode_length!r}."
         )
-
-    # VIEWING toggle (recorder-only, display not dynamics): play the full episode instead of
-    # freezing each tile the instant it succeeds. Done at RUNTIME on the live env so it stays out
-    # of env_cfg_overrides (which the runner forbids for record overlays) and can never be mistaken
-    # for the training env. Only episode LENGTH changes; the peg's behavior is identical up to the
-    # point it would have terminated.
-    if bool(getattr(recorder_cfg, "full_episode", False)):
-        _ct = getattr(env.unwrapped, "cfg_task", None)
-        if _ct is not None:
-            for _flag in ("terminate_on_success", "terminate_on_lag"):
-                if hasattr(_ct, _flag):
-                    setattr(_ct, _flag, False)
-            print("[record] recorder.full_episode=true — success/lag early-termination disabled for "
-                  "the recording (display only; env dynamics unchanged).", flush=True)
 
     state_pre = getattr(agent, "_state_preprocessor", None) or (lambda s: s)
     critic_1, critic_2 = agent.critic_1, agent.critic_2
@@ -255,245 +241,6 @@ def collect_and_record(
     return out_path
 
 
-def collect_stills_grid(
-    *,
-    env: Any,
-    agent: Any,
-    recorder_cfg: Any,
-    camera: Any,
-    max_episode_length: int,
-    output_dir: str,
-    out_name: str = "surface_stills.png",
-) -> str:
-    """Surface-task recorder: run ONE rollout and write a rows x cols PNG montage of annotated
-    still frames (one env per tile) with keypoint balls (in-scene), force + orientation gauges, and
-    a top-down path inset. Requires the env to expose ``viz_snapshot()`` (FlatSurfaceFollowEnv)."""
-    from learning import surface_viz as sv
-    from PIL import Image
-
-    uenv = env.unwrapped
-    if not hasattr(uenv, "viz_snapshot"):
-        raise RuntimeError("stills_grid requires FlatSurfaceFollowEnv (env.viz_snapshot missing).")
-
-    rows, cols = int(recorder_cfg.grid_rows), int(recorder_cfg.grid_cols)
-    overlays = bool(getattr(recorder_cfg, "surface_overlays", True))
-    n_tiles = rows * cols
-    num_envs = int(env.num_envs)
-    if num_envs < n_tiles:
-        print(f"[record] WARNING: num_envs={num_envs} < grid {rows}x{cols}={n_tiles}; "
-              f"tiling only {num_envs} envs.", flush=True)
-        n_tiles = num_envs
-    H, W = int(recorder_cfg.height), int(recorder_cfg.width)
-    T = int(max_episode_length)
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Per-step captures (kept for every env; we display each env's last-alive frame).
-    frames = torch.zeros((num_envs, T, H, W, 3), dtype=torch.uint8)
-    force_sq = np.zeros((num_envs, T), dtype=np.float32)      # gauge fill/colour (reward closeness)
-    orn_sq = np.zeros((num_envs, T), dtype=np.float32)
-    force_N = np.zeros((num_envs, T), dtype=np.float32)       # gauge read-out: measured force (N)
-    angle_dev = np.zeros((num_envs, T), dtype=np.float32)     # gauge read-out: deg off desired angle
-    shear_N = np.zeros((num_envs, T), dtype=np.float32)       # read-out: shear force (N)
-    cross_m = np.zeros((num_envs, T), dtype=np.float32)       # read-out: cross-track error (m)
-    pace_ms = np.zeros((num_envs, T), dtype=np.float32)       # read-out: along-track speed (m/s)
-    tr_u = np.zeros((num_envs, T), dtype=np.float32)
-    tr_v = np.zeros((num_envs, T), dtype=np.float32)
-    tr_c = np.zeros((num_envs, T), dtype=bool)
-    tr_o = np.zeros((num_envs, T), dtype=bool)
-    term_step = np.full(num_envs, T - 1, dtype=np.int64)
-    success = np.zeros(num_envs, dtype=bool)
-    env_done = np.zeros(num_envs, dtype=bool)
-
-    markers = None
-    cur_status = cur_setpoint = None   # keypoint status/goal read from the env snapshot (authoritative)
-    const = {}  # per-env plate constants for the inset (filled at t=0)
-    cur_s_ref = np.zeros(num_envs, dtype=np.float32)  # latest time-based pace arc length (for pace marker)
-
-    set_camera_active(camera, True)
-    obs, _ = env.reset()
-    state = _resolve_state(env, obs)
-    try:
-        for t in range(T):
-            if markers is not None:                                  # colour balls from the env's status so far
-                markers.update(cur_status[:, :k].reshape(-1).astype(np.int64))
-                gidx = np.clip(cur_setpoint - 1, 0, k - 1)           # current goal keypoint per env
-                goal_marker.update(base[np.arange(num_envs), gidx] + goal_lift)
-                pace_marker.update(start_w_env + cur_s_ref[:, None] * path_dir_np + goal_lift)
-            actions, _ = agent.act(obs, state, timestep=10**9, timesteps=10**9)
-            obs, reward, terminated, truncated, info = env.step(actions)
-            rgb = read_camera_rgb(camera)                            # (num_envs,H,W,3)
-            snap = uenv.viz_snapshot()
-
-            if t == 0:
-                spacing = float(snap["keypoint_spacing"])
-                k = int(snap["keypoints_total"].min().item())
-                # Ball diameter is a fraction of the keypoint spacing (spec 0.5; enlarged for
-                # legibility). start_world/path_dir are ENV-LOCAL (like env.goal_world in the control
-                # wrapper, which adds env_origins) so shift into world frame; lift onto the surface.
-                ball_frac = float(getattr(recorder_cfg, "ball_diameter_frac", 1.6))
-                radius = spacing * ball_frac / 2.0
-                normal = snap["surface_normal"].numpy()                       # (E,3)
-                env_origins = uenv.scene.env_origins.detach().cpu().numpy()   # (E,3)
-                base = sv.keypoint_world_positions(snap["start_w"], snap["path_dir"], spacing, k)
-                base = base + env_origins[:, None, :]                         # (E,k,3) env-world, on surface
-                markers = sv.KeypointBallMarkers("/World/Visuals/surface_keypoints", radius=radius)
-                markers.set_positions((base + normal[:, None, :] * radius).reshape(-1, 3))
-                # Separate, exaggerated (4x) moving marker for the CURRENT goal keypoint.
-                goal_radius = radius * 4.0
-                goal_lift = normal * goal_radius                             # (E,3)
-                goal_marker = sv.GoalMarker("/World/Visuals/surface_goal", radius=goal_radius)
-                # Same big purple sphere, slightly transparent, for the TIME-BASED pace setpoint.
-                pace_marker = sv.GoalMarker("/World/Visuals/surface_pace", radius=goal_radius, opacity=0.4)
-                start_w_env = snap["start_w"].numpy() + env_origins          # (E,3) path start, on surface
-                path_dir_np = snap["path_dir"].numpy()                       # (E,3)
-                kpst = np.zeros((num_envs, T, k), dtype=np.uint8)             # per-frame keypoint status (minimap)
-                des_force = np.maximum(snap["desired_force_N"].numpy(), 1e-6)  # (E,) force-gauge scale
-                track_tol = float(snap["keypoint_track_tol"])
-                v_des = float(snap["desired_speed"])
-                bf_t = snap.get("break_force_N")                             # present only when the peg is fragile
-                break_force = bf_t.numpy() if bf_t is not None else None
-                # Plate frame per env for the top-down inset.
-                start_w = snap["start_w"].numpy(); goal_w = snap["goal_w"].numpy()
-                u_dir = snap["path_dir"].numpy(); v_dir = snap["d_lat"].numpy()
-                center = 0.5 * (start_w + goal_w)
-                su, svv = sv.project_uv(start_w, center, u_dir, v_dir)
-                gu, gvv = sv.project_uv(goal_w, center, u_dir, v_dir)
-                half = 0.5 * snap["path_length"].numpy()             # square plate: half_u == half_v
-                const = dict(center=center, u=u_dir, v=v_dir, start_uv=np.stack([su, svv], 1),
-                             goal_uv=np.stack([gu, gvv], 1), half=half)
-                kp_uv = _keypoint_uv(const["start_uv"], const["goal_uv"], half, spacing, k)   # (E,k,2)
-
-            # tip projection for the inset trace
-            tu, tv = sv.project_uv(snap["tip_w"].numpy(), const["center"], const["u"], const["v"])
-            over = (np.abs(tu) <= const["half"]) & (np.abs(tv) <= const["half"])
-            alive = ~env_done
-            force_sq[alive, t] = snap["force_squash"].numpy()[alive]
-            orn_sq[alive, t] = snap["orn_squash"].numpy()[alive]
-            force_N[alive, t] = snap["force_N"].numpy()[alive]
-            angle_dev[alive, t] = snap["angle_dev_deg"].numpy()[alive]
-            shear_N[alive, t] = snap["shear_force_N"].numpy()[alive]
-            cross_m[alive, t] = snap["cross_track"].numpy()[alive]
-            pace_ms[alive, t] = snap["along_track_speed"].numpy()[alive]
-            tr_u[alive, t] = tu[alive]; tr_v[alive, t] = tv[alive]
-            tr_c[alive, t] = snap["in_contact"].numpy()[alive]
-            tr_o[alive, t] = over[alive]
-            alive_idx = np.nonzero(alive)[0]
-            if alive_idx.size:
-                frames[torch.from_numpy(alive_idx), t] = rgb[torch.from_numpy(alive_idx)]
-
-            cur_s_ref = snap["s_ref"].numpy()                        # for next step's pace-marker update
-            cur_status = snap["keypoint_status"].numpy()            # authoritative env status after this step
-            cur_setpoint = snap["setpoint_kp_idx"].numpy()
-            kpst[:, t, :] = cur_status[:, :k]
-
-            term_now = _coerce_done(terminated).cpu().numpy()
-            trunc_now = _coerce_done(truncated).cpu().numpy()
-            new_done = (term_now | trunc_now) & alive
-            if new_done.any():
-                idx = np.nonzero(new_done)[0]
-                term_step[idx] = t
-                succ = info.get("is_success", None)
-                if isinstance(succ, torch.Tensor):
-                    success[idx] = succ.view(-1).bool().cpu().numpy()[idx]
-                env_done[idx] = True
-            state = _resolve_state(env, obs)
-            if env_done.all():
-                break
-    finally:
-        set_camera_active(camera, False)
-
-    # Compose one annotated tile per env (its last-alive frame), then montage.
-    tiles = []
-    for e in range(n_tiles):
-        di = int(term_step[e])
-        frame = frames[e, di].numpy()
-        inset = None
-        if overlays:
-            inset = sv.topdown_inset(
-                tr_u[e, : di + 1], tr_v[e, : di + 1], tr_c[e, : di + 1], tr_o[e, : di + 1],
-                const["start_uv"][e], const["goal_uv"][e], float(const["half"][e]), float(const["half"][e]),
-                keypoint_uv=kp_uv[e], keypoint_status=kpst[e, di],
-            )
-        border = (45, 200, 95) if success[e] else None
-        if overlays:
-            ffill, ftf = _force_bar(float(force_N[e, di]), float(des_force[e]),
-                                    None if break_force is None else float(break_force[e]))
-            readouts = _build_readouts(force_sq[e, di], force_N[e, di], shear_N[e, di], des_force[e],
-                                       pace_ms[e, di], v_des, cross_m[e, di], track_tol)
-            kp_counts = _build_kp_counts(kpst[e, di])
-            tiles.append(sv.compose_tile(
-                frame, float(force_sq[e, di]), float(orn_sq[e, di]), inset, border,
-                force_text=f"{force_N[e, di]:.1f}N", orn_text=f"{angle_dev[e, di]:+.0f}°",
-                force_fill=ffill, orn_fill=float(angle_dev[e, di] / 30.0),
-                force_target_frac=ftf, readouts=readouts, kp_counts=kp_counts))
-        else:
-            tiles.append(frame if border is None else sv.compose_tile(frame, 0, 0, None, border))
-
-    grid = sv.montage(tiles, rows, cols)
-    out_path = os.path.join(output_dir, out_name)
-    # stills_grid_png=False writes ONLY the mp4 below (no PNG montage) — for a pure video request.
-    write_png = bool(getattr(recorder_cfg, "stills_grid_png", True))
-    if write_png:
-        Image.fromarray(grid).save(out_path)
-        print(f"[record] wrote stills grid {out_path} "
-              f"({rows}x{cols} tiles, {int(success.sum())}/{n_tiles} succeeded)", flush=True)
-
-    # Optional full mp4 of the SAME rollout: per-frame gauges + a top-down path that grows over time
-    # (the in-scene keypoint balls animate for free in the captured frames). The matplotlib inset is
-    # cached at a stride so we render ~T/K of them per env instead of one per frame.
-    if bool(getattr(recorder_cfg, "stills_grid_video", False)):
-        from wrappers.recording_grid import write_video
-
-        K = 3
-        Tmax = int(term_step[:n_tiles].max()) + 1
-        inset_cache = []  # per env: inset image at times 0, K, 2K, ... (path up to that time)
-        for e in range(n_tiles):
-            di = int(term_step[e])
-            cache = []
-            if overlays:
-                for tt in range(0, di + 1, K):
-                    cache.append(sv.topdown_inset(
-                        tr_u[e, : tt + 1], tr_v[e, : tt + 1], tr_c[e, : tt + 1], tr_o[e, : tt + 1],
-                        const["start_uv"][e], const["goal_uv"][e],
-                        float(const["half"][e]), float(const["half"][e]),
-                        keypoint_uv=kp_uv[e], keypoint_status=kpst[e, tt]))
-            inset_cache.append(cache or [None])
-
-        video = None
-        for t in range(Tmax):
-            tiles_t = []
-            for e in range(n_tiles):
-                di = int(term_step[e])
-                q = min(t, di)                                  # freeze finished envs on their last frame
-                frame = frames[e, q].numpy()
-                border = (45, 200, 95) if (success[e] and t >= di) else None
-                if overlays:
-                    ins = inset_cache[e][min(q // K, len(inset_cache[e]) - 1)]
-                    ffill, ftf = _force_bar(float(force_N[e, q]), float(des_force[e]),
-                                            None if break_force is None else float(break_force[e]))
-                    readouts = _build_readouts(force_sq[e, q], force_N[e, q], shear_N[e, q], des_force[e],
-                                               pace_ms[e, q], v_des, cross_m[e, q], track_tol)
-                    kp_counts = _build_kp_counts(kpst[e, q])
-                    tiles_t.append(sv.compose_tile(
-                        frame, float(force_sq[e, q]), float(orn_sq[e, q]), ins, border,
-                        force_text=f"{force_N[e, q]:.1f}N", orn_text=f"{angle_dev[e, q]:+.0f}°",
-                        force_fill=ffill, orn_fill=float(angle_dev[e, q] / 30.0),
-                        force_target_frac=ftf, readouts=readouts, kp_counts=kp_counts))
-                else:
-                    tiles_t.append(frame if border is None else sv.compose_tile(frame, 0, 0, None, border))
-            gframe = sv.montage(tiles_t, rows, cols)
-            if video is None:
-                video = np.zeros((Tmax,) + gframe.shape, dtype=np.uint8)
-            video[t] = gframe
-        vid_base = os.path.join(output_dir, os.path.splitext(out_name)[0])
-        vid_path = write_video(video, vid_base, fps=int(recorder_cfg.fps), fmt="mp4")
-        print(f"[record] wrote stills video {vid_path} ({Tmax} frames)", flush=True)
-        if not write_png:
-            out_path = vid_path  # nothing else written; return the mp4 path
-
-    return out_path
-
-
 def _build_readouts(force_sq, fN, shr, desF, pac, vdes, xtr, tol):
     """Four raw-value read-out lines for the bottom-right of a tile, each coloured green->red by how
     close it is to ideal: current normal force, current shear force, along-track pace, cross-track
@@ -558,7 +305,7 @@ def _keypoint_uv(start_uv, goal_uv, half, spacing, k):
     return start_uv[:, None, :] + frac[:, :, None] * (goal_uv - start_uv)[:, None, :]
 
 
-def collect_annotated_ranked(
+def _collect_surface(
     *,
     env: Any,
     agent: Any,
@@ -591,7 +338,7 @@ def collect_annotated_ranked(
         raise RuntimeError(f"max_episode_length must be > 0; got {max_episode_length!r}.")
     rows, cols = 3, 4                       # best-4 / median-4 / worst-4 (matches the plain grid video)
     n_sel = rows * cols
-    overlays = bool(getattr(recorder_cfg, "surface_overlays", True))
+    overlays = True
     ball_frac = float(getattr(recorder_cfg, "ball_diameter_frac", 1.6))
     os.makedirs(output_dir, exist_ok=True)
     num_episodes = max(1, math.ceil(int(num_trajectories) / max(1, num_envs)))
@@ -847,6 +594,54 @@ def collect_annotated_ranked(
     return vid_path
 
 
+# ---------------------------------------------------------------------------------------------------
+# Overlay registry + THE single standalone trajectory recorder (mode='trajectories').
+# ---------------------------------------------------------------------------------------------------
+# recorder.overlay -> renderer that collects + composes the ranked best/median/worst grid. Add a new
+# task overlay by writing its renderer (same kw signature) and registering it here — nothing else changes.
+OVERLAY_RENDERERS = {
+    "surface_tracking": _collect_surface,   # keypoint-status balls + force/orientation gauges + path minimap
+    "none": _collect_plain,                 # plain frames, no overlay -- env-agnostic (forge / peg / ...)
+}
+
+
+def collect_recording(
+    *,
+    env: Any,
+    agent: Any,
+    recorder_cfg: Any,
+    camera: Any,
+    max_episode_length: int,
+    num_trajectories: int,
+    output_dir: str,
+    gif_name: str = "recording.mp4",
+) -> str:
+    """The one standalone trajectory recorder (mode='trajectories'): collect >= num_trajectories
+    episodes, rank best-4 / median-4 / worst-4 by return, write a 3x4 grid mp4 with the per-tile
+    overlay selected by ``recorder_cfg.overlay`` (see OVERLAY_RENDERERS). 'none' is env-agnostic;
+    'surface_tracking' requires env.viz_snapshot. Returns the written mp4 path."""
+    # Full-episode VIEWING toggle (recorder-only, runtime, display-not-dynamics): disable success/lag
+    # early-termination so every tile plays the whole episode. Kept OUT of env_cfg_overrides on purpose
+    # (that path is guarded) so it can never masquerade as the training env.
+    if bool(getattr(recorder_cfg, "full_episode", False)):
+        _ct = getattr(env.unwrapped, "cfg_task", None)
+        if _ct is not None:
+            for _flag in ("terminate_on_success", "terminate_on_lag"):
+                if hasattr(_ct, _flag):
+                    setattr(_ct, _flag, False)
+            print("[record] recorder.full_episode=true — early-termination disabled for the recording "
+                  "(display only; env dynamics unchanged).", flush=True)
+    overlay = str(getattr(recorder_cfg, "overlay", "surface_tracking"))
+    renderer = OVERLAY_RENDERERS.get(overlay)
+    if renderer is None:
+        raise ValueError(
+            f"unknown recorder.overlay {overlay!r}; registered overlays: {sorted(OVERLAY_RENDERERS)}"
+        )
+    return renderer(env=env, agent=agent, recorder_cfg=recorder_cfg, camera=camera,
+                    max_episode_length=max_episode_length, num_trajectories=num_trajectories,
+                    output_dir=output_dir, gif_name=gif_name)
+
+
 def collect_reset_snapshots(
     *,
     env: Any,
@@ -878,7 +673,7 @@ def collect_reset_snapshots(
         raise RuntimeError("reset_snapshots requires FlatSurfaceFollowEnv (env.viz_snapshot missing).")
 
     num_envs = int(env.num_envs)
-    overlays = bool(getattr(recorder_cfg, "surface_overlays", True))
+    overlays = True
     ball_frac = float(getattr(recorder_cfg, "ball_diameter_frac", 1.0))
     n_resets = int(getattr(recorder_cfg, "reset_snapshots_count", 8))
     hold_s = float(getattr(recorder_cfg, "reset_snapshots_hold_s", 1.0))
