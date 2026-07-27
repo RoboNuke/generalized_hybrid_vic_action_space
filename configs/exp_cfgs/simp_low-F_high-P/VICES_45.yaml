@@ -33,8 +33,8 @@ runner_cfg:
   # Surface-task params on FlatSurfaceFollowTask via dotted env_cfg overrides.
   env_cfg_overrides:
     task.desired_speed_cm_s: 5.0
-    task.force_desired_min: 5.0
-    task.force_desired_max: 5.0
+    task.force_desired_min: 10.0
+    task.force_desired_max: 10.0
     task.orientation_desired_angle_deg: 0.0
     task.success_orn_tol_deg: 180.0   # angle success check DISABLED (drag angle must not gate success in the tilted-grasp experiment)
     task.plate_tilt_range_deg: 0.0

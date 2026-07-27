@@ -348,11 +348,13 @@ def _collect_surface(
     # Per-tile STATUS indicator (drawn bottom-right of each tile): in-progress until the trajectory
     # ends, then its terminal cause. Determined at termination from is_success + the fragile wrapper's
     # per-env break flags in env.extras["to_log"].
-    _ST_INPROG, _ST_DONE, _ST_BROKE, _ST_LOST = 0, 1, 2, 3
-    _STATUS_LABEL = {_ST_INPROG: "in-progress", _ST_DONE: "completed",
-                     _ST_BROKE: "broke peg", _ST_LOST: "lost-contact"}
+    _ST_INPROG, _ST_DONE, _ST_BROKE, _ST_LOST, _ST_TRAVERSED, _ST_TIMEOUT = 0, 1, 2, 3, 4, 5
+    _STATUS_LABEL = {_ST_INPROG: "in-progress", _ST_DONE: "success",
+                     _ST_BROKE: "broke peg", _ST_LOST: "lost-contact",
+                     _ST_TRAVERSED: "traversed <90%", _ST_TIMEOUT: "timeout"}
     _STATUS_COLOR = {_ST_INPROG: (180, 180, 185), _ST_DONE: (60, 200, 90),
-                     _ST_BROKE: (225, 70, 70), _ST_LOST: (240, 160, 50)}
+                     _ST_BROKE: (225, 70, 70), _ST_LOST: (240, 160, 50),
+                     _ST_TRAVERSED: (235, 205, 60), _ST_TIMEOUT: (120, 130, 200)}
 
     def _read_flag(info, key):
         # The fragile wrapper publishes its per-env break flags in info["per_env_episode_stat"] (the
@@ -494,13 +496,22 @@ def _collect_surface(
                     # takes precedence over the force break); a plain time-out leaves it in-progress.
                     _cl = _read_flag(info, "Fragile / Contact Loss") > 0.5
                     _pb = _read_flag(info, "Fragile / Peg Break") > 0.5
+                    _tr = _read_flag(info, "Episode / Traversed under-achieved") > 0.5
+                    _to = _read_flag(info, "Episode / Timeout incomplete") > 0.5
                     for e in idx:
+                        # Priority: success, then the terminal-BREAK causes, then the two non-break
+                        # non-success outcomes (went the full distance but under 90% coverage; or plain
+                        # ran-out-of-time before finishing). A finished tile is never left "in-progress".
                         if success[e]:
                             status[e] = _ST_DONE
                         elif _cl[e]:
                             status[e] = _ST_LOST
                         elif _pb[e]:
                             status[e] = _ST_BROKE
+                        elif _tr[e]:
+                            status[e] = _ST_TRAVERSED
+                        elif _to[e]:
+                            status[e] = _ST_TIMEOUT
                     env_done[idx] = True
                 state = _resolve_state(env, obs)
                 if env_done.all():

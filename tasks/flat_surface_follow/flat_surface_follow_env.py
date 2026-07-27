@@ -1008,12 +1008,24 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # Success-conditional per-episode stats (NaN for rollouts that did NOT succeed, so block_agent
         # averages ONLY over successful trajectories). Full tag names -> logged verbatim.
         succeeded = self.success_reward_given
+        # Outcome breakdown of the FAILURE bucket (0/1 flags -> averaged over ALL finishing episodes via
+        # the mask, so each is a fraction-of-episodes). _get_dones ran just before this, so _passed_all /
+        # _time_out are current. "Timeout incomplete" = ran out of steps WITHOUT traversing the path;
+        # "Traversed under-achieved" = went the full distance (passed every keypoint) but forfeited too
+        # many so coverage stayed below success_keypoint_frac -> never cleared the success bar.
+        _cov = self.keypoints_achieved.float() / self.keypoints_total.clamp_min(1).float()
+        _cov_met = _cov >= float(self.cfg_task.success_keypoint_frac)
+        _passed_all = getattr(self, "_passed_all", torch.zeros_like(self.reset_buf))
+        _time_out = getattr(self, "_time_out", torch.zeros_like(self.reset_buf))
         self.extras["per_env_episode_stat"] = {
             "Episode / Steps to success": torch.where(succeeded, self.success_step, nan),
             "Episode_Reward/success_time_on_success": torch.where(succeeded, self.success_time_earned, nan),
             # Fraction of FINISHING rollouts ending because of lag (0/1, so it averages over ALL of
             # them, not just successes) -> lag-termination rate.
             "Episode / Lag termination rate": self._term_lag.float(),
+            "Episode / Timeout incomplete": (_time_out & ~_passed_all).float(),
+            "Episode / Traversed under-achieved": (_passed_all & ~_cov_met).float(),
+            "Episode / Traversed (went the distance)": _passed_all.float(),
         }
         self.extras["per_env_episode_stat_mask"] = self.reset_buf.clone()
 
@@ -1043,6 +1055,14 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self._compute_intermediate_values(dt=self.physics_dt)
         cfg = self.cfg_task
         time_out = self.episode_length_buf >= self.max_episode_length - 1
+        # Truncate once the WHOLE path has been traversed (the progress frontier has passed EVERY
+        # keypoint): from there the setpoint is pinned at the far edge, so no further keypoint reward
+        # is reachable and continuing only wastes steps. Truncated (not terminated) so SAC still
+        # bootstraps the (near-zero) tail value rather than treating it as a hard failure.
+        passed_all = self.keypoints_passed >= self.keypoints_total
+        self._passed_all = passed_all                 # stashed for the per-episode outcome metrics + recorder pill
+        self._time_out = time_out
+        truncated = time_out | passed_all
         terminated = torch.zeros_like(time_out)
         self._term_lag = torch.zeros_like(time_out)   # this step's lag-termination flag (for the metric)
         if bool(cfg.terminate_on_lag):
@@ -1052,7 +1072,7 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             terminated = terminated | self._term_lag
         if bool(cfg.terminate_on_success):
             terminated = terminated | (self._get_curr_successes() & self.in_contact_any)
-        return terminated, time_out
+        return terminated, truncated
 
     # ------------------------------------------------------------------
     # Reset: grandparent (Factory) reset + our placement, then Forge dynamics rand
