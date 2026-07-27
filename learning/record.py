@@ -9,16 +9,15 @@ config; it loads that one agent's weights, rolls out, collects complete
 trajectories, and writes an agent-specific best/median/worst grid video next to
 the checkpoint (``<agent_dir>/videos/recording.mp4``).
 
-WANDB-TAG mode: give it ``--wandb_entity/--wandb_project/--wandb_tag`` and it finds
-every run with that tag, downloads each run's ``ckpt_best.pt`` from wandb, records
-it, and writes each video to::
+WANDB-TAG mode: give it ``--wandb_tag`` (aka ``--tag``) with ``--project``/``--entity`` and it
+finds every run with that tag, downloads each run's ``ckpt_best.pt`` + its ``runtime_config.yaml``
+(the EXACT training env) into ``runs/wandb/{project}_{tag}/{method}/{agent}/``, and records each
+agent in place (``<agent>/videos/recording.mp4``) -- one subprocess per agent. ``--download_only``
+fetches without rendering, ``--methods`` filters by wandb group, ``--force`` re-downloads.
 
-    runs/{project}/{tag}/{group_name}/{run_name}.mp4
-
-where ``group_name`` is the run's wandb group (the config name, e.g. ``7_GAS_dyn``)
-and ``run_name`` is the agent run (e.g. ``7_GAS_dyn_agent0``). The training config
-isn't stored on wandb, so the per-group config is taken from
-``--wandb_config_dir/{group_name}.yaml`` (defaults to the glued_surface configs).
+This is the ONE recording entry point (single agent + wandb batch); the recorder itself is just
+runner.py with a camera, and WHAT/HOW it draws is set in the ``_*.yaml`` record config
+(``recorder.mode`` = trajectories | reset_snapshots, ``recorder.overlay`` = surface_tracking | none).
 
 Examples
 --------
@@ -48,6 +47,9 @@ import subprocess
 import sys
 
 
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 def _project_root_on_path() -> None:
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if root not in sys.path:
@@ -67,22 +69,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Base config. Defaults to <agent_dir>/config.yaml.",
     )
     # --- wandb-tag (batch) mode ---
-    p.add_argument("--wandb_tag", type=str, default=None,
-                   help="Record EVERY run carrying this wandb tag: download each run's ckpt_best.pt "
-                        "and write runs/{project}/{tag}/{group}/{run_name}.mp4. Mutually exclusive "
-                        "with --agent_dir.")
-    p.add_argument("--wandb_entity", type=str, default="hur", help="wandb entity (wandb-tag mode).")
-    p.add_argument("--wandb_project", type=str, default="surface_baselines",
-                   help="wandb project (wandb-tag mode).")
-    p.add_argument("--wandb_config_dir", type=str, default="configs/exp_cfgs/glued_surface",
-                   help="Directory holding per-group training configs {group}.yaml (wandb-tag mode; "
-                        "the config.yaml isn't stored on wandb, so we use the repo config by group).")
+    p.add_argument("--wandb_tag", "--tag", dest="wandb_tag", type=str, default=None,
+                   help="Record EVERY run carrying this wandb tag: download each run's ckpt_best.pt + its "
+                        "runtime_config.yaml into runs/wandb/{project}_{tag}/{method}/{agent}/ and record "
+                        "each agent in place. Mutually exclusive with --agent_dir.")
+    p.add_argument("--wandb_entity", "--entity", dest="wandb_entity", type=str, default="hur",
+                   help="wandb entity (wandb-tag mode).")
+    p.add_argument("--wandb_project", "--project", dest="wandb_project", type=str, default="surface_baselines",
+                   help="wandb project (wandb-tag mode). Accepts 'entity/project' too.")
     p.add_argument("--wandb_run_filter", type=str, default=None,
-                   help="Optional substring: in wandb-tag mode, only record runs whose name contains it "
-                        "(e.g. '7_GAS' for one group, or '7_GAS_dyn_agent0' for a single agent).")
-    p.add_argument("--wandb_keep_ckpts", action="store_true",
-                   help="Keep the downloaded ckpt_best.pt files after recording (default: delete them "
-                        "once the video is written, since they are ~0.85 GB each).")
+                   help="Optional substring: only record runs whose name contains it (wandb-tag mode).")
+    p.add_argument("--methods", nargs="*", default=None,
+                   help="wandb-tag mode: only record these wandb groups/methods (by group name).")
+    p.add_argument("--download_only", action="store_true",
+                   help="wandb-tag mode: fetch the ckpt/config tree but do NOT render.")
+    p.add_argument("--force", action="store_true",
+                   help="wandb-tag mode: re-download ckpt_best.pt even if already present.")
     # --- shared record knobs ---
     p.add_argument(
         "--record_config", type=str, action="append", default=None,
@@ -160,57 +162,81 @@ def _record_single(args) -> None:
 
 
 def _record_from_wandb(args) -> None:
-    """Find every run with --wandb_tag, download each ckpt_best.pt, record it, and write
-    runs/{project}/{tag}/{group}/{run_name}.mp4. Each record runs in its own subprocess
-    (runner.main os._exit's, so we can't loop in-process)."""
-    if not args.record_config:
-        raise SystemExit("[record] --record_config is required (the recorder overlay YAML).")
+    """Download every run carrying --wandb_tag (its ckpt_best.pt + runtime_config.yaml) into
+    runs/wandb/{project}_{tag}/{method}/{agent}/, then record each agent in single-agent mode -- one
+    subprocess per agent, because runner.main os._exit's and would otherwise stop the batch. Uses the
+    run's OWN runtime_config.yaml (the exact training env) as the base config. --download_only fetches
+    the tree without rendering; --methods filters by wandb group; --force re-downloads."""
+    if not args.download_only and not args.record_config:
+        raise SystemExit("[record] --record_config is required for --wandb_tag (unless --download_only).")
     import wandb
 
-    entity, project, tag = args.wandb_entity, args.wandb_project, args.wandb_tag
-    api = wandb.Api()
-    runs = [r for r in api.runs(f"{entity}/{project}") if tag in r.tags]
+    project = args.wandb_project
+    path = project if "/" in project else (f"{args.wandb_entity}/{project}" if args.wandb_entity else project)
+    out = os.path.abspath(args.output_dir or os.path.join(
+        _PROJECT_ROOT, "runs", "wandb", f"{project.replace('/', '_')}_{args.wandb_tag}"))
+
+    api = wandb.Api(timeout=60)
+    runs = list(api.runs(path, filters={"tags": args.wandb_tag}))
     if args.wandb_run_filter:
-        runs = [r for r in runs if args.wandb_run_filter in r.name]
+        runs = [r for r in runs if args.wandb_run_filter in (r.name or "")]
     if not runs:
-        raise SystemExit(f"[record] no runs carry tag {tag!r} in {entity}/{project}"
+        raise SystemExit(f"[record] no runs in {path} tagged {args.wandb_tag!r}"
                          + (f" matching {args.wandb_run_filter!r}" if args.wandb_run_filter else ""))
-    print(f"[record] {len(runs)} run(s) tagged {tag!r} in {entity}/{project}"
-          + (f" matching {args.wandb_run_filter!r}" if args.wandb_run_filter else ""), flush=True)
+    print(f"[record] {len(runs)} run(s) in {path} tagged {args.wandb_tag!r} -> {out}", flush=True)
+
+    def _agent_index(r):
+        name = r.name or ""
+        if "_agent" in name:
+            try:
+                return int(name.rsplit("_agent", 1)[1])
+            except ValueError:
+                pass
+        return 0
+
+    agent_dirs: list[str] = []
+    skipped: list[str] = []
+    for r in sorted(runs, key=lambda r: r.name or ""):
+        method = r.group or (r.name or "unknown").rsplit("_agent", 1)[0]
+        if args.methods and method not in args.methods:
+            continue
+        ai = _agent_index(r)
+        agent_dir = os.path.join(out, method, str(ai))
+        ck_dir = os.path.join(agent_dir, "checkpoints")
+        best = os.path.join(ck_dir, "ckpt_best.pt")
+        label = f"{method}/agent{ai} ({r.name})"
+        if os.path.isfile(best) and not args.force:
+            print(f"[record] have {label} (skip download; --force to refresh)", flush=True)
+            agent_dirs.append(agent_dir); continue
+        files = {fl.name for fl in r.files()}
+        if "ckpt_best.pt" not in files:
+            print(f"[record] SKIP {label}: no ckpt_best.pt on wandb "
+                  "(run predates the ckpt-best backup, or hasn't hit a best yet)", flush=True)
+            skipped.append(label); continue
+        os.makedirs(ck_dir, exist_ok=True)
+        print(f"[record] downloading {label} ...", flush=True)
+        r.file("ckpt_best.pt").download(root=ck_dir, replace=True)
+        if "runtime_config.yaml" in files:
+            r.file("runtime_config.yaml").download(root=agent_dir, replace=True)
+            os.replace(os.path.join(agent_dir, "runtime_config.yaml"), os.path.join(agent_dir, "config.yaml"))
+        else:
+            print(f"[record]   WARNING: {label} has no runtime_config.yaml; pass --config for it.", flush=True)
+        agent_dirs.append(agent_dir)
+
+    if not agent_dirs:
+        raise SystemExit("[record] no agents with ckpt_best.pt were fetched -- nothing to record.")
+    if args.download_only:
+        print(f"[record] tree ready at {out} (--download_only; skipped {len(skipped)}).", flush=True)
+        return
 
     ok: list[str] = []
     failed: list[str] = []
-    for r in sorted(runs, key=lambda r: r.name):
-        group = r.group or r.name.rsplit("_agent", 1)[0]
-        config = os.path.join(args.wandb_config_dir, f"{group}.yaml")
-        if not os.path.isfile(config):
-            print(f"[record] SKIP {r.name}: group config not found: {config}", flush=True)
-            failed.append(r.name)
-            continue
-
-        base = os.path.join("runs", project, tag, group)
-        agent_dir = os.path.join(base, "_ckpts", r.name)          # staging: ckpt + intermediate video
-        ck_dir = os.path.join(agent_dir, "checkpoints")
-        vid_dir = os.path.join(agent_dir, "vid")
-        os.makedirs(ck_dir, exist_ok=True)
-        dst = os.path.join(base, f"{r.name}.mp4")
-
-        # 1) download ckpt_best.pt (skip if already present)
-        ckpt = os.path.join(ck_dir, "ckpt_best.pt")
-        if not os.path.isfile(ckpt):
-            try:
-                print(f"[record] downloading ckpt_best.pt for {r.name} ...", flush=True)
-                r.file("ckpt_best.pt").download(root=ck_dir, replace=True)
-            except Exception as e:  # noqa: BLE001
-                print(f"[record] SKIP {r.name}: ckpt_best.pt download failed: {e}", flush=True)
-                failed.append(r.name)
-                continue
-
-        # 2) record this agent in a fresh subprocess (single-agent mode)
-        cmd = [sys.executable, os.path.abspath(__file__),
-               "--agent_dir", agent_dir, "--config", config,
-               "--checkpoint_step", "best", "--output_dir", vid_dir]
-        for ov in args.record_config:
+    for ad in agent_dirs:
+        cfg = os.path.join(ad, "config.yaml")
+        cmd = [sys.executable, os.path.abspath(__file__), "--agent_dir", ad, "--checkpoint_step", "best"]
+        if os.path.isfile(cfg):
+            cmd += ["--config", cfg]
+        for ov in (args.record_config or []):
             cmd += ["--record_config", ov]
         if args.num_trajectories is not None:
             cmd += ["--num_trajectories", str(args.num_trajectories)]
@@ -220,22 +246,11 @@ def _record_from_wandb(args) -> None:
             cmd += ["--headless"]
         if args.enable_cameras:
             cmd += ["--enable_cameras"]
-        print(f"[record] recording {r.name} (group {group}) ...", flush=True)
+        print(f"[record] recording {ad} ...", flush=True)
         rc = subprocess.run(cmd).returncode
+        (ok if rc == 0 else failed).append(ad)
 
-        # 3) place the produced video at runs/{project}/{tag}/{group}/{run_name}.mp4
-        vids = sorted(glob.glob(os.path.join(vid_dir, "*.mp4")))
-        if rc == 0 and vids:
-            shutil.move(vids[0], dst)
-            print(f"[record] wrote {dst}", flush=True)
-            ok.append(r.name)
-            if not args.wandb_keep_ckpts:
-                shutil.rmtree(agent_dir, ignore_errors=True)
-        else:
-            print(f"[record] FAILED {r.name} (subprocess rc={rc}, mp4s found={vids})", flush=True)
-            failed.append(r.name)
-
-    print(f"\n[record] done: {len(ok)} ok, {len(failed)} failed.", flush=True)
+    print(f"\n[record] done: {len(ok)} ok, {len(failed)} failed, {len(skipped)} skipped.", flush=True)
     if failed:
         print(f"[record] failed: {failed}", flush=True)
         sys.exit(1)
