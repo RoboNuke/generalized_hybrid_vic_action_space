@@ -179,8 +179,8 @@ controller_cfg:
   # ---- shared per-axis bounds [x,y,z,Rx,Ry,Rz], geometric scaling k = lo*(hi/lo)^((a+1)/2) ----
   # A lower bound < ~1e-6 disables that channel (k=0) instead of producing NaN, so use > 0 for
   # meaningful variable impedance. Translation and rotation differ ~10x, hence the split values.
-  gain_min: [300, 300, 100, 150, 150, 150] # pose stiffness K (position x3, rotation x3)
-  gain_max: [4000, 4000, 2000, 150, 150, 150] 
+  gain_min: [300, 300, 100, 50, 50, 50] # pose stiffness K (position x3, rotation x3)
+  gain_max: [4000, 4000, 2000, 50, 50, 50] 
 
   # Policy commands the pose stiffness directly, so disable the base Forge env's per-reset
   # multiplicative gain randomization (default [0.41]x6) to avoid randomizing on top of the

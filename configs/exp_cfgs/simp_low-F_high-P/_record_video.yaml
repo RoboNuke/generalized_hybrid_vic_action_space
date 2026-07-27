@@ -37,7 +37,7 @@ runner_cfg:
     # spawn noise. Informative (not perfect) — shows how the trained policy handles a not-pre-seated,
     # slightly-jittered start.
     task.reset_press_to_contact: false
-    task.spawn_tip_pos_mean: [0.0, 0.0, 0.0005]   # 0.5mm above the plate
+    task.spawn_tip_pos_mean: [0.0, 0.0, 0.0005]   # 0.5mm above the plate (matches training)
     task.spawn_tip_pos_std: [0.001, 0.001, 0.0]
     task.keypoint_track_tol: 0.005                # 5mm on-track gate
 
