@@ -193,7 +193,8 @@ def _paste(dst, src, x, y):
 
 def compose_tile(frame, force_squash, orn_squash, inset, border_rgb=None, pad=6,
                  force_text=None, orn_text=None, force_fill=None, orn_fill=None,
-                 status_label=None, status_color=None, force_target_frac=0.5, readouts=None):
+                 status_label=None, status_color=None, force_target_frac=0.5, readouts=None,
+                 kp_counts=None):
     """One annotated tile: [force gauge | orientation gauge | frame], both gauges on the LEFT, with
     the top-down inset pasted into the frame's bottom-left corner. Gauge COLOUR = squash closeness;
     the FORCE gauge fills from the bottom (force_fill in [0,1], empty at <=0, yellow target tick at
@@ -201,7 +202,8 @@ def compose_tile(frame, force_squash, orn_squash, inset, border_rgb=None, pad=6,
     sign). force_text / orn_text are the physical read-outs. Optional coloured border. ``status_label``
     (with ``status_color`` RGB) draws a status pill in the frame's BOTTOM-RIGHT corner. ``readouts`` is
     an optional list of ``(text, rgb)`` lines stacked ABOVE that pill (same size), each colour-coded by
-    how close the value is to ideal."""
+    how close the value is to ideal. ``kp_counts`` is an optional list of ``(text, rgb)`` lines stacked
+    DOWN from the frame's TOP-RIGHT corner (the per-keypoint-outcome tally)."""
     from PIL import Image, ImageDraw, ImageFont
 
     frame = np.asarray(frame, dtype=np.uint8).copy()
@@ -214,7 +216,7 @@ def compose_tile(frame, force_squash, orn_squash, inset, border_rgb=None, pad=6,
         b = 6
         frame[:b, :] = border_rgb; frame[-b:, :] = border_rgb
         frame[:, :b] = border_rgb; frame[:, -b:] = border_rgb
-    if status_label or readouts:                     # status pill + raw read-outs, BOTTOM-RIGHT corner
+    if status_label or readouts or kp_counts:        # status pill + read-outs + keypoint tally
         img = Image.fromarray(frame); d = ImageDraw.Draw(img)
         try:
             font = ImageFont.truetype("DejaVuSans-Bold.ttf", 22)
@@ -229,6 +231,16 @@ def compose_tile(frame, force_squash, orn_squash, inset, border_rgb=None, pad=6,
 
         mx, my = 8, 6
         bx1, by1 = W - pad, H - pad
+        if kp_counts:                                # per-keypoint-outcome tally, TOP-RIGHT, stacked down
+            gap = 4
+            ty = pad
+            for text, rgb in kp_counts:
+                tw_, th_ = _tsize(text)
+                ry0, ry1 = ty, ty + th_ + 2 * my
+                rx0 = bx1 - tw_ - 2 * mx
+                d.rectangle([rx0, ry0, bx1, ry1], fill=(18, 18, 20))   # dark backing keeps coloured text legible
+                d.text((rx0 + mx, ry0 + my - 2), text, fill=tuple(int(c) for c in rgb), font=font)
+                ty = ry1 + gap
         top = by1 + 4                                # running top edge; readouts stack upward from the pill
         if status_label:
             tw_, th_ = _tsize(status_label)

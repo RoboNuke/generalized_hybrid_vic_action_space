@@ -112,6 +112,20 @@ def collect_and_record(
             f"got {max_episode_length!r}."
         )
 
+    # VIEWING toggle (recorder-only, display not dynamics): play the full episode instead of
+    # freezing each tile the instant it succeeds. Done at RUNTIME on the live env so it stays out
+    # of env_cfg_overrides (which the runner forbids for record overlays) and can never be mistaken
+    # for the training env. Only episode LENGTH changes; the peg's behavior is identical up to the
+    # point it would have terminated.
+    if bool(getattr(recorder_cfg, "full_episode", False)):
+        _ct = getattr(env.unwrapped, "cfg_task", None)
+        if _ct is not None:
+            for _flag in ("terminate_on_success", "terminate_on_lag"):
+                if hasattr(_ct, _flag):
+                    setattr(_ct, _flag, False)
+            print("[record] recorder.full_episode=true — success/lag early-termination disabled for "
+                  "the recording (display only; env dynamics unchanged).", flush=True)
+
     state_pre = getattr(agent, "_state_preprocessor", None) or (lambda s: s)
     critic_1, critic_2 = agent.critic_1, agent.critic_2
 
@@ -406,11 +420,12 @@ def collect_stills_grid(
                                     None if break_force is None else float(break_force[e]))
             readouts = _build_readouts(force_sq[e, di], force_N[e, di], shear_N[e, di], des_force[e],
                                        pace_ms[e, di], v_des, cross_m[e, di], track_tol)
+            kp_counts = _build_kp_counts(kpst[e, di])
             tiles.append(sv.compose_tile(
                 frame, float(force_sq[e, di]), float(orn_sq[e, di]), inset, border,
                 force_text=f"{force_N[e, di]:.1f}N", orn_text=f"{angle_dev[e, di]:+.0f}°",
                 force_fill=ffill, orn_fill=float(angle_dev[e, di] / 30.0),
-                force_target_frac=ftf, readouts=readouts))
+                force_target_frac=ftf, readouts=readouts, kp_counts=kp_counts))
         else:
             tiles.append(frame if border is None else sv.compose_tile(frame, 0, 0, None, border))
 
@@ -458,11 +473,12 @@ def collect_stills_grid(
                                             None if break_force is None else float(break_force[e]))
                     readouts = _build_readouts(force_sq[e, q], force_N[e, q], shear_N[e, q], des_force[e],
                                                pace_ms[e, q], v_des, cross_m[e, q], track_tol)
+                    kp_counts = _build_kp_counts(kpst[e, q])
                     tiles_t.append(sv.compose_tile(
                         frame, float(force_sq[e, q]), float(orn_sq[e, q]), ins, border,
                         force_text=f"{force_N[e, q]:.1f}N", orn_text=f"{angle_dev[e, q]:+.0f}°",
                         force_fill=ffill, orn_fill=float(angle_dev[e, q] / 30.0),
-                        force_target_frac=ftf, readouts=readouts))
+                        force_target_frac=ftf, readouts=readouts, kp_counts=kp_counts))
                 else:
                     tiles_t.append(frame if border is None else sv.compose_tile(frame, 0, 0, None, border))
             gframe = sv.montage(tiles_t, rows, cols)
@@ -499,6 +515,24 @@ def _build_readouts(force_sq, fN, shr, desF, pac, vdes, xtr, tol):
         (f"Shear: {float(shr):.1f}N",       sv.closeness_color(shear_close)),
         (f"Pace: {float(pac) * 100:.1f}cm/s", sv.closeness_color(pace_close)),
         (f"XTrk: {float(xtr) * 1000:+.0f}mm", sv.closeness_color(xtr_close)),
+    ]
+
+
+def _build_kp_counts(status_row):
+    """Per-keypoint-outcome tally for the TOP-RIGHT of a tile — one coloured line per outcome plus a
+    remaining (unpassed) line. ``status_row`` is this tile's (k,) status codes (0..4). Returns a list
+    of ``(text, rgb)`` for ``surface_viz.compose_tile(kp_counts=...)``; colours match STATUS_RGB so
+    each line reads as the same colour as its keypoint balls/circles."""
+    from learning import surface_viz as sv
+
+    s = np.asarray(status_row).reshape(-1)
+    rgb = sv.STATUS_RGB
+    return [
+        (f"Achieved: {int((s == 1).sum())}",   tuple(int(c) for c in rgb[1])),
+        (f"No contact: {int((s == 2).sum())}", tuple(int(c) for c in rgb[2])),
+        (f"Off track: {int((s == 3).sum())}",  tuple(int(c) for c in rgb[3])),
+        (f"Both off: {int((s == 4).sum())}",   tuple(int(c) for c in rgb[4])),
+        (f"Remaining: {int((s == 0).sum())}",  tuple(int(c) for c in rgb[0])),
     ]
 
 
@@ -790,13 +824,14 @@ def collect_annotated_ranked(
                 force_fill, force_tf = _force_bar(fN_q, desF, coll_break[j])
                 readouts = _build_readouts(coll_fsq[j][q], fN_q, coll_shr[j][q], desF,
                                            coll_pac[j][q], coll_vdes[j], coll_xtr[j][q], coll_tol[j])
+                kp_counts = _build_kp_counts(coll_kpst[j][q])
                 tiles.append(sv.compose_tile(
                     frame, float(coll_fsq[j][q]), float(coll_osq[j][q]), ins, border,
                     force_text=f"{fN_q:.1f}N", orn_text=f"{coll_ang[j][q]:+.0f}°",
                     force_fill=float(force_fill), orn_fill=float(coll_ang[j][q] / 30.0),
                     force_target_frac=float(force_tf),
                     status_label=_STATUS_LABEL[_st], status_color=_STATUS_COLOR[_st],
-                    readouts=readouts))
+                    readouts=readouts, kp_counts=kp_counts))
             else:
                 tiles.append(sv.compose_tile(frame, 0, 0, None, border,
                                              status_label=_STATUS_LABEL[_st], status_color=_STATUS_COLOR[_st]))

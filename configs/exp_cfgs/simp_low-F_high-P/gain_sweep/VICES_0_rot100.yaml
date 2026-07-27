@@ -9,7 +9,7 @@ runner_cfg:
   agent_type: sac
   num_envs: 512
   num_agents: 3
-  total_timesteps: 20_000
+  total_timesteps: 10_000
   eval_timesteps: 75
   memory_size: 1_000_000
   seed: -1
@@ -17,7 +17,7 @@ runner_cfg:
   # --- Cylinder grasp tilt (rotation of the cylinder RELATIVE TO THE GRIPPER), folded into the
   #     rigid weld frame once at startup. pitch = the angle in this file's name. ---
   grasp_rot_mode: fixed                  # 'none' = aligned grip; 'fixed' = constant weld tilt below
-  rel_grasp_rot_init_deg: [0.0, 30.0, 0.0]   # [roll, pitch, yaw] deg; cylinder pitch in the gripper
+  rel_grasp_rot_init_deg: [0.0, 0.0, 0.0]   # [roll, pitch, yaw] deg; cylinder pitch in the gripper
   # --- Fragile peg (directional break). To enable: flip the three bools on, and set break_force to
   #     [shear_N, normal_N]. efficient_reset is REQUIRED by fragile; direction_break_force makes
   #     break_force a [shear, normal] pair; require_contact_enabled also breaks on loss of contact
@@ -25,7 +25,7 @@ runner_cfg:
   fragile_peg_enabled: true
   efficient_reset_enabled: true
   direction_break_force: true
-  break_force: [1000, 20]                         # scalar N (magnitude) when direction_break_force=false;
+  break_force: [1000, 20]                      # scalar N (magnitude) when direction_break_force=false;
                                          # set to [shear_N, normal_N] when direction_break_force=true
   require_contact_enabled: true
   require_contact_grace_steps: 7   # no loss-of-contact break for the first N steps; earliest failure at step N+1 (peg spawns 1mm above, descends into contact)
@@ -123,7 +123,7 @@ sac_cfg:
     enabled: false
   experiment:
     directory: simp_low-F_high-P
-    experiment_name: "VICES_30.yaml"
+    experiment_name: "VICES_0_rot100"
     write_interval: 150
     checkpoint_interval: auto
     wandb: true
@@ -180,8 +180,8 @@ controller_cfg:
   # ---- shared per-axis bounds [x,y,z,Rx,Ry,Rz], geometric scaling k = lo*(hi/lo)^((a+1)/2) ----
   # A lower bound < ~1e-6 disables that channel (k=0) instead of producing NaN, so use > 0 for
   # meaningful variable impedance. Translation and rotation differ ~10x, hence the split values.
-  gain_min: [300, 300, 100, 80, 80, 80] # pose stiffness K (position x3, rotation x3)
-  gain_max: [4000, 4000, 2000, 80, 80, 80] 
+  gain_min: [300, 300, 100, 100, 100, 100] # pose stiffness K (position x3, rotation x3)
+  gain_max: [4000, 4000, 2000, 100, 100, 100] 
 
   # Policy commands the pose stiffness directly, so disable the base Forge env's per-reset
   # multiplicative gain randomization (default [0.41]x6) to avoid randomizing on top of the

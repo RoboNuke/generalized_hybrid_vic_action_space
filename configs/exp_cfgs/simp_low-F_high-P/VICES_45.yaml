@@ -36,6 +36,7 @@ runner_cfg:
     task.force_desired_min: 5.0
     task.force_desired_max: 5.0
     task.orientation_desired_angle_deg: 0.0
+    task.success_orn_tol_deg: 180.0   # angle success check DISABLED (drag angle must not gate success in the tilted-grasp experiment)
     task.plate_tilt_range_deg: 0.0
     # Held-cylinder spawn: TIP 1 mm above the starting keypoint (along the surface normal), peg straight
     # up/down (no rotation), no jitter. Each DOF has a mean + std; std == 0 => mean used exactly (no
@@ -179,8 +180,8 @@ controller_cfg:
   # ---- shared per-axis bounds [x,y,z,Rx,Ry,Rz], geometric scaling k = lo*(hi/lo)^((a+1)/2) ----
   # A lower bound < ~1e-6 disables that channel (k=0) instead of producing NaN, so use > 0 for
   # meaningful variable impedance. Translation and rotation differ ~10x, hence the split values.
-  gain_min: [300, 300, 100, 50, 50, 50] # pose stiffness K (position x3, rotation x3)
-  gain_max: [4000, 4000, 2000, 50, 50, 50]  
+  gain_min: [300, 300, 100, 80, 80, 80] # pose stiffness K (position x3, rotation x3)
+  gain_max: [4000, 4000, 2000, 80, 80, 80]  
 
   # Policy commands the pose stiffness directly, so disable the base Forge env's per-reset
   # multiplicative gain randomization (default [0.41]x6) to avoid randomizing on top of the

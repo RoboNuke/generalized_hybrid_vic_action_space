@@ -164,6 +164,7 @@ def main(argv: list[str] | None = None) -> None:
     # refuse to spawn the recorder TiledCamera without ``--enable_cameras``.
     # Peek the YAML BEFORE booting AppLauncher and force the flag on so the
     # user doesn't have to remember to pass it.
+    _record_overlay_env_drift: list = []  # (overlay_path, [keys]) — record overlays that mutate env
     try:
         import yaml as _yaml
 
@@ -187,18 +188,37 @@ def main(argv: list[str] | None = None) -> None:
                 _peek = _deep_merge_peek(_peek, _ov_peek)
         _agent_type_peek = str(_peek.get("runner_cfg", {}).get("agent_type", "sac")).lower()
         _cfg_key = "ppo_cfg" if _agent_type_peek == "ppo" else "sac_cfg"
-        if (
-            _peek.get(_cfg_key, {})
-                 .get("recorder", {})
-                 .get("enabled", False)
-            and not getattr(args, "enable_cameras", False)
-        ):
+        _recorder_on = (
+            _peek.get(_cfg_key, {}).get("recorder", {}).get("enabled", False)
+        )
+        if _recorder_on and not getattr(args, "enable_cameras", False):
             args.enable_cameras = True
             print(f"[runner] {_cfg_key}.recorder.enabled=true — forcing --enable_cameras on.")
+        # ENV-NEUTRALITY GUARD: a recording run must reproduce the EXACT training env (the recorder
+        # is just the runner with a camera injected by build_env). So no record OVERLAY may carry
+        # runner_cfg.env_cfg_overrides — those silently drift the recorded env from training. The
+        # base --config (the agent's snapshot) legitimately owns the training overrides; only the
+        # overlays are policed here. Collect offenders and raise AFTER this try (a raise inside it
+        # would be swallowed by the broad except below).
+        if _recorder_on:
+            for _ov_path in (args.overlay or []):
+                with open(_ov_path) as _ovf:
+                    _ovp = _yaml.safe_load(_ovf) or {}
+                _env_ov = ((_ovp.get("runner_cfg") or {}).get("env_cfg_overrides")) or {}
+                if _env_ov:
+                    _record_overlay_env_drift.append((_ov_path, sorted(_env_ov.keys())))
     except Exception as _e:
         # If the YAML is malformed we'll surface the error during ConfigManager
         # load below; don't block AppLauncher here.
         print(f"[runner] could not peek YAML for recorder.enabled: {_e!r}")
+    if _record_overlay_env_drift:
+        _details = "; ".join(f"{_p} sets {_ks}" for _p, _ks in _record_overlay_env_drift)
+        raise SystemExit(
+            "[runner] REFUSING to record: record overlay(s) carry runner_cfg.env_cfg_overrides, "
+            "which would drift the recorded env away from what the agent trained on. A record "
+            "overlay must be ENV-NEUTRAL (the recorder is the runner + a camera on the exact "
+            f"training env). Offenders: {_details}. Move any env change into the training config."
+        )
 
     # Boot Omniverse before any isaaclab.envs imports.
     app_launcher = AppLauncher(args)

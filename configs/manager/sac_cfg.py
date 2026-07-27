@@ -77,6 +77,15 @@ class RecorderCfg:
     output_subdir: str = "videos"
     """Subdirectory under the SAC experiment dir where GIFs are written."""
 
+    full_episode: bool = False
+    """Recorder-only VIEWING toggle. When True, the collect loop disables success/lag
+    early-termination AT RUNTIME (``terminate_on_success``/``terminate_on_lag`` -> False on the
+    live env) so every tile plays the full episode instead of freezing the instant it succeeds.
+    This is display-only: it changes episode LENGTH, never the dynamics/control/policy, and it is
+    kept OUT of ``env_cfg_overrides`` on purpose (that path is guarded/forbidden for record
+    overlays) so it can never masquerade as the training env. Use the eval path, not the recorder,
+    for any quantitative metric."""
+
     stills_grid: bool = False
     """Surface-task only. When True, ``learning/record.py`` runs ONE rollout and writes a single
     ``grid_rows x grid_cols`` PNG montage of annotated still frames (one env per tile) instead of the

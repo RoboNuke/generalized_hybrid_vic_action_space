@@ -14,6 +14,10 @@
 # Coordinate-frame axis markers (from _record.yaml). The rotated stiffness frame only appears for
 # gain_mapping=rotated agents; silently skipped otherwise.
 controller_cfg:
+  # ROT-GAIN A/B: force pose stiffness with rotation=80 (old policies trained at 50) to see the
+  # rot-gain effect on orientation-hold during the drag, holding the policy fixed.
+  gain_min: [300, 300, 100, 80, 80, 80]
+  gain_max: [4000, 4000, 2000, 80, 80, 80]
   visualize_rotation_frame: true        # rotation R, at the peg tip (rotated mode only)
   rotation_frame_axis_scale: 0.02
   visualize_peg_tip_frame: false
@@ -26,12 +30,9 @@ runner_cfg:
   num_agents: 1
   num_envs: 24              # parallel rollout width (24 trajectories/episode -> 48 in 2 episodes)
   memory_size: 50_000
-  # NO env_cfg_overrides. A record overlay must be ENV-NEUTRAL: the recorder is just the runner
-  # with a camera injected (build_env adds the TiledCamera when recorder.enabled, --enable_cameras
-  # is auto-forced), so recordings run the EXACT env the agent was trained on — read straight from
-  # its snapshotted config.yaml. Changing task params here silently drifts the recorded env away
-  # from training and produces misleading footage/metrics. The runner REFUSES a record overlay that
-  # carries env_cfg_overrides (see runner.main); put any env change in the training config instead.
+  # ENV-NEUTRAL (no env_cfg_overrides) — recordings run the EXACT training env + camera. The ONLY
+  # deliberate deviation is the rotation stiffness override in controller_cfg above (rot=80 vs the
+  # trained 50), an intentional A/B on the frozen policy; everything else is as trained.
 
 sac_cfg:
   recorder:
@@ -54,4 +55,4 @@ sac_cfg:
     horizontal_aperture: 20.955
     clipping_range: [0.1, 20.0]
     fps: 15                        # = env step rate 1/(sim.dt*decimation) = 1/((1/120)*8) -> real-time (75 steps = 5 s)
-    output_subdir: videos
+    output_subdir: videos_rot80
