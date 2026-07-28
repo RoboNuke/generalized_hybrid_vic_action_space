@@ -559,10 +559,16 @@ def main(argv: list[str] | None = None) -> None:
 
     # --wandb_tag: APPEND to experiment.wandb_kwargs["tags"] (deduped, order preserved) so
     # make_wandb_run passes them straight to wandb.init(tags=...). Merges with any config tags.
-    if getattr(args, "wandb_tag", None):
+    # Eval runs ALWAYS also carry an "eval" tag (independent of --wandb_tag) so they are trivial
+    # to filter out in wandb. Applied here, at the single tag-merge point, so EVERY eval path gets
+    # it: the e2e pipeline's eval step AND a bare `runner.py --mode eval` on a finished run.
+    _extra_tags = list(getattr(args, "wandb_tag", None) or [])
+    if args.mode == "eval":
+        _extra_tags.append("eval")
+    if _extra_tags:
         wk = dict(getattr(cfg.experiment, "wandb_kwargs", {}) or {})
         tags = list(wk.get("tags") or [])
-        for t in args.wandb_tag:
+        for t in _extra_tags:
             if t and t not in tags:
                 tags.append(t)
         wk["tags"] = tags
