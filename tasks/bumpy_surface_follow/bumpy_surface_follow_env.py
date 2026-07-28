@@ -45,6 +45,24 @@ from .bumpy_surface_follow_env_cfg import BumpySurfaceFollowEnvCfg
 class BumpySurfaceFollowEnv(FlatSurfaceFollowEnv):
     cfg: BumpySurfaceFollowEnvCfg
 
+    def __init__(self, cfg, render_mode=None, **kwargs):
+        super().__init__(cfg, render_mode, **kwargs)
+        # Efficient-reset (per-env teleport) faithfulness: a RigidObjectCollection is NOT part of
+        # scene.get_state()/reset_to(), so a teleported env would otherwise keep STALE bumps under a
+        # donor's peg pose. Carry the per-env bump layout (_bump_local, plate-local) across teleports
+        # by adding it to the wrapper's donor-copied extra attrs; _efficient_reset_finalize then writes
+        # the physical sphere poses relative to the just-teleported plate. (No-op when there are no
+        # bumps, i.e. bump_density=0.)
+        if getattr(self, "_bumps", None) is not None:
+            self._efficient_reset_extra_attrs = tuple(self._efficient_reset_extra_attrs) + ("_bump_local",)
+
+    def _efficient_reset_finalize(self, env_ids):
+        """Called by EfficientResetWrapper at the end of a partial (teleport) reset. ``_bump_local``
+        was already donor-copied (extra attr); write the physical sphere poses relative to the
+        teleported plate so the reset env's bumps match the donor's — a faithful reconstruction."""
+        if getattr(self, "_bumps", None) is not None:
+            self._place_bumps(env_ids)
+
     # ------------------------------------------------------------------
     # Build-time: create the bump sphere pool (before clone) + register it (after clone)
     # ------------------------------------------------------------------

@@ -165,6 +165,15 @@ class EfficientResetWrapper(gym.Wrapper):
             if hasattr(u, name):
                 getattr(u, name)[env_ids] = 0.0
 
+        # 5) Task-specific finalize hook for per-env state that scene.get_state()/reset_to() do NOT
+        #    cover. Notably a RigidObjectCollection (e.g. the bumpy surface's procedural bumps) is not
+        #    part of the scene state dict, so its physical poses aren't teleported. The donor's per-env
+        #    layout was already donor-copied above (via _efficient_reset_extra_attrs); the env writes
+        #    the physical poses here, AFTER the plate/assets have been teleported into place.
+        finalize = getattr(u, "_efficient_reset_finalize", None)
+        if callable(finalize):
+            finalize(env_ids)
+
     # ------------------------------------------------------------------ utils
     def _shuffle_state(self, state, source_idxs):
         """Recursively rebuild the get_state() dict, indexing per-env tensors by donor."""
