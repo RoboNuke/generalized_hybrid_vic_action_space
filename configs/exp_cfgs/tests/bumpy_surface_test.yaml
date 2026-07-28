@@ -1,0 +1,10 @@
+# Bare-bones config for the BUMPY surface-following task (tasks/bumpy_surface_follow).
+#
+# Mirrors tests/flat_surface_test.yaml: everything not set here falls back to defaults
+# (agent_type=sac, control_type=pose, no contact sensor, no domain randomization). The bumpy
+# task adds random spherical-cap bumps on the plate; bump knobs use their defaults. For quick
+# wiring/smoke tests only, NOT training.
+
+runner_cfg:
+  task: Isaac-FlatSurfaceFollow-Bumpy-Direct-v0
+  num_envs: 16

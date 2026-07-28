@@ -249,6 +249,30 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         """
         return self._plate_normal, self._plate_path_dir
 
+    # ------------------------------------------------------------------
+    # Extension hooks (no-ops here; overridden by non-flat surface subclasses)
+    # ------------------------------------------------------------------
+    def _setup_extra_assets(self):
+        """Create additional scene assets BEFORE ``clone_environments`` (so they are cloned across
+        envs). No-op for the flat plate; the bumpy-surface subclass spawns its procedural bumps here."""
+        pass
+
+    def _register_extra_assets(self):
+        """Register the extra assets into ``self.scene`` AFTER cloning (so the scene initializes /
+        updates / resets them each step). No-op for the flat plate."""
+        pass
+
+    def _compute_in_contact_any(self):
+        """Per-env "in contact in any direction" bool. Prefers the ContactSensorWrapper's per-axis
+        state; falls back to a small normal-force threshold when the sensor is disabled, so the env
+        stays self-contained. Overridable hook: a non-flat surface can OR-in a force-based signal so
+        that contact on geometry the plate-filtered contact sensor doesn't see (e.g. a bump) still
+        counts (the FT joint-force reaction is source-agnostic)."""
+        cw = getattr(self, "in_contact", None)
+        if torch.is_tensor(cw):
+            return cw.any(dim=1)
+        return self.measured_normal_force.abs() > 0.1
+
     def interaction_frame_world(self):
         """(E,3,3) world<-interaction rotation — columns are the interaction-frame axes in world.
         Consumed by the controller's ``fixed_rotation_from_interaction`` stiffness variant (R =
@@ -325,6 +349,10 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self._fixed_asset = RigidObject(self.cfg_task.fixed_asset)
         self._held_asset = RigidObject(self.cfg_task.held_asset)
 
+        # Hook: subclasses (e.g. the bumpy surface) create additional scene assets BEFORE cloning,
+        # so clone_environments replicates them across envs. No-op for the flat plate.
+        self._setup_extra_assets()
+
         self.scene.clone_environments(copy_from_source=False)
         if self.device == "cpu":
             self.scene.filter_collisions()
@@ -332,6 +360,9 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.scene.articulations["robot"] = self._robot
         self.scene.rigid_objects["fixed_asset"] = self._fixed_asset
         self.scene.rigid_objects["held_asset"] = self._held_asset
+        # Hook: subclasses register their extra assets into the scene AFTER cloning (so the scene
+        # initializes/updates/resets them each step). No-op for the flat plate.
+        self._register_extra_assets()
 
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
@@ -519,11 +550,7 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # contact-sensor wrapper's per-axis state; fall back to a small normal-force threshold when
         # the contact sensor is disabled, so the env stays self-contained. Computed BEFORE the
         # interaction frame below, which now consumes it (off-contact -> identity/EEF frame).
-        cw = getattr(self, "in_contact", None)
-        if torch.is_tensor(cw):
-            self.in_contact_any = cw.any(dim=1)
-        else:
-            self.in_contact_any = self.measured_normal_force.abs() > 0.1
+        self.in_contact_any = self._compute_in_contact_any()
         self.interaction_exists = self.in_contact_any
 
         # Orientation = the SAME [path_dir, d_lat, surface_normal] frame the controller's fixed-rot

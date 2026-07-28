@@ -114,6 +114,15 @@ class RecorderCfg:
     mm balls that are near-invisible from the recorder camera; the default here is enlarged for
     legibility. Lower it toward 0.5 for a physically faithful size."""
 
+    grid_select: str = "ranked"
+    """How ``mode='trajectories'`` chooses which collected trajectories to tile:
+      * "ranked" (default) — best-4 / median-4 / worst-4 by return in a 3x4 grid (the training-agent
+                             view: meaningful only when the policy varies in quality across envs).
+      * "all"             — tile ALL num_envs trajectories from a single episode in a square-ish grid
+                             (ceil(sqrt(num_envs)) cols). Use for random/untrained rollouts where the
+                             best/median/worst ranking is meaningless. Set num_trajectories == num_envs
+                             so exactly one fresh-spawn episode fills the grid (e.g. 16 -> 4x4)."""
+
     # ---- DEPRECATED (backward-compat only; IGNORED by the recorder) ----------------------------------
     # Replaced by ``mode`` + ``overlay`` above. Kept ONLY so that already-snapshotted training
     # config.yaml files (which serialized the full old RecorderCfg) still load under the strict

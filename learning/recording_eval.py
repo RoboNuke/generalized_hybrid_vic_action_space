@@ -336,7 +336,14 @@ def _collect_surface(
     T = int(max_episode_length)
     if T <= 0:
         raise RuntimeError(f"max_episode_length must be > 0; got {max_episode_length!r}.")
-    rows, cols = 3, 4                       # best-4 / median-4 / worst-4 (matches the plain grid video)
+    grid_select = str(getattr(recorder_cfg, "grid_select", "ranked"))
+    if grid_select == "all":
+        # Tile ALL envs from one episode (square-ish) — for random/untrained rollouts where the
+        # best/median/worst ranking is meaningless. num_trajectories should == num_envs.
+        cols = int(math.ceil(math.sqrt(num_envs)))
+        rows = int(math.ceil(num_envs / cols))
+    else:
+        rows, cols = 3, 4                   # best-4 / median-4 / worst-4 (matches the plain grid video)
     n_sel = rows * cols
     overlays = True
     ball_frac = float(getattr(recorder_cfg, "ball_diameter_frac", 1.6))
@@ -537,10 +544,15 @@ def _collect_surface(
         set_camera_active(camera, False)
 
     R = torch.tensor(coll_returns)
-    sel = select_grid_indices(R).tolist()                                # 12 indices: best-4/median-4/worst-4
-    print(f"[record] selected {len(sel)}/{len(coll_frames)} by return "
-          f"(best={[round(coll_returns[j], 1) for j in sel[:4]]} "
-          f"worst={[round(coll_returns[j], 1) for j in sel[-4:]]})", flush=True)
+    if grid_select == "all":
+        # All trajectories in collection order (one episode of num_envs fresh spawns), capped to the grid.
+        sel = list(range(min(n_sel, len(coll_frames))))
+        print(f"[record] tiling all {len(sel)} trajectories ({rows}x{cols}, grid_select=all)", flush=True)
+    else:
+        sel = select_grid_indices(R).tolist()                            # 12 indices: best-4/median-4/worst-4
+        print(f"[record] selected {len(sel)}/{len(coll_frames)} by return "
+              f"(best={[round(coll_returns[j], 1) for j in sel[:4]]} "
+              f"worst={[round(coll_returns[j], 1) for j in sel[-4:]]})", flush=True)
 
     # Animate the selected trajectories; insets cached at stride K (matplotlib is the bottleneck).
     K = 3
