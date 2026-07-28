@@ -126,6 +126,7 @@ def make_wandb_run(
     experiment_dir: str,
     log_dir: str,
     cfg: Any,
+    run_config: dict | None = None,
 ):
     """Create one wandb run for agent ``agent_index``.
 
@@ -143,6 +144,14 @@ def make_wandb_run(
 
     Any of these (plus ``entity``, ``tags``, ``mode``, ``id``, ...) can be
     overridden via ``experiment.wandb_kwargs``. Returns a wandb ``Run``.
+
+    ``run_config`` is the full serialized runtime config — the header-keyed dict of
+    every registered config section (``ConfigManager.to_serializable(loaded)``),
+    identical to what the runner writes to ``runtime_config.yaml``. When provided it
+    becomes the structured ``wandb.config`` verbatim, so runs are sortable/filterable
+    by any parameter in that file (e.g. ``runner_cfg.num_envs``, ``controller_cfg.*``),
+    not just this agent's own ``cfg`` subtree. Nested keys surface as dotted columns
+    in the wandb UI. Falls back to ``dataclasses.asdict(cfg)`` when None.
     """
     try:
         import wandb
@@ -167,18 +176,24 @@ def make_wandb_run(
     if experiment_cfg is not None:
         user_kwargs = dict(getattr(experiment_cfg, "wandb_kwargs", {}) or {})
 
-    # Best-effort config dump for the run's overview/sweep panes. asdict never
-    # raises on Callable/class fields (deepcopy returns them as-is); wandb str()s
-    # anything non-JSON. Fall back to just the experiment block if asdict trips.
-    try:
-        run_config = dataclasses.asdict(cfg)
-    except Exception:
-        run_config = {}
-        if experiment_cfg is not None:
-            try:
-                run_config = dataclasses.asdict(experiment_cfg)
-            except Exception:
-                run_config = {}
+    # Structured config for the run's overview/sweep panes. Prefer the full
+    # serialized runtime config (every registered header — already reduced to
+    # primitives, so classes/callables are safe), which mirrors runtime_config.yaml
+    # exactly. Without it, fall back to this agent's own cfg subtree: asdict never
+    # raises on Callable/class fields (deepcopy returns them as-is) and wandb str()s
+    # anything non-JSON; fall back further to just the experiment block if asdict trips.
+    if run_config is not None:
+        run_config = dict(run_config)  # copy: we mutate it below
+    else:
+        try:
+            run_config = dataclasses.asdict(cfg)
+        except Exception:
+            run_config = {}
+            if experiment_cfg is not None:
+                try:
+                    run_config = dataclasses.asdict(experiment_cfg)
+                except Exception:
+                    run_config = {}
     run_config.update(agent_index=agent_index, num_agents=num_agents)
 
     kwargs: dict[str, Any] = dict(user_kwargs)

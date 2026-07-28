@@ -660,6 +660,12 @@ def main(argv: list[str] | None = None) -> None:
               "(GAS rotation dims supervised toward the ground-truth interaction frame)")
 
     # ---- agent ----
+    # Serialize the full loaded config ONCE, here — after every CLI override has
+    # been applied to the loaded instances (experiment name/dir, wandb tags, record
+    # overrides) and before agent.init() creates the wandb run. This same tree is
+    # what ConfigManager.dump writes to runtime_config.yaml below (nothing mutates
+    # `loaded` in between), so wandb.config and that file carry identical parameters.
+    run_config = ConfigManager.to_serializable(loaded)
     agent_cls = SAC if agent_type == "sac" else PPO
     agent = agent_cls(
         models=models,
@@ -677,6 +683,8 @@ def main(argv: list[str] | None = None) -> None:
         aux_losses=AuxLossManager.from_cfg(loss_cfg),
         contact_axes=contact_axes,
         rot6d_slice=rot6d_slice,
+        # Full serialized runtime config -> structured wandb.config (see make_wandb_run).
+        run_config=run_config,
     )
 
     # Keypoint-servo removes the leading pose dims from the policy action, so the SAC per-pose-axis

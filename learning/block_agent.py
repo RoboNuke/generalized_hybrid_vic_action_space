@@ -66,6 +66,7 @@ class BlockAgent(Agent):
         num_agents: int = 1,
         contact_axes: list[int] | None = None,
         rot6d_slice: tuple[int, int] | None = None,
+        run_config: dict | None = None,
     ) -> None:
         super().__init__(
             models=models,
@@ -76,6 +77,14 @@ class BlockAgent(Agent):
             cfg=cfg,
         )
         self.num_agents = num_agents
+
+        # Full serialized runtime config (all registered headers, header-keyed and
+        # reduced to primitives via ConfigManager.to_serializable) — the exact same
+        # tree the runner writes to runtime_config.yaml. Passed to make_wandb_run so
+        # the structured wandb.config mirrors every parameter in that file (not just
+        # this agent's own cfg subtree), making runs sortable/filterable by any of
+        # them. None => make_wandb_run falls back to dataclasses.asdict(self.cfg).
+        self._run_config = run_config
 
         # Optional ground-truth contact buffering for the supervised-selection loss.
         # ``contact_axes`` are the force-eligible sensor-contact columns (nonzero
@@ -356,6 +365,7 @@ class BlockAgent(Agent):
                         experiment_dir=self.experiment_dir,
                         log_dir=agent_log_dir,
                         cfg=self.cfg,
+                        run_config=self._run_config,
                     )
                     # The runner dumps the verbatim runtime config to this path
                     # AFTER init(); MetricWriter.close() attaches it to the run.

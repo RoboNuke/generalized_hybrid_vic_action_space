@@ -43,6 +43,7 @@ class SAC(BlockAgent):
         aux_losses: "AuxLossManager | None" = None,
         contact_axes: list[int] | None = None,
         rot6d_slice: tuple[int, int] | None = None,
+        run_config: dict | None = None,
     ) -> None:
         """Soft Actor-Critic (SAC) with per-agent block-parallel independence.
 
@@ -79,6 +80,7 @@ class SAC(BlockAgent):
             num_agents=num_agents,
             contact_axes=contact_axes,
             rot6d_slice=rot6d_slice,
+            run_config=run_config,
         )
 
         # Asymmetric actor-critic: when ``state_space`` is provided, the critic

@@ -225,12 +225,38 @@ class ConfigManager:
                 f"expected only {sorted(cls.REGISTRY)}"
             )
 
-        # Preserve REGISTRY order in the output for deterministic, readable diffs.
-        serializable = {header: _to_yaml_safe(configs[header]) for header in cls.REGISTRY}
+        serializable = cls.to_serializable(configs)
         out_path = Path(path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with out_path.open("w") as f:
             yaml.safe_dump(serializable, f, sort_keys=False, default_flow_style=False)
+
+    @classmethod
+    def to_serializable(cls, configs: dict) -> dict:
+        """Reduce a loaded-configs dict to nested YAML/JSON-safe primitives.
+
+        Returns ``{header: primitives}`` for every registered header, in REGISTRY
+        order, each dataclass deep-converted through :func:`_to_yaml_safe` (classes
+        and callables become their import paths; everything else is data). This is
+        the single source of truth shared by :meth:`dump` (which YAML-writes it as
+        ``runtime_config.yaml``) and the wandb-run builder (which sets it as the
+        structured ``wandb.config``), so the two are guaranteed to carry the exact
+        same parameter tree.
+
+        Strict, like :meth:`dump`: every registered header must be present.
+        """
+        if not isinstance(configs, dict):
+            raise TypeError(
+                f"configs must be a dict, got {type(configs).__name__}"
+            )
+        missing = set(cls.REGISTRY) - set(configs)
+        if missing:
+            raise KeyError(
+                f"Configs missing required headers: {sorted(missing)}; "
+                f"expected all of {sorted(cls.REGISTRY)}"
+            )
+        # Preserve REGISTRY order for deterministic, readable output.
+        return {header: _to_yaml_safe(configs[header]) for header in cls.REGISTRY}
 
     @classmethod
     def _build(cls, dataclass_type: type, data: Any, *, context: str):
