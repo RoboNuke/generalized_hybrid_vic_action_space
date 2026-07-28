@@ -1,6 +1,6 @@
-# GAS: identical to simp_low-F_high-P/VICES_45 (pitch 45, force 10N, EMA 0.08, keypoint-servo
-# + fix_orientation + normal_offset -0.01, gains, all reward/env settings) EXCEPT the stiffness-frame
-# method: gain_mapping=rotated (policy-emitted stiffness-frame rotation).
+# GAS: identical to simp_low-F_high-P/VICES (force 10N, EMA 0.08, keypoint-servo
+# + fix_orientation + normal_offset -0.01, gains, all reward/env settings; baked at grasp pitch 45)
+# EXCEPT the stiffness-frame method: gain_mapping=rotated (policy-emitted stiffness-frame rotation).
 # Surface Path-Following experiment: simp_low-F_high-P (VICES / variable_diagonal).
 # Copied from glued_surface/2_VICES.yaml. Adds the knobs this sweep tunes, exposed at their
 # DEFAULT values (flip/edit as needed): directional fragile peg (+ require-contact + reset-in-

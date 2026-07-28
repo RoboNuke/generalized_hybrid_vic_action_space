@@ -1,3 +1,9 @@
+# GAS_geo: identical to simp_low-F_high-P/fixed_geo (gain_mapping=rotated, geometric interaction
+# frame; baked at grasp pitch 45) EXCEPT the stiffness-frame rotation is LEARNED (policy-emitted, as
+# in GAS) rather than fixed, and is supervised toward the GEOMETRIC interaction frame via a
+# chordal supervised-rotation loss (loss_cfg.supervised_rotation_enabled). I.e. GAS + geometric
+# interaction mode + supervised-rotation loss (the learned analog of fixed_geo). Mirrors the
+# fixed->learned delta in glued_surface/4_GAS_fixed_rot.yaml -> 8_GAS_geo.yaml.
 # Surface Path-Following experiment: simp_low-F_high-P (VICES / variable_diagonal).
 # Copied from glued_surface/2_VICES.yaml. Adds the knobs this sweep tunes, exposed at their
 # DEFAULT values (flip/edit as needed): directional fragile peg (+ require-contact + reset-in-
@@ -39,6 +45,7 @@ runner_cfg:
     task.orientation_desired_angle_deg: 0.0
     task.success_orn_tol_deg: 180.0   # angle success check DISABLED (drag angle must not gate success in the tilted-grasp experiment)
     task.plate_tilt_range_deg: 0.0
+    task.interaction_frame_mode: geometric   # target frame for the supervised-rotation loss (below)
     # Held-cylinder spawn: TIP 1 mm above the starting keypoint (along the surface normal), peg straight
     # up/down (no rotation), no jitter. Each DOF has a mean + std; std == 0 => mean used exactly (no
     # sampling). pos = surface-local (x=along-path, y=cross-track, z=normal, m); orn = WORLD-frame
@@ -97,6 +104,12 @@ loss_cfg:
   supervised_selection_enabled: false
   supervised_selection_policy_weight: 1.0
   supervised_selection_critic_weight: 0.0
+  # Supervise the policy's LEARNED rot6d stiffness frame toward the geometric interaction frame
+  # (R_eefᵀ·interaction_frame_world), the noise-free target a fixed-rot controller would use.
+  # This is what makes GAS_geo the "learned" analog of fixed_geo. Policy-only (critic weight 0).
+  supervised_rotation_enabled: true
+  supervised_rotation_policy_weight: 1.0   # tune on HPC (chordal loss in [0,8])
+  supervised_rotation_critic_weight: 0.0
 
 sac_cfg:
   tensorboard: false        # log ONLY to wandb (requires experiment.wandb: true)
@@ -124,7 +137,7 @@ sac_cfg:
     enabled: false
   experiment:
     directory: simp_low-F_high-P
-    experiment_name: "VICES_45.yaml"
+    experiment_name: "GAS_geo"
     write_interval: 150
     checkpoint_interval: auto
     wandb: true
@@ -169,7 +182,10 @@ controller_cfg:
   #                       (per block: 3 L-diagonal + 3 L-off-diagonal). D = zeros for now.
   # "rotated"           : diagonal K (6) + 6-D rotation vector (6) = 12 dims; R applied as
   #                       blkdiag(R,R) to the full 6x6.
-  gain_mapping: variable_diagonal #"constant" #
+  gain_mapping: rotated #"constant" #
+  # Rotation is LEARNED (policy-emitted rot6d frame), NOT fixed: fixed_rotation_from_interaction is
+  # intentionally OMITTED (cf. fixed_geo, which sets it true). The learned frame is instead pulled
+  # toward the geometric interaction frame by loss_cfg.supervised_rotation_enabled above.
   #fixed_rotation_rpy: [0.0, 30.0, 0.0]   # stiffness-frame R; aligned to the 30deg grasp tilt (used only when gain_mapping=rotated)
 
   # Toggle force control. When false: NO selection/force-target dims, K_f = zeros, and

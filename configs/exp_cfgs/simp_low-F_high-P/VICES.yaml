@@ -2,8 +2,10 @@
 # Copied from glued_surface/2_VICES.yaml. Adds the knobs this sweep tunes, exposed at their
 # DEFAULT values (flip/edit as needed): directional fragile peg (+ require-contact + reset-in-
 # contact), the keypoint-servo action override (target offsets + fixed EEF orientation), and
-# every surface reward-term weight. The one per-file difference is the cylinder's fixed grasp
-# PITCH relative to the gripper (rel_grasp_rot_init_deg), set to the angle in the file name.
+# every surface reward-term weight. The cylinder's fixed grasp PITCH relative to the gripper
+# (rel_grasp_rot_init_deg) defaults to 0 (aligned); sweep it across jobs with
+# launchers/hpc/sweep_launcher.bash (--sweep_param runner_cfg.rel_grasp_rot_init_deg) rather
+# than maintaining one config per angle.
 runner_cfg:
   task: Isaac-FlatSurfaceFollow-Direct-v0
   agent_type: sac
@@ -17,7 +19,7 @@ runner_cfg:
   # --- Cylinder grasp tilt (rotation of the cylinder RELATIVE TO THE GRIPPER), folded into the
   #     rigid weld frame once at startup. pitch = the angle in this file's name. ---
   grasp_rot_mode: fixed                  # 'none' = aligned grip; 'fixed' = constant weld tilt below
-  rel_grasp_rot_init_deg: [0.0, 30.0, 0.0]   # [roll, pitch, yaw] deg; cylinder pitch in the gripper
+  rel_grasp_rot_init_deg: [0.0, 0.0, 0.0]   # [roll, pitch, yaw] deg; cylinder pitch in the gripper
   # --- Fragile peg (directional break). To enable: flip the three bools on, and set break_force to
   #     [shear_N, normal_N]. efficient_reset is REQUIRED by fragile; direction_break_force makes
   #     break_force a [shear, normal] pair; require_contact_enabled also breaks on loss of contact
@@ -25,7 +27,7 @@ runner_cfg:
   fragile_peg_enabled: true
   efficient_reset_enabled: true
   direction_break_force: true
-  break_force: [1000, 20]                         # scalar N (magnitude) when direction_break_force=false;
+  break_force: [1000, 20]                      # scalar N (magnitude) when direction_break_force=false;
                                          # set to [shear_N, normal_N] when direction_break_force=true
   require_contact_enabled: true
   require_contact_grace_steps: 7   # no loss-of-contact break for the first N steps; earliest failure at step N+1 (peg spawns 1mm above, descends into contact)
@@ -124,7 +126,7 @@ sac_cfg:
     enabled: false
   experiment:
     directory: simp_low-F_high-P
-    experiment_name: "VICES_30.yaml"
+    experiment_name: "VICES"
     write_interval: 150
     checkpoint_interval: auto
     wandb: true
