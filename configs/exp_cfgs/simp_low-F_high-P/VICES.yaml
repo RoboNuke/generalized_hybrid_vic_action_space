@@ -10,8 +10,8 @@ runner_cfg:
   task: Isaac-FlatSurfaceFollow-Direct-v0
   agent_type: sac
   num_envs: 512
-  num_agents: 3
-  total_timesteps: 20_000
+  num_agents: 5
+  total_timesteps: 12_500
   eval_timesteps: 75
   memory_size: 1_000_000
   seed: -1
