@@ -40,6 +40,7 @@ EXPERIMENT_DIRECTORY=""
 RECORD=0
 RECORD_CONFIG=""
 WANDB_TAG_FLAGS=()   # collected --wandb_tag flags, forwarded verbatim to runner.py
+OVERLAY_FLAGS=()     # collected --overlay flags, forwarded verbatim to runner.py (train + eval)
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --no_eval) RUN_EVAL=0 ;;
@@ -49,6 +50,13 @@ while [[ $# -gt 0 ]]; do
         --wandb_tag)
             [[ $# -ge 2 ]] || { echo "[launcher] --wandb_tag requires a value" >&2; exit 2; }
             WANDB_TAG_FLAGS+=("--wandb_tag" "$2"); shift ;;
+        --overlay)
+            # A deep-merged YAML overlay applied over --config by runner.py BEFORE validation.
+            # Repeatable; forwarded to BOTH train and eval so the env matches (e.g. a sweep
+            # launcher pinning runner_cfg.rel_grasp_rot_init_deg per job). NOT passed to the
+            # record step, which reloads the agent's snapshotted (already-merged) config.yaml.
+            [[ $# -ge 2 ]] || { echo "[launcher] --overlay requires a value" >&2; exit 2; }
+            OVERLAY_FLAGS+=("--overlay" "$2"); shift ;;
         --record) RECORD=1 ;;
         --record_config)
             [[ $# -ge 2 ]] || { echo "[launcher] --record_config requires a value" >&2; exit 2; }
@@ -140,6 +148,7 @@ TRAIN_RC=0
     --logdir "$LOGDIR" \
     "${EXP_DIR_FLAG[@]}" \
     "${WANDB_TAG_FLAGS[@]}" \
+    "${OVERLAY_FLAGS[@]}" \
     --mode train \
     --headless || TRAIN_RC=$?
 
@@ -183,6 +192,7 @@ if [[ "$TRAIN_HARD_FAIL" -eq 0 ]]; then
             --logdir "$LOGDIR" \
             "${EXP_DIR_FLAG[@]}" \
             "${WANDB_TAG_FLAGS[@]}" \
+            "${OVERLAY_FLAGS[@]}" \
             --checkpoint "$EXP_DIR" \
             --mode eval \
             --headless
