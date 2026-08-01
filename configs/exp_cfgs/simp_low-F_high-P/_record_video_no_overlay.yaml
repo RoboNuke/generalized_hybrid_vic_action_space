@@ -1,0 +1,56 @@
+# _record_video_no_overlay.yaml - RAW version of _record_video.yaml (overlay: none). Same 3x4
+# of the surface task: collect num_trajectories full episodes, rank by return, select best-4/median-4/
+# worst-4, and draw the surface overlays (in-scene keypoint balls, force + orientation gauges, top-down
+# path inset) on the selected 12 tiles. The annotated viz layered on top of the best/median/worst grid.
+#
+# Render/quality settings taken from _record.yaml (560x720 tiles, camera at z=0.35, the in-scene
+# rotation-frame axis markers, fps 30). Deep-merged over an agent's snapshotted config.yaml.
+#
+#   python learning/record.py \
+#     --agent_dir runs/surface_baselines/surface_baselines/5_GAS/0 \
+#     --record_config configs/exp_cfgs/glued_surface/_record_video.yaml \
+#     --headless --checkpoint_step best
+
+# Coordinate-frame axis markers (from _record.yaml). The rotated stiffness frame only appears for
+# gain_mapping=rotated agents; silently skipped otherwise.
+controller_cfg:
+  visualize_rotation_frame: false       # raw: no in-scene axis markers (skipped for VICES anyway)
+  rotation_frame_axis_scale: 0.02
+  visualize_peg_tip_frame: false
+  peg_tip_frame_axis_scale: 0.02
+  visualize_eef_frame: false
+  eef_frame_axis_scale: 0.02
+  visualize_stiffness_ellipsoid: false
+
+runner_cfg:
+  num_agents: 1
+  num_envs: 24              # parallel rollout width (24 trajectories/episode -> 48 in 2 episodes)
+  memory_size: 50_000
+  # NO env_cfg_overrides. A record overlay must be ENV-NEUTRAL: the recorder is just the runner
+  # with a camera injected (build_env adds the TiledCamera when recorder.enabled, --enable_cameras
+  # is auto-forced), so recordings run the EXACT env the agent was trained on — read straight from
+  # its snapshotted config.yaml. Changing task params here silently drifts the recorded env away
+  # from training and produces misleading footage/metrics. The runner REFUSES a record overlay that
+  # carries env_cfg_overrides (see runner.main); put any env change in the training config instead.
+
+sac_cfg:
+  recorder:
+    enabled: true                  # triggers TiledCamera injection in build_env
+    full_episode: true             # play full episodes for viewing (recorder-only, not env drift)
+    overlay: none                 # RAW frames, no overlay (best/median/worst 3x4 grid unchanged)
+    ball_diameter_frac: 1.0        # diameter = keypoint spacing (enlarged for legibility)
+    video_format: mp4
+    num_trajectories: 24           # = num_envs -> ONE episode, so every trajectory is a FRESH spawn.
+                                   # (env.reset() only re-randomizes on its first call; a 2nd episode
+                                   # would start from stale end-of-episode-1 states -> garbage worst tiles.)
+    # Render/quality settings from _record.yaml:
+    width: 560                     # per-tile RGB width  (2.5x of 240, 4:3 preserved)
+    height: 720                    # per-tile RGB height (2.5x of 180, 4:3 preserved)
+    camera_pos: [1.0, 0.0, 0.35]
+    camera_quat: [-0.3535534, 0.6123724, 0.6123724, -0.3535534]
+    focal_length: 24.0
+    focus_distance: 0.05
+    horizontal_aperture: 20.955
+    clipping_range: [0.1, 20.0]
+    fps: 15                        # = env step rate 1/(sim.dt*decimation) = 1/((1/120)*8) -> real-time (75 steps = 5 s)
+    output_subdir: videos
