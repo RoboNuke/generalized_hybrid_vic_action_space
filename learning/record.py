@@ -128,6 +128,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--step_trace_out", type=str, default=None,
                    help="Single-agent mode: write a per-step / per-env trace parquet to this path "
                         "(passed through to runner). In wandb-tag mode the pipeline sets this itself.")
+    p.add_argument("--overlay", type=str, action="append", default=None,
+                   help="Deep-merge overlay YAML forwarded to runner.py --overlay (repeatable). In "
+                        "eval mode this lets a sweep pin one parameter per invocation. For eval, "
+                        "overlays carrying runner_cfg.env_cfg_overrides ARE allowed (unlike record).")
+    p.add_argument("--trace_label", type=str, default=None,
+                   help="wandb-tag mode: label folded into the uploaded trace filename -> "
+                        "eval_<label>_<ts>.parquet (record: rec_eval_<label>_<ts>). Used by the sweep "
+                        "wrapper to encode <param-label>_<value> so each swept value's file is distinct.")
     p.add_argument("--device", type=str, default=None, help="Torch/sim device, e.g. cuda:0.")
     p.add_argument("--headless", action="store_true", help="Run Isaac headless (still records).")
     p.add_argument("--enable_cameras", action="store_true",
@@ -225,6 +233,8 @@ def _eval_cmd(agent_dir: str, trace_path: str, args) -> list[str]:
         cmd += ["--config", cfg]
     for ov in (args.record_config or []):  # allow eval overlays too (optional)
         cmd += ["--overlay", ov]
+    for ov in (args.overlay or []):         # sweep / general overlays (env_cfg_overrides ok in eval)
+        cmd += ["--overlay", ov]
     if args.num_envs is not None:
         cmd += ["--num_envs", str(args.num_envs)]
     if args.eval_timesteps is not None:
@@ -247,6 +257,8 @@ def _record_cmd(agent_dir: str, trace_path: str, video_dir: str, args) -> list[s
         cmd += ["--config", cfg]
     for ov in (args.record_config or []):
         cmd += ["--record_config", ov]
+    for ov in (args.overlay or []):
+        cmd += ["--record_config", ov]   # _record_single forwards --record_config as runner --overlay
     if args.num_trajectories is not None:
         cmd += ["--num_trajectories", str(args.num_trajectories)]
     if args.num_envs is not None:
@@ -298,7 +310,13 @@ def _run_from_wandb(args) -> None:
     print(f"[{mode}] {len(runs)} run(s) in {path} tagged {args.wandb_tag!r}", flush=True)
 
     ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-    trace_name = f"{'rec_' if mode == 'record' else ''}eval_{ts}.parquet"
+    # Optional label (e.g. "<param-label>_<value>" from the sweep wrapper) -> filename-safe.
+    _lbl = ""
+    if args.trace_label:
+        import re as _re
+        _lbl = _re.sub(r"[^A-Za-z0-9._-]+", "_", str(args.trace_label)).strip("_")
+        _lbl = f"{_lbl}_" if _lbl else ""
+    trace_name = f"{'rec_' if mode == 'record' else ''}eval_{_lbl}{ts}.parquet"
 
     ok: list[str] = []
     failed: list[str] = []
