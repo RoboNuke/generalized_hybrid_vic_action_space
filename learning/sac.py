@@ -291,7 +291,8 @@ class SAC(BlockAgent):
         # Uses RAW (pre-shaping) rewards — matches the ordering relative to the
         # reward_shaper applied below for the memory write.
         self._ingest_step_metrics(
-            rewards=rewards, terminated=terminated, truncated=truncated, infos=infos
+            rewards=rewards, terminated=terminated, truncated=truncated, infos=infos,
+            observations=observations, actions=actions, states=states,
         )
 
         if self.training:

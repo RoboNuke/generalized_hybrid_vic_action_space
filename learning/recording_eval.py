@@ -95,6 +95,7 @@ def _collect_plain(
     gif_name: str = "recording.gif",
     image_writer: Any = None,
     global_step: int = 0,
+    step_trace: Any = None,
 ) -> str:
     """Roll out the (single-agent) policy, collect >= ``num_trajectories`` complete
     episodes, and write a best/median/worst 3x4-grid GIF to ``output_dir``.
@@ -151,7 +152,12 @@ def _collect_plain(
                 pre_state = state if state is not None else obs
                 v = _compute_min_q(critic_1, critic_2, state_pre, pre_state, actions)
 
+                step_obs, step_state = obs, state
                 obs, reward, terminated, truncated, info = env.step(actions)
+                if step_trace is not None:
+                    step_trace.capture(observations=step_obs, states=step_state, actions=actions,
+                                       rewards=reward, terminated=terminated, truncated=truncated,
+                                       infos=info)
                 rgb = read_camera_rgb(camera)  # (num_envs, H, W, 3) cpu uint8
 
                 alive = ~env_done
@@ -315,6 +321,7 @@ def _collect_surface(
     num_trajectories: int,
     output_dir: str,
     gif_name: str = "recording.mp4",
+    step_trace: Any = None,
 ) -> str:
     """Collect >= ``num_trajectories`` full episodes, select best-4 / median-4 / worst-4 by return,
     and write an ANNOTATED 3x4 grid video of the selected 12 — the surface overlays (in-scene keypoint
@@ -463,7 +470,12 @@ def _collect_surface(
                 goal_marker.update(base[np.arange(num_envs), gidx] + goal_lift)
                 pace_marker.update(start_w_env + cur_s_ref[:, None] * path_dir_np + goal_lift)
                 actions, _ = agent.act(obs, state, timestep=10**9, timesteps=10**9)
+                step_obs, step_state = obs, state
                 obs, reward, terminated, truncated, info = env.step(actions)
+                if step_trace is not None:
+                    step_trace.capture(observations=step_obs, states=step_state, actions=actions,
+                                       rewards=reward, terminated=terminated, truncated=truncated,
+                                       infos=info)
                 rgb = read_camera_rgb(camera)
                 snap = uenv.viz_snapshot()
 
@@ -638,6 +650,7 @@ def collect_recording(
     num_trajectories: int,
     output_dir: str,
     gif_name: str = "recording.mp4",
+    step_trace: Any = None,
 ) -> str:
     """The one standalone trajectory recorder (mode='trajectories'): collect >= num_trajectories
     episodes, rank best-4 / median-4 / worst-4 by return, write a 3x4 grid mp4 with the per-tile
@@ -662,7 +675,7 @@ def collect_recording(
         )
     return renderer(env=env, agent=agent, recorder_cfg=recorder_cfg, camera=camera,
                     max_episode_length=max_episode_length, num_trajectories=num_trajectories,
-                    output_dir=output_dir, gif_name=gif_name)
+                    output_dir=output_dir, gif_name=gif_name, step_trace=step_trace)
 
 
 def collect_reset_snapshots(

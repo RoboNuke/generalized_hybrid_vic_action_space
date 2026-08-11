@@ -311,7 +311,8 @@ class PPO(BlockAgent):
         """Per-agent metric ingestion (shared) + on-policy rollout write."""
         # Shared per-agent env-metric ingestion uses RAW (pre-shaping) rewards.
         self._ingest_step_metrics(
-            rewards=rewards, terminated=terminated, truncated=truncated, infos=infos
+            rewards=rewards, terminated=terminated, truncated=truncated, infos=infos,
+            observations=observations, actions=actions, states=states,
         )
 
         if self.training:

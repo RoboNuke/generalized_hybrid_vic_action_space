@@ -686,6 +686,36 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         augment_obs_dict_with_rot6d(obs_dict)
         augment_obs_dict_with_rot6d(state_dict)
 
+        # Per-step trace side channel: consumed ONLY by the eval/record step-trace recorder
+        # (StepTraceRecorder expands each (E,K) into named columns; (E,) -> one column);
+        # ignored by TB/training. Velocities are captured RAW (no acceleration is computed —
+        # the env does not track it). Absolute poses/velocities/keypoints are NOT in the policy
+        # obs, so publish them here.
+        # Positions are env-relative (like held_pos/fingertip_midpoint_pos); velocities are
+        # world-frame; quaternions are (w, x, y, z). The peg tip is rigidly attached to the
+        # fingertip, so its velocity is the fingertip's plus omega x (tip - fingertip).
+        _tip_rel = self.cyl_tip - self.fingertip_midpoint_pos
+        _peg_tip_vel = self.fingertip_midpoint_linvel + torch.cross(
+            self.fingertip_midpoint_angvel, _tip_rel, dim=-1
+        )
+        self.extras["per_env_trace"] = {
+            "ee_pos": self.fingertip_midpoint_pos.detach(),
+            "ee_quat": self.fingertip_midpoint_quat.detach(),
+            "ee_linvel": self.fingertip_midpoint_linvel.detach(),
+            "ee_angvel": self.fingertip_midpoint_angvel.detach(),
+            "peg_pos": self.held_pos.detach(),
+            "peg_quat": self.held_quat.detach(),
+            "peg_tip_pos": self.cyl_tip.detach(),
+            "peg_tip_vel": _peg_tip_vel.detach(),
+            # target-tracking geometry + keypoint accounting (all env-current this step)
+            "target_keypoint_pos": self.setpoint_pos.detach(),
+            "next_keypoint_pos": self.next_setpoint_pos.detach(),
+            "setpoint_kp_idx": self.setpoint_kp_idx.detach().float(),
+            "keypoints_achieved": self.keypoints_achieved.detach().float(),
+            "keypoints_passed": self.keypoints_passed.detach().float(),
+            "keypoints_total": self.keypoints_total.detach().float(),
+        }
+
         obs_tensors = factory_utils.collapse_obs_dict(obs_dict, self.cfg.obs_order + ["prev_actions"])
         state_tensors = factory_utils.collapse_obs_dict(state_dict, self.cfg.state_order + ["prev_actions"])
         return {"policy": obs_tensors, "critic": state_tensors}

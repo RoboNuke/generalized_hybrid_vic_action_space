@@ -577,6 +577,9 @@ class BlockAgent(Agent):
         terminated: torch.Tensor,
         truncated: torch.Tensor,
         infos: Any,
+        observations: torch.Tensor | None = None,
+        actions: torch.Tensor | None = None,
+        states: torch.Tensor | None = None,
     ) -> None:
         """Per-agent reward/episode bookkeeping + env-published metric partitioning.
 
@@ -584,6 +587,16 @@ class BlockAgent(Agent):
         ``record_transition`` with the RAW (pre-shaping) rewards. Publishes nothing
         unless ``write_interval > 0``.
         """
+        # Per-step trace capture (eval): taps the same raw per-env signals one step
+        # before reduction. Runs REGARDLESS of write_interval so it works even when
+        # scalar logging is off; a no-op unless a StepTraceRecorder is attached.
+        st = getattr(self, "_step_trace", None)
+        if st is not None:
+            st.capture(
+                observations=observations, actions=actions, states=states, rewards=rewards,
+                terminated=terminated, truncated=truncated, infos=infos,
+            )
+
         if self.write_interval > 0:
             if self._cumulative_rewards is None:
                 self._cumulative_rewards = torch.zeros_like(rewards, dtype=torch.float32)

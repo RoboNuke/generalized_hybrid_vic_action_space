@@ -147,6 +147,19 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Overrides runner_cfg.memory_size (replay buffer per agent).")
     parser.add_argument("--seed", type=int, default=None,
                         help="Overrides runner_cfg.seed. -1 means non-deterministic.")
+    parser.add_argument("--step_trace_out", type=str, default=None,
+                        help="If set, capture a per-step / per-env trace (obs, actions, reward, "
+                             "terminated/truncated, and every per-env metric signal) and write it to "
+                             "this parquet path. Works in eval mode and record mode. Enables the "
+                             "capture independently of write_interval.")
+    parser.add_argument("--no_wandb", action="store_true",
+                        help="Force experiment.wandb=False for this launch (create no wandb run). "
+                             "Used by the from-wandb eval/record pipeline, which uploads the step "
+                             "trace to the ORIGINAL training run instead of making an eval run.")
+    parser.add_argument("--eval_weights_only", action="store_true",
+                        help="Eval mode: load the checkpoint's WEIGHTS (+ preprocessor) only, skipping "
+                             "optimizer state — required to eval a single-agent checkpoint that was "
+                             "sliced from a multi-agent training run. No effect in train mode.")
     AppLauncher.add_app_launcher_args(parser)  # adds --headless, --device
     return parser
 
@@ -574,6 +587,12 @@ def main(argv: list[str] | None = None) -> None:
         wk["tags"] = tags
         cfg.experiment.wandb_kwargs = wk
 
+    # --no_wandb: create NO wandb run this launch. The from-wandb eval/record pipeline
+    # uploads the step trace to the ORIGINAL training run as a file, so it never wants
+    # a per-agent eval run created here. Applied after the tag merge so it wins.
+    if getattr(args, "no_wandb", False):
+        cfg.experiment.wandb = False
+
     # Final per-run output dir = <log_root>/<family>/<experiment_name>
     #   * log_root: --logdir CLI (e.g. "runs/", or absolute), default "runs/".
     #   * family:   sac_cfg.experiment.directory from YAML (e.g. "pick_block",
@@ -757,6 +776,15 @@ def main(argv: list[str] | None = None) -> None:
             print(f"[record] agent_dir={args.record_agent_dir}  num_trajectories={n_traj}  "
                   f"num_envs={env.num_envs}  max_ep_len={max_ep_len}  out_dir={out_dir}", flush=True)
 
+            # Optional per-step trace: capture obs/actions/reward/term/trunc + every per-env
+            # metric signal from the collector loop, flushed to parquet below. Independent of
+            # write_interval (record forces it to 0). collect_reset_snapshots runs no policy,
+            # so it has no per-step transitions to trace.
+            _step_trace = None
+            if args.step_trace_out:
+                from learning.step_trace import StepTraceRecorder
+                _step_trace = StepTraceRecorder(args.step_trace_out, num_envs=int(env.num_envs))
+
             # ONE dispatch: mode selects WHAT to record; overlay (inside collect_recording) selects
             # the per-tile task overlay. No bespoke per-variant branches.
             mode = str(getattr(sac_cfg.recorder, "mode", "trajectories"))
@@ -779,7 +807,10 @@ def main(argv: list[str] | None = None) -> None:
                     max_episode_length=max_ep_len,
                     num_trajectories=int(n_traj),
                     output_dir=out_dir,
+                    step_trace=_step_trace,
                 )
+            if _step_trace is not None:
+                _step_trace.flush()
             # Validate the soft contract: a non-raising return must have actually
             # written a non-empty video file. collect_and_record can return a path
             # without a usable file on disk (silent write failure, degenerate
@@ -821,6 +852,14 @@ def main(argv: list[str] | None = None) -> None:
         except Exception as e:
             print(f"[record] simulation_app.close() raised: {e!r}", flush=True)
         os._exit(0)
+
+    # Eval per-step trace: attach a recorder so the shared record_transition path captures
+    # every per-env signal one step before reduction (independent of write_interval). Flushed
+    # in the teardown finally below. The from-wandb pipeline runs one agent per run, so the
+    # captured env batch is exactly that agent's slice.
+    if args.step_trace_out and args.mode == "eval":
+        from learning.step_trace import StepTraceRecorder
+        agent._step_trace = StepTraceRecorder(args.step_trace_out, num_envs=int(env.num_envs))
 
     # ---- trainer ----
     # `total_timesteps` is interpreted as raw env_steps (env.step() calls). One env_step
@@ -895,7 +934,14 @@ def main(argv: list[str] | None = None) -> None:
 
     # Optional checkpoint load — works for both train (resume) and eval.
     if args.checkpoint is not None:
-        agent.load(args.checkpoint, step=args.checkpoint_step)
+        if args.mode == "eval" and args.eval_weights_only:
+            # Weights-only per-slot load: skips optimizer state (agent.load refuses a
+            # single-agent ckpt sliced from a multi-agent run because its optimizer can't
+            # be restored). Eval never trains, so weights + preprocessor is all we need.
+            for i in range(n_agents):
+                agent._load_one_into_slot(args.checkpoint, target_slot=i, step=args.checkpoint_step)
+        else:
+            agent.load(args.checkpoint, step=args.checkpoint_step)
     elif args.mode == "eval":
         raise ValueError("--checkpoint is required for --mode eval")
 
@@ -965,6 +1011,14 @@ def main(argv: list[str] | None = None) -> None:
                 _w.flush(); _w.close()
             except Exception as e:
                 print(f"[runner] per-agent image writer flush/close raised: {e!r}", flush=True)
+        # Flush the eval step trace synchronously (parquet write is blocking, so it is
+        # safe here before os._exit; nothing async to lose). Only on a clean run.
+        _st = getattr(agent, "_step_trace", None)
+        if _st is not None and train_exc is None:
+            try:
+                _st.flush()
+            except Exception as e:
+                print(f"[runner] step-trace flush raised: {e!r}", flush=True)
         sys.stdout.flush(); sys.stderr.flush()
 
         # If training raised, exit non-zero NOW so the launcher sees the failure.

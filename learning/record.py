@@ -45,6 +45,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -79,12 +80,34 @@ def build_parser() -> argparse.ArgumentParser:
                    help="wandb project (wandb-tag mode). Accepts 'entity/project' too.")
     p.add_argument("--wandb_run_filter", type=str, default=None,
                    help="Optional substring: only record runs whose name contains it (wandb-tag mode).")
+    p.add_argument("--wandb_group", nargs="*", default=None,
+                   help="wandb-tag mode: only process runs in these wandb group(s) (the {method}_{angle} "
+                        "group name). The primary selector alongside --wandb_tag. Alias of --methods.")
     p.add_argument("--methods", nargs="*", default=None,
-                   help="wandb-tag mode: only record these wandb groups/methods (by group name).")
+                   help="Deprecated alias of --wandb_group.")
     p.add_argument("--download_only", action="store_true",
-                   help="wandb-tag mode: fetch the ckpt/config tree but do NOT render.")
+                   help="wandb-tag mode: fetch the ckpt/config tree but do NOT eval/record.")
     p.add_argument("--force", action="store_true",
                    help="wandb-tag mode: re-download ckpt_best.pt even if already present.")
+    # --- from-wandb eval/record pipeline (tag+group -> download -> run -> upload trace) ---
+    p.add_argument("--mode", choices=["eval", "record"], default="record",
+                   help="wandb-tag mode: 'eval' runs trainer.eval() and uploads a per-step trace to "
+                        "each ORIGINAL run (no eval run created); 'record' additionally renders the "
+                        "video locally and uploads a rec_-prefixed trace. Default: record.")
+    p.add_argument("--no_upload", action="store_true",
+                   help="wandb-tag mode: run eval/record but do NOT upload the trace back to wandb "
+                        "(leaves it in the work dir for inspection).")
+    p.add_argument("--keep_local", action="store_true",
+                   help="wandb-tag mode: keep the per-run work dir (checkpoint + trace) after upload "
+                        "instead of deleting it. Videos are always kept.")
+    p.add_argument("--work_dir", type=str, default=None,
+                   help="wandb-tag mode: scratch root for downloads/traces. "
+                        "Default runs/_eval_tmp/{project}_{tag}. Cleaned per-run unless --keep_local.")
+    p.add_argument("--video_dir", type=str, default=None,
+                   help="record mode: where to persist videos. Default runs/eval_videos/{project}_{tag}.")
+    p.add_argument("--num_envs", type=int, default=None, help="Override envs per run (passed to runner).")
+    p.add_argument("--eval_timesteps", type=int, default=None,
+                   help="eval mode: override eval_timesteps (env steps to roll out).")
     # --- shared record knobs ---
     p.add_argument(
         "--record_config", type=str, action="append", default=None,
@@ -102,6 +125,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output_dir", type=str, default=None,
                    help="Where to write the video (single-agent mode). "
                         "Default <agent_dir>/<recorder.output_subdir>.")
+    p.add_argument("--step_trace_out", type=str, default=None,
+                   help="Single-agent mode: write a per-step / per-env trace parquet to this path "
+                        "(passed through to runner). In wandb-tag mode the pipeline sets this itself.")
     p.add_argument("--device", type=str, default=None, help="Torch/sim device, e.g. cuda:0.")
     p.add_argument("--headless", action="store_true", help="Run Isaac headless (still records).")
     p.add_argument("--enable_cameras", action="store_true",
@@ -133,10 +159,14 @@ def _record_single(args) -> None:
         argv += ["--overlay", ov]
     if args.num_trajectories is not None:
         argv += ["--num_trajectories", str(args.num_trajectories)]
+    if getattr(args, "num_envs", None) is not None:
+        argv += ["--num_envs", str(args.num_envs)]
     if args.checkpoint_step is not None:
         argv += ["--checkpoint_step", str(args.checkpoint_step)]
     if args.output_dir is not None:
         argv += ["--record_output_dir", args.output_dir]
+    if getattr(args, "step_trace_out", None):
+        argv += ["--step_trace_out", args.step_trace_out]
     if args.device is not None:
         argv += ["--device", args.device]
     if args.headless:
@@ -161,98 +191,179 @@ def _record_single(args) -> None:
         os._exit(1)
 
 
-def _record_from_wandb(args) -> None:
-    """Download every run carrying --wandb_tag (its ckpt_best.pt + runtime_config.yaml) into
-    runs/wandb/{project}_{tag}/{method}/{agent}/, then record each agent in single-agent mode -- one
-    subprocess per agent, because runner.main os._exit's and would otherwise stop the batch. Uses the
-    run's OWN runtime_config.yaml (the exact training env) as the base config. --download_only fetches
-    the tree without rendering; --methods filters by wandb group; --force re-downloads."""
-    if not args.download_only and not args.record_config:
-        raise SystemExit("[record] --record_config is required for --wandb_tag (unless --download_only).")
+def _agent_index(r) -> int:
+    name = r.name or ""
+    if "_agent" in name:
+        try:
+            return int(name.rsplit("_agent", 1)[1])
+        except ValueError:
+            pass
+    return 0
+
+
+def _eval_cmd(agent_dir: str, trace_path: str, args) -> list[str]:
+    """runner.py --mode eval on a single downloaded agent, writing the step trace to
+    trace_path and creating NO wandb run. TB output (if any) is redirected under the
+    work dir so it is cleaned with it."""
+    cfg = os.path.join(agent_dir, "config.yaml")
+    # Redirect the experiment dir to a LOCAL temp under the work dir. The downloaded
+    # runtime_config's experiment.directory is the original (HPC) absolute path, which
+    # skrl's SummaryWriter would try to create -> PermissionDenied on /nfs. Both --logdir
+    # and --experiment_directory are pointed here so the final dir is local and cleaned.
+    _evalrun = os.path.join(agent_dir, "_evalrun")
+    cmd = [sys.executable, os.path.join(_PROJECT_ROOT, "learning", "runner.py"),
+           "--mode", "eval",
+           "--checkpoint", agent_dir,
+           "--checkpoint_step", "best",
+           "--num_agents", "1",
+           "--no_wandb",
+           "--eval_weights_only",
+           "--step_trace_out", trace_path,
+           "--logdir", _evalrun,
+           "--experiment_directory", _evalrun]
+    if os.path.isfile(cfg):
+        cmd += ["--config", cfg]
+    for ov in (args.record_config or []):  # allow eval overlays too (optional)
+        cmd += ["--overlay", ov]
+    if args.num_envs is not None:
+        cmd += ["--num_envs", str(args.num_envs)]
+    if args.eval_timesteps is not None:
+        cmd += ["--eval_timesteps", str(args.eval_timesteps)]
+    if args.device is not None:
+        cmd += ["--device", args.device]
+    if args.headless:
+        cmd += ["--headless"]
+    return cmd
+
+
+def _record_cmd(agent_dir: str, trace_path: str, video_dir: str, args) -> list[str]:
+    """record.py single-agent mode on a downloaded agent: renders the video to video_dir
+    (persisted) and writes the step trace to trace_path (uploaded, then temp cleaned)."""
+    cfg = os.path.join(agent_dir, "config.yaml")
+    cmd = [sys.executable, os.path.abspath(__file__), "--agent_dir", agent_dir,
+           "--checkpoint_step", "best", "--step_trace_out", trace_path,
+           "--output_dir", video_dir]
+    if os.path.isfile(cfg):
+        cmd += ["--config", cfg]
+    for ov in (args.record_config or []):
+        cmd += ["--record_config", ov]
+    if args.num_trajectories is not None:
+        cmd += ["--num_trajectories", str(args.num_trajectories)]
+    if args.num_envs is not None:
+        cmd += ["--num_envs", str(args.num_envs)]
+    if args.device is not None:
+        cmd += ["--device", args.device]
+    if args.headless:
+        cmd += ["--headless"]
+    if args.enable_cameras:
+        cmd += ["--enable_cameras"]
+    return cmd
+
+
+def _run_from_wandb(args) -> None:
+    """Unified from-wandb eval/record pipeline (NO local checkpoints kept, NO eval runs created).
+
+    Selects runs by ``--wandb_tag`` (+ optional ``--wandb_group``), and for EACH run:
+      1. download ``ckpt_best.pt`` + ``runtime_config.yaml`` into a scratch work dir,
+      2. subprocess eval (``--mode eval``) or record (``--mode record``) that writes a per-step
+         trace parquet + (record only) a video,
+      3. upload the trace to that ORIGINAL run's Files as ``eval_<ts>`` / ``rec_eval_<ts>``
+         (the parent holds the run object, so no run-id ever touches disk),
+      4. delete the work dir (videos are persisted separately).
+    ``--download_only`` stops after step 1; ``--no_upload`` skips step 3; ``--keep_local`` skips step 4.
+    """
+    mode = args.mode
+    if mode == "record" and not args.download_only and not args.record_config:
+        raise SystemExit("[record] --record_config is required for --mode record (unless --download_only).")
     import wandb
 
     project = args.wandb_project
     path = project if "/" in project else (f"{args.wandb_entity}/{project}" if args.wandb_entity else project)
-    out = os.path.abspath(args.output_dir or os.path.join(
-        _PROJECT_ROOT, "runs", "wandb", f"{project.replace('/', '_')}_{args.wandb_tag}"))
+    work_root = os.path.abspath(args.work_dir or os.path.join(
+        _PROJECT_ROOT, "runs", "_eval_tmp", f"{project.replace('/', '_')}_{args.wandb_tag}"))
+    video_root = os.path.abspath(args.video_dir or os.path.join(
+        _PROJECT_ROOT, "runs", "eval_videos", f"{project.replace('/', '_')}_{args.wandb_tag}"))
 
     api = wandb.Api(timeout=60)
     runs = list(api.runs(path, filters={"tags": args.wandb_tag}))
     if args.wandb_run_filter:
         runs = [r for r in runs if args.wandb_run_filter in (r.name or "")]
+    groups = args.wandb_group or args.methods
+    if groups:
+        runs = [r for r in runs if (r.group or "") in set(groups)]
     if not runs:
-        raise SystemExit(f"[record] no runs in {path} tagged {args.wandb_tag!r}"
+        raise SystemExit(f"[{mode}] no runs in {path} tagged {args.wandb_tag!r}"
+                         + (f" in groups {groups}" if groups else "")
                          + (f" matching {args.wandb_run_filter!r}" if args.wandb_run_filter else ""))
-    print(f"[record] {len(runs)} run(s) in {path} tagged {args.wandb_tag!r} -> {out}", flush=True)
+    print(f"[{mode}] {len(runs)} run(s) in {path} tagged {args.wandb_tag!r}", flush=True)
 
-    def _agent_index(r):
-        name = r.name or ""
-        if "_agent" in name:
-            try:
-                return int(name.rsplit("_agent", 1)[1])
-            except ValueError:
-                pass
-        return 0
+    ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    trace_name = f"{'rec_' if mode == 'record' else ''}eval_{ts}.parquet"
 
-    agent_dirs: list[str] = []
+    ok: list[str] = []
+    failed: list[str] = []
     skipped: list[str] = []
     for r in sorted(runs, key=lambda r: r.name or ""):
         method = r.group or (r.name or "unknown").rsplit("_agent", 1)[0]
-        if args.methods and method not in args.methods:
-            continue
         ai = _agent_index(r)
-        agent_dir = os.path.join(out, method, str(ai))
+        label = f"{method}/agent{ai} ({r.name})"
+        agent_dir = os.path.join(work_root, method, str(ai))
         ck_dir = os.path.join(agent_dir, "checkpoints")
         best = os.path.join(ck_dir, "ckpt_best.pt")
-        label = f"{method}/agent{ai} ({r.name})"
-        if os.path.isfile(best) and not args.force:
-            print(f"[record] have {label} (skip download; --force to refresh)", flush=True)
-            agent_dirs.append(agent_dir); continue
+
         files = {fl.name for fl in r.files()}
         if "ckpt_best.pt" not in files:
-            print(f"[record] SKIP {label}: no ckpt_best.pt on wandb "
+            print(f"[{mode}] SKIP {label}: no ckpt_best.pt on wandb "
                   "(run predates the ckpt-best backup, or hasn't hit a best yet)", flush=True)
             skipped.append(label); continue
-        os.makedirs(ck_dir, exist_ok=True)
-        print(f"[record] downloading {label} ...", flush=True)
-        r.file("ckpt_best.pt").download(root=ck_dir, replace=True)
+        if not (os.path.isfile(best) and not args.force):
+            os.makedirs(ck_dir, exist_ok=True)
+            print(f"[{mode}] downloading {label} ...", flush=True)
+            r.file("ckpt_best.pt").download(root=ck_dir, replace=True)
         if "runtime_config.yaml" in files:
             r.file("runtime_config.yaml").download(root=agent_dir, replace=True)
             os.replace(os.path.join(agent_dir, "runtime_config.yaml"), os.path.join(agent_dir, "config.yaml"))
         else:
-            print(f"[record]   WARNING: {label} has no runtime_config.yaml; pass --config for it.", flush=True)
-        agent_dirs.append(agent_dir)
+            print(f"[{mode}]   WARNING: {label} has no runtime_config.yaml; the run's exact "
+                  "env can't be reconstructed.", flush=True)
 
-    if not agent_dirs:
-        raise SystemExit("[record] no agents with ckpt_best.pt were fetched -- nothing to record.")
-    if args.download_only:
-        print(f"[record] tree ready at {out} (--download_only; skipped {len(skipped)}).", flush=True)
-        return
+        if args.download_only:
+            ok.append(label); continue
 
-    ok: list[str] = []
-    failed: list[str] = []
-    for ad in agent_dirs:
-        cfg = os.path.join(ad, "config.yaml")
-        cmd = [sys.executable, os.path.abspath(__file__), "--agent_dir", ad, "--checkpoint_step", "best"]
-        if os.path.isfile(cfg):
-            cmd += ["--config", cfg]
-        for ov in (args.record_config or []):
-            cmd += ["--record_config", ov]
-        if args.num_trajectories is not None:
-            cmd += ["--num_trajectories", str(args.num_trajectories)]
-        if args.device is not None:
-            cmd += ["--device", args.device]
-        if args.headless:
-            cmd += ["--headless"]
-        if args.enable_cameras:
-            cmd += ["--enable_cameras"]
-        print(f"[record] recording {ad} ...", flush=True)
+        trace_path = os.path.join(agent_dir, trace_name)
+        if mode == "eval":
+            cmd = _eval_cmd(agent_dir, trace_path, args)
+        else:
+            cmd = _record_cmd(agent_dir, trace_path, os.path.join(video_root, method, str(ai)), args)
+
+        print(f"[{mode}] running {label} ...", flush=True)
         rc = subprocess.run(cmd).returncode
-        (ok if rc == 0 else failed).append(ad)
+        if rc != 0:
+            print(f"[{mode}] FAILED {label} (rc={rc})", flush=True)
+            failed.append(label)
+        elif not os.path.isfile(trace_path):
+            print(f"[{mode}] FAILED {label}: no trace written to {trace_path}", flush=True)
+            failed.append(label)
+        else:
+            uploaded = True
+            if not args.no_upload:
+                try:
+                    # r holds the ORIGINAL training run; upload_file adds the parquet to its
+                    # Files (root=agent_dir -> stored under its basename). No run-id on disk,
+                    # no eval run created.
+                    r.upload_file(trace_path, root=agent_dir)
+                    print(f"[{mode}] uploaded {trace_name} -> {r.entity}/{r.project}/{r.id}", flush=True)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[{mode}] UPLOAD FAILED for {label}: {e!r}", flush=True)
+                    uploaded = False
+            (ok if uploaded else failed).append(label)
 
-    print(f"\n[record] done: {len(ok)} ok, {len(failed)} failed, {len(skipped)} skipped.", flush=True)
+        if not args.keep_local:
+            shutil.rmtree(agent_dir, ignore_errors=True)
+
+    print(f"\n[{mode}] done: {len(ok)} ok, {len(failed)} failed, {len(skipped)} skipped.", flush=True)
     if failed:
-        print(f"[record] failed: {failed}", flush=True)
+        print(f"[{mode}] failed: {failed}", flush=True)
         sys.exit(1)
 
 
@@ -262,7 +373,7 @@ def main() -> None:
     if args.wandb_tag and args.agent_dir:
         raise SystemExit("[record] pass EITHER --agent_dir (single) OR --wandb_tag (batch), not both.")
     if args.wandb_tag:
-        _record_from_wandb(args)
+        _run_from_wandb(args)
         return
     if not args.agent_dir:
         raise SystemExit("[record] --agent_dir is required (single-agent mode), or use --wandb_tag.")
