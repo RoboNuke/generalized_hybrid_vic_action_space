@@ -1,0 +1,25 @@
+# Example eval sweep config for launchers/eval_sweep.bash
+#
+# Evaluate FLAT-trained policies in the BUMPY env, sweeping the desired drag speed, with a
+# couple of fixed bump-difficulty knobs held constant across the sweep. Run with, e.g.:
+#
+#   launchers/eval_sweep.bash --sweep_config launchers/sweep_configs/flat_to_bumpy_speed.yaml \
+#       --wandb_tag pitch_sweep --wandb_group VICES_0 --num_envs 512
+#
+# -> for each flat-trained run in the selection, three evals IN THE BUMPY ENV, uploading
+#    eval_bumpy_speed_3_<ts>.parquet / _5_ / _8_ to that run's wandb Files.
+
+label: bumpy_speed                       # folded into the uploaded trace filename
+sweep_param: task.desired_speed_cm_s     # the ONE parameter that varies (env param -> env_cfg_overrides)
+sweep_values: [3, 5, 8]                  # scalars; each becomes eval_<label>_<value>_<ts>.parquet
+
+# Fixed overrides applied to EVERY eval in this sweep. Dotted paths auto-route:
+#   runner_cfg.* / <header>.* -> nested config field;  task.* -> env override (env_cfg_overrides).
+constants:
+  runner_cfg.task: Isaac-FlatSurfaceFollow-Bumpy-Direct-v0   # switch flat -> bumpy env
+  # Bump difficulty knobs (real BumpySurfaceFollowTask fields; omit to use bumpy defaults):
+  task.bump_density: 250.0
+  task.bump_max_height: 0.006
+  task.bump_min_height: 0.001
+  # task.bump_curvature_radius: 0.02
+  # task.bump_edge_margin: 0.0
