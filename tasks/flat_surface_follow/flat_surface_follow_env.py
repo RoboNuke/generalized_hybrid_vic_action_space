@@ -69,9 +69,34 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # Contact flag (set each _compute); init here so interaction_frame_world() is safe if the
         # controller queries the stiffness frame before the first _compute.
         self.in_contact_any = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        # Rounded-tip radius (m): the hemisphere radius the CONTACT tip sits below the flat-face center
+        # when use_spherical_tip is set (== the cylinder radius); 0.0 for the default flat tip. Used by
+        # the tip-clearance math (_compute_intermediate_values) and the reset seating (_spawn_fingertip_target).
+        self._tip_sphere_r = (
+            0.5 * float(self.cfg_task.held_asset_cfg.diameter)
+            if bool(getattr(self.cfg_task, "use_spherical_tip", False))
+            else 0.0
+        )
         # Count of envs whose reset IK didn't converge (set in randomize_initial_state); logged as
         # a "Stats /" metric every step. 0 until the first full reset.
         self._reset_ik_nonconverged = 0
+        # Per-env grasp tilt [roll, pitch, yaw] (deg) actually USED this reset. Sampled per reset in
+        # randomize_initial_state (uniform in [grasp_tilt_min_deg, grasp_tilt_max_deg]) and re-sampled
+        # per IK-retry for stragglers; get_handheld_asset_relative_pose reads it so the seat IK and the
+        # cylinder teleport agree. Initialized to the constant grasp_weld_tilt_deg so the first call
+        # (before any reset) and the non-randomized path both reproduce the fixed-tilt behavior.
+        self._grasp_tilt_deg = torch.tensor(
+            self.cfg_task.grasp_weld_tilt_deg, dtype=torch.float32, device=self.device
+        ).unsqueeze(0).repeat(self.num_envs, 1)
+        # Randomization active iff the max differs from the min on any axis.
+        self._grasp_tilt_random = any(
+            abs(float(hi) - float(lo)) > 1e-9
+            for lo, hi in zip(self.cfg_task.grasp_tilt_min_deg, self.cfg_task.grasp_tilt_max_deg)
+        )
+        # Mask of envs whose reset IK converged this reset (all True until the first reset). Lets a
+        # reset-stats consumer report the grasp tilt ACTUALLY ACHIEVED (an IK solution was found), as
+        # opposed to the raw samples (some of which are re-sampled away on IK failure).
+        self._reset_ik_converged_mask = torch.ones((self.num_envs,), dtype=torch.bool, device=self.device)
         # Per-episode desired normal force (N), sampled in _reset_idx, observed by the policy.
         self.desired_force = torch.zeros((self.num_envs,), device=self.device)
         # Pace schedule clock (s): TIME since first contact — advances by the env step dt every step
@@ -182,6 +207,18 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         std = torch.tensor(std_list, dtype=torch.float32, device=self.device).unsqueeze(0).expand(n, -1)
         sampled = torch.normal(mean, std)                 # std == 0 columns already return the mean
         return torch.where(std > 0.0, sampled, mean)      # explicit: no sampling where std == 0
+
+    def _sample_grasp_tilt(self, n):
+        """Sample ``n`` rows of grasp tilt [roll, pitch, yaw] (deg), each axis ~ U(min, max).
+
+        Uniform (NOT Gaussian): each component is drawn independently in the closed interval
+        [grasp_tilt_min_deg[i], grasp_tilt_max_deg[i]]. min == max => that axis is the constant.
+        Returns ``(n, 3)`` in degrees.
+        """
+        lo = torch.tensor(self.cfg_task.grasp_tilt_min_deg, dtype=torch.float32, device=self.device)
+        hi = torch.tensor(self.cfg_task.grasp_tilt_max_deg, dtype=torch.float32, device=self.device)
+        u = torch.rand((n, 3), device=self.device)
+        return lo.unsqueeze(0) + u * (hi - lo).unsqueeze(0)
 
     def _rotate_vec(self, quat, vec):
         """Rotate ``vec`` (E,3) or (3,) by ``quat`` (E,4): returns R(quat) @ vec.
@@ -346,6 +383,27 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.cfg_task.fixed_asset.spawn.physics_material.dynamic_friction = float(self.cfg_task.plate_friction)
         self.cfg_task.held_asset.spawn.physics_material.static_friction = float(self.cfg_task.held_friction)
         self.cfg_task.held_asset.spawn.physics_material.dynamic_friction = float(self.cfg_task.held_friction)
+        # Optional rounded contact tip: respawn the held object as a CAPSULE (same radius/height/props),
+        # so its bottom is a hemisphere of radius = the cylinder radius. Keeping height = the cylinder
+        # segment length leaves the grip + `half` math unchanged; the hemisphere adds `radius` below the
+        # flat tip (the tip-clearance and reset-seating math offset by self._tip_sphere_r). The capsule is
+        # a single rigid body (one collision shape) — no separate body, no joint — so it works unchanged
+        # in both the friction and the folded-link (glued) paths. Runs after gym.make's env_cfg_overrides.
+        if bool(getattr(self.cfg_task, "use_spherical_tip", False)):
+            _cyl = self.cfg_task.held_asset.spawn
+            self.cfg_task.held_asset.spawn = sim_utils.CapsuleCfg(
+                radius=_cyl.radius,
+                height=_cyl.height,
+                axis=_cyl.axis,
+                rigid_props=_cyl.rigid_props,
+                mass_props=_cyl.mass_props,
+                collision_props=_cyl.collision_props,
+                physics_material=_cyl.physics_material,
+                visual_material=_cyl.visual_material,
+                activate_contact_sensors=_cyl.activate_contact_sensors,
+            )
+            print(f"[flat_surface] use_spherical_tip=True: held object spawned as a CAPSULE "
+                  f"(hemispherical tip, radius={_cyl.radius:.4f} m).", flush=True)
         self._fixed_asset = RigidObject(self.cfg_task.fixed_asset)
         self._held_asset = RigidObject(self.cfg_task.held_asset)
 
@@ -382,17 +440,14 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         rel_pos = torch.zeros((self.num_envs, 3), device=self.device)
         rel_pos[:, 2] = self.cfg_task.held_asset_cfg.height / 2.0
         rel_pos[:, 2] -= self.cfg_task.robot_cfg.franka_fingerpad_length
-        tilt = self.cfg_task.grasp_weld_tilt_deg
-        if any(abs(float(v)) > 1e-9 for v in tilt):
-            r, p, y = (float(np.deg2rad(float(v))) for v in tilt)
-            perturb = torch_utils.quat_from_euler_xyz(
-                torch.tensor([r], device=self.device),
-                torch.tensor([p], device=self.device),
-                torch.tensor([y], device=self.device),
-            )
-            rel_quat = torch_utils.quat_conjugate(perturb).repeat(self.num_envs, 1)
-        else:
-            rel_quat = self._identity_quat()
+        # Per-env tilt used THIS reset: the constant grasp_weld_tilt_deg, or the per-reset uniform
+        # sample (self._grasp_tilt_deg is kept in sync by randomize_initial_state — sampled once at the
+        # top of the reset and re-sampled per IK-retry for stragglers, so BOTH call sites here and in
+        # the seating step read the same value for a given env). Built per env (a fast identity path is
+        # not usable once tilts differ across envs).
+        tilt_rad = torch.deg2rad(self._grasp_tilt_deg)                     # (E,3)
+        perturb = torch_utils.quat_from_euler_xyz(tilt_rad[:, 0], tilt_rad[:, 1], tilt_rad[:, 2])
+        rel_quat = torch_utils.quat_conjugate(perturb)                     # (E,4)
         return rel_pos, rel_quat
 
     # ------------------------------------------------------------------
@@ -426,11 +481,17 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # CONTACT POINT ("point of contact if any"): the surface point at/under the tip — the tip
         # projected onto the surface (plate top plane through `start`). When touching, this IS the
         # contact point; otherwise the nearest surface point, so the local frame is always defined.
+        # signed_dist = height of the tip REFERENCE above the surface. For a flat tip that reference is
+        # the lower face center; for a rounded (capsule) tip it is the hemisphere CENTER, whose lowest
+        # surface point is self._tip_sphere_r closer to the plate — so subtract it for the clearance.
         signed_dist = ((self.cyl_tip - start) * plate_normal).sum(-1, keepdim=True)
+        # Surface point under the tip (the hemisphere contact sits directly below the center along the
+        # normal, so the projected in-plane point is unchanged by the rounding).
         self.contact_point = self.cyl_tip - signed_dist * plate_normal
         # Signed height of the tool tip above the surface (m): >0 above, ~0 in contact, <0 penetrating.
-        # Used by the orientation reward's near-surface gate.
-        self.tip_surface_dist = signed_dist.squeeze(-1)
+        # Used by the orientation reward's near-surface gate. Rounded tip => clearance of the hemisphere
+        # SURFACE (center height minus the radius); flat tip => face-center height (_tip_sphere_r == 0).
+        self.tip_surface_dist = (signed_dist - self._tip_sphere_r).squeeze(-1)
 
         # LOCAL surface frame AT THE CONTACT POINT — the normal + travel direction the reward and the
         # critic use. General hook: a non-flat surface overrides `_surface_normal_and_dir_at` to
@@ -535,16 +596,22 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.held_end_quat = torch_utils.quat_mul(self.held_quat, rz180)
 
         # --- Interaction frame (env-defined; viz/obs only, NOT control) ---
-        # Position: the actual contact point of the (possibly tilted) lower cylinder face with the
-        # plane — the lowest rim point. perp = component of -normal in the face plane (⊥ cyl axis);
-        # contact = tip-center + radius * perp_dir. When the cylinder is perpendicular to the
-        # surface, perp -> 0 and the contact collapses to the tip center.
-        radius = 0.5 * self.cfg_task.held_asset_cfg.diameter
-        neg_n = -normal
-        perp = neg_n - (neg_n * self.cyl_axis).sum(-1, keepdim=True) * self.cyl_axis
-        perp_norm = torch.linalg.norm(perp, dim=-1, keepdim=True)
-        downhill = torch.where(perp_norm > 1e-6, perp / perp_norm.clamp_min(1e-6), torch.zeros_like(perp))
-        self.interaction_pos = self.cyl_tip + radius * downhill
+        # Position: the actual contact point of the lower tip with the plane.
+        if self._tip_sphere_r > 0.0:
+            # ROUNDED (hemispherical) tip: the contact is the single lowest point on the hemisphere,
+            # exactly self._tip_sphere_r below the tip center along the surface normal — tilt-independent
+            # (no flat-face rim to track). This is the whole point of the rounded tip.
+            self.interaction_pos = self.cyl_tip - self._tip_sphere_r * normal
+        else:
+            # FLAT face: the actual contact of the (possibly tilted) lower face is its lowest RIM point.
+            # perp = component of -normal in the face plane (⊥ cyl axis); contact = tip-center + radius *
+            # perp_dir. Perpendicular to the surface => perp -> 0 and the contact collapses to the center.
+            radius = 0.5 * self.cfg_task.held_asset_cfg.diameter
+            neg_n = -normal
+            perp = neg_n - (neg_n * self.cyl_axis).sum(-1, keepdim=True) * self.cyl_axis
+            perp_norm = torch.linalg.norm(perp, dim=-1, keepdim=True)
+            downhill = torch.where(perp_norm > 1e-6, perp / perp_norm.clamp_min(1e-6), torch.zeros_like(perp))
+            self.interaction_pos = self.cyl_tip + radius * downhill
 
         # In-contact bool (drives the interaction frame + the pace schedule clock). Prefer the
         # contact-sensor wrapper's per-axis state; fall back to a small normal-force threshold when
@@ -795,6 +862,11 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "shear_force_N": shear_force.detach().cpu(),               # (E,) tangential force magnitude, N
             "along_track_speed": along_speed.detach().cpu(),          # (E,) along-track drag speed, m/s
             "desired_speed": float(v_des),                             # scalar ideal along-track speed, m/s
+            # Grasp tilt [roll, pitch, yaw] (deg) USED this reset (constant, or the per-reset uniform
+            # sample), and whether the reset IK converged — so a reset-stats consumer can histogram the
+            # grasp pitch actually achieved (converged rows) vs. the sampled distribution.
+            "grasp_tilt_deg": self._grasp_tilt_deg.detach().cpu(),      # (E,3) roll/pitch/yaw deg
+            "reset_ik_converged": self._reset_ik_converged_mask.detach().cpu(),  # (E,) bool
         }
         # Fragile-peg break threshold (exposed by FragileObjectWrapper onto the unwrapped env). When
         # present and fragile, the recorder scales the force bar so its TOP is the normal break force.
@@ -1244,7 +1316,11 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             sin = (torch.cross(u, w, dim=-1) * axis).sum(-1)                 # (E,) signed about axis
             roll = torch.atan2(sin, cos)                                     # (E,) eef roll to apply
             held_quat_des = torch_utils.quat_mul(torch_utils.quat_from_angle_axis(roll, axis), held_quat_des)
-        held_center_pos = p_tip + 0.5 * H * cyl_axis                          # (E,3) cylinder body origin
+        # Body origin sits half the cylinder segment ABOVE the tip, plus the rounded-tip radius so the
+        # HEMISPHERE'S lowest point (not the flat-face center) lands at the sampled spawn tip p_tip —
+        # keeps the spawn clearance (e.g. 1 mm above the plate) correct for a rounded tip. _tip_sphere_r
+        # is 0 for the flat tip, so this is unchanged there.
+        held_center_pos = p_tip + (0.5 * H + self._tip_sphere_r) * cyl_axis    # (E,3) cylinder body origin
         _q1, _t1 = torch_utils.tf_combine(held_quat_des, held_center_pos, held_rel_quat, held_rel_pos)
         target_quat_all, target_pos_all = torch_utils.tf_combine(_q1, _t1, flip_z_quat, zeros3)
         return target_pos_all, target_quat_all
@@ -1313,6 +1389,14 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             self._sample_spawn_dof(self.cfg_task.spawn_orn_mean_deg, self.cfg_task.spawn_orn_std_deg, self.num_envs)
         )                                                                     # (E,3) rad, surface-local rpy
 
+        # GRASP TILT for this reset: uniform U(min, max) per env when randomization is active, else the
+        # constant grasp_weld_tilt_deg (kept from init). get_handheld_asset_relative_pose reads this
+        # buffer, so the seat-IK target below and the cylinder teleport in step (4) use the SAME grasp.
+        # Stragglers get their tilt re-sampled inside the IK-retry loop, so an unreachable draw is
+        # replaced (not stuck); converged envs keep the tilt they solved for.
+        if self._grasp_tilt_random:
+            self._grasp_tilt_deg = self._sample_grasp_tilt(self.num_envs)     # (E,3) deg
+
         # Starting keypoint = k0 = the near-edge center (start). The peg spawns directly over k0 and
         # the step-0 observation setpoint is ALSO k0 (held there until first contact, see
         # _compute_intermediate_values), so the peg descends straight down onto k0, then the setpoint
@@ -1353,6 +1437,13 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             self.step_sim_no_action()
             start, goal, normal, path_dir, cross_dir = self._surface_frame()
             self.fixed_pos_obs_frame[:] = start
+            # Also re-sample the stragglers' GRASP TILT: an unreachable draw gets a fresh grasp instead
+            # of being retried unchanged, giving an extra DOF to escape a stuck wrist target. Only the
+            # bad_envs rows are touched, so already-converged envs keep the exact tilt they solved for
+            # (their buffer entry — read again by the step-(4) teleport — is never mutated after they
+            # leave bad_envs, keeping seat-IK and teleport consistent).
+            if self._grasp_tilt_random:
+                self._grasp_tilt_deg[bad_envs] = self._sample_grasp_tilt(int(bad_envs.shape[0]))
             target_pos_all, target_quat_all = self._spawn_fingertip_target(
                 pos_off, orn_off, start, path_dir, cross_dir, normal)
             jp = self._robot.data.default_joint_pos[bad_envs].clone()
@@ -1367,6 +1458,11 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # as a "Stats /" metric (next to the GPU/host-memory stats) so it's monitorable in wandb/TB —
         # should be ~0 now that a fresh board + default reseed is tried each retry.
         self._reset_ik_nonconverged = int(bad_envs.shape[0])
+        # Converged mask: True where an IK solution was found (so a reset-stats consumer can report the
+        # grasp tilt ACTUALLY ACHIEVED, not the raw draws that were re-sampled away on failure).
+        self._reset_ik_converged_mask = torch.ones((self.num_envs,), dtype=torch.bool, device=self.device)
+        if bad_envs.shape[0] > 0:
+            self._reset_ik_converged_mask[bad_envs] = False
         if self._reset_ik_nonconverged > 0:
             print(
                 f"[flat_surface] reset IK did not converge for {bad_envs.shape[0]}/{env_ids.shape[0]} "

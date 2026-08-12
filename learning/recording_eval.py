@@ -731,12 +731,26 @@ def collect_reset_snapshots(
     markers = goal_marker = pace_marker = None
     set_camera_active(camera, True)
     out_frames: list[np.ndarray] = []
+    # Accumulate the grasp tilt ACTUALLY ACHIEVED (converged-IK rows) at each reset, so we can report
+    # the realized min/max pitch and histogram the coverage of the sampled distribution. Read from the
+    # post-reset snapshot (before the hold loop overwrites `snap`).
+    grasp_tilt_achieved: list[np.ndarray] = []   # each (n_converged, 3) roll/pitch/yaw deg
+    n_reset_nonconverged = 0
     try:
         env.reset()                                                    # one-time init reset
         for r in range(n_resets):
             uenv._reset_idx(all_ids)                                    # force a fresh full re-randomization
             uenv._compute_intermediate_values(dt)
             snap = uenv.viz_snapshot()
+
+            # Record the grasp tilt that got an IK solution this reset (converged rows only).
+            gt = snap.get("grasp_tilt_deg")
+            conv = snap.get("reset_ik_converged")
+            if gt is not None and conv is not None:
+                m = conv.numpy().astype(bool)
+                n_reset_nonconverged += int((~m).sum())
+                if m.any():
+                    grasp_tilt_achieved.append(gt.numpy()[m])
 
             spacing = float(snap["keypoint_spacing"])
             k = int(snap["keypoints_total"].min().item())
@@ -828,4 +842,55 @@ def collect_reset_snapshots(
     vid_path = write_video(video, vid_base, fps=fps, fmt=getattr(recorder_cfg, "video_format", "mp4"))
     print(f"[record] wrote reset-snapshots video {vid_path} "
           f"({n_resets} resets x {hold_frames} frames, {rows}x{cols} envs)", flush=True)
+
+    # Grasp-tilt statistics: realized (converged-IK) pitch min/max + a coverage histogram. Written next
+    # to the video. Skipped only if the env exposed no grasp_tilt_deg (older env without the field).
+    if grasp_tilt_achieved:
+        tilts = np.concatenate(grasp_tilt_achieved, axis=0)            # (N,3) roll/pitch/yaw deg
+        roll, pitch, yaw = tilts[:, 0], tilts[:, 1], tilts[:, 2]
+        axis_lo = np.asarray(getattr(uenv.cfg_task, "grasp_tilt_min_deg", [0.0, 0.0, 0.0]), dtype=float)
+        axis_hi = np.asarray(getattr(uenv.cfg_task, "grasp_tilt_max_deg", [0.0, 0.0, 0.0]), dtype=float)
+        print(
+            f"[record] grasp tilt ACHIEVED (IK-converged) over {tilts.shape[0]} spawn(s) "
+            f"[{n_reset_nonconverged} non-converged excluded]:\n"
+            f"           requested pitch range = [{axis_lo[1]:.1f}, {axis_hi[1]:.1f}] deg\n"
+            f"           achieved pitch: min={pitch.min():.2f}  max={pitch.max():.2f}  "
+            f"mean={pitch.mean():.2f}  std={pitch.std():.2f} deg\n"
+            f"           achieved roll:  min={roll.min():.2f}  max={roll.max():.2f} deg | "
+            f"yaw: min={yaw.min():.2f}  max={yaw.max():.2f} deg",
+            flush=True,
+        )
+        # Save the raw samples for offline re-plotting.
+        npy_path = os.path.join(output_dir, "grasp_tilt_achieved_deg.npy")
+        np.save(npy_path, tilts)
+        # Histogram of the achieved pitch (the axis the user randomizes), with the requested range shown.
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots(figsize=(7.5, 4.5), dpi=130)
+            lo_p, hi_p = float(axis_lo[1]), float(axis_hi[1])
+            span = max(hi_p - lo_p, 1e-6)
+            # ~5-deg bins (clamped) so ~100 samples read clearly rather than as 1-deg noise.
+            nbins = max(6, min(20, int(round(span / 5.0))))
+            ax.hist(pitch, bins=nbins, range=(min(lo_p, pitch.min()), max(hi_p, pitch.max())),
+                    color="#4C78A8", edgecolor="white", linewidth=0.5)
+            ax.axvline(lo_p, color="#E45756", ls="--", lw=1.2, label=f"requested min ({lo_p:.0f}°)")
+            ax.axvline(hi_p, color="#E45756", ls="--", lw=1.2, label=f"requested max ({hi_p:.0f}°)")
+            ax.set_xlabel("achieved grasp PITCH (deg)")
+            ax.set_ylabel("count")
+            ax.set_title(f"Grasp pitch coverage — {tilts.shape[0]} IK-converged spawns "
+                         f"(min={pitch.min():.1f}°, max={pitch.max():.1f}°)")
+            ax.legend(loc="upper right", fontsize=8)
+            fig.tight_layout()
+            hist_path = os.path.join(output_dir, "grasp_pitch_histogram.png")
+            fig.savefig(hist_path)
+            plt.close(fig)
+            print(f"[record] wrote grasp-pitch histogram {hist_path} and raw samples {npy_path}", flush=True)
+        except Exception as _e:
+            print(f"[record] histogram plot skipped ({_e!r}); raw samples saved at {npy_path}", flush=True)
+    else:
+        print("[record] no grasp_tilt_deg exposed by env — skipping grasp-tilt stats.", flush=True)
+
     return vid_path

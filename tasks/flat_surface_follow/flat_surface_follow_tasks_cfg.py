@@ -57,12 +57,33 @@ class FlatSurfaceFollowTask(ForgeTask):
     fixed_asset_cfg: PlateCfg = PlateCfg()
     held_asset_cfg: CylinderHeldCfg = CylinderHeldCfg()
 
+    # Round the held object's contact TIP: when True, the held cylinder is spawned as a CAPSULE
+    # (cylinder body + hemispherical end-caps) instead of a flat-faced cylinder, so the bottom tip is
+    # a hemisphere of radius = the cylinder radius (diameter/2). This gives a single, tilt-independent
+    # contact point (Hertzian-style) that simplifies the tip-plate contact dynamics, vs. the flat
+    # face's edge/rim contact. The cylinder-segment length is kept at held_asset_cfg.height, so the
+    # grip is unchanged and the hemisphere adds `radius` below the old flat tip (the reset seating +
+    # tip-clearance math account for it). Default False = flat cylinder (backward-compatible). The top
+    # cap is rounded too but never touched (the grip sits mid-cylinder).
+    use_spherical_tip: bool = False
+
     # Fixed grasp tilt [roll, pitch, yaw] (deg) of the cylinder RELATIVE TO THE GRIPPER, folded
     # into the peg-gripper weld. Set by env_setup.build_env from runner_cfg.rel_grasp_rot_init_deg
     # (grasp_rot_mode='fixed'); NOT a user override. The reset reads it to invert the tilt when
     # seating the cylinder, so a tilted grasp still spawns the cylinder at the desired orientation
     # (the eef/wrist absorbs the tilt). All-zero = aligned grip.
     grasp_weld_tilt_deg: list = [0.0, 0.0, 0.0]
+
+    # Per-reset UNIFORM grasp-tilt randomization [roll, pitch, yaw] (deg), for the FRICTION-held
+    # (non-welded) grip only. Each axis is drawn independently ~ U(min, max) per env per reset and
+    # stored in a buffer that get_handheld_asset_relative_pose reads, so the reset IK seats the wrist
+    # for that grasp and the cylinder is teleported into it (friction-held). If IK fails for an env,
+    # the reset loop RE-SAMPLES its tilt (see randomize_initial_state), so an unreachable draw can't
+    # get stuck. Randomization is ACTIVE iff max != min on some axis; when inactive the grip falls
+    # back to the constant grasp_weld_tilt_deg (so glued / fixed-tilt behavior is unchanged).
+    # Default = [0,0,0]..[0,0,0] => inactive (aligned grip), backward-compatible.
+    grasp_tilt_min_deg: list = [0.0, 0.0, 0.0]
+    grasp_tilt_max_deg: list = [0.0, 0.0, 0.0]
 
     # --- Plate geometry + spawn randomization ---
     plate_length: float = _PLATE_LENGTH
