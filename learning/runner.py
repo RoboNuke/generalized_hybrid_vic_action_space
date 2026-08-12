@@ -282,6 +282,17 @@ def main(argv: list[str] | None = None) -> None:
     ppo_cfg = loaded["ppo_cfg"]
     model_cfg = loaded["model_cfg"]
     controller_cfg = loaded["controller_cfg"]
+    # rotation_frame_override is an EVAL-ONLY ablation (overwrites the stiffness rotation R). Refuse
+    # to TRAIN with it set — training with a forced/absent rotation would silently produce a policy
+    # that doesn't match its own action space. Record + eval are allowed (both are inference).
+    _is_training = args.mode == "train" and args.record_agent_dir is None
+    _rot_override = str(getattr(controller_cfg, "rotation_frame_override", "none") or "none").lower()
+    if _is_training and _rot_override != "none":
+        raise SystemExit(
+            f"[runner] controller_cfg.rotation_frame_override={_rot_override!r} is EVAL-ONLY, but this "
+            "is a TRAINING run (--mode train). Set it back to 'none' for training; use it only via the "
+            "eval sweep / an eval overlay (--mode eval)."
+        )
     noise_cfg = loaded["noise_cfg"]
     sensor_cfg = loaded["sensor_cfg"]
     # Auxiliary-loss switches (which extra losses are on and their per-target

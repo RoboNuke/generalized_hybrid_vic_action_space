@@ -103,6 +103,19 @@ class ControlCfg(ForgeCtrlCfg):
     # gain_mapping='rotated' and mutually exclusive with fixed_rotation_rpy.
     fixed_rotation_from_interaction: bool = False
 
+    # ---- EVAL-ONLY rotation ablation (ctrl-action-interface, gain_mapping='rotated') ----
+    # Overwrites the stiffness rotation R at RUNTIME to isolate the effect of the learned rotation,
+    # WITHOUT changing the action space (unlike fixed_rotation_*, the policy still emits rot6d; it is
+    # simply ignored). So a trained checkpoint loads as-is. One of:
+    #   "none"      -> no override (R is the policy's predicted rot6d / the configured fixed frame).
+    #   "geometric" -> R = the TRUE geometric interaction->EEF frame (the SAME code path as
+    #                  fixed_rotation_from_interaction: _geometric_rotation_frame()).
+    #   "identity"  -> R = I (axis-aligned EEF stiffness; the rotation is removed).
+    # EVAL-ONLY: the runner ERRORS if this is anything but "none" for a training run. No-op for
+    # non-"rotated" gain mappings (diagonal stiffness has no R). Drive the geometric/identity/none
+    # comparison via the eval sweep (sweep_param: controller_cfg.rotation_frame_override).
+    rotation_frame_override: str = "none"
+
     # When True, command full 3-DOF orientation (roll/pitch/yaw) via a delta-axis-angle
     # rotation scaled by rot_action_bounds, instead of the default yaw-only map (roll/pitch
     # forced to 0). Also un-zeros the orientation observation channels (AutoMate adapter).

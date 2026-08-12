@@ -114,6 +114,23 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         self._fixed_rot = (self._fixed_rpy is not None) or self._fixed_from_interaction
         self._pdim = self._pose_pdim(self._mode, self._full, self._fixed_rot)
 
+        # EVAL-ONLY rotation ablation: overwrite R at runtime without touching the action space
+        # (the policy still emits rot6d; it's ignored). Validated here; the runner enforces that it
+        # is "none" for training. Only meaningful for gain_mapping="rotated" (no R otherwise).
+        self._rotation_frame_override = str(getattr(cfg, "rotation_frame_override", "none") or "none").lower()
+        if self._rotation_frame_override not in ("none", "geometric", "identity"):
+            raise ValueError(
+                f"controller_cfg.rotation_frame_override must be none/geometric/identity, "
+                f"got {self._rotation_frame_override!r}."
+            )
+        if self._rotation_frame_override != "none":
+            if self._mode != "rotated":
+                print(f"[ctrl] rotation_frame_override={self._rotation_frame_override!r} is a no-op for "
+                      f"gain_mapping={self._mode!r} (no rotation frame).", flush=True)
+            else:
+                print(f"[ctrl] EVAL rotation ablation: overriding stiffness R with "
+                      f"{self._rotation_frame_override!r}.", flush=True)
+
         super().__init__(env, controller_cfg, num_agents=num_agents)
 
         dev = self.device
@@ -628,15 +645,28 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         ``_log_stiffness_frame_metrics`` still assume world axes — they're corrected in the
         visualization stage (compose with ``R_eef`` for drawing / metrics).
         """
+        # EVAL-ONLY ablation (leaves the action space untouched; the emitted rot6d is ignored).
+        # "geometric" reuses the SAME _geometric_rotation_frame() as fixed_rotation_from_interaction,
+        # so the two can never drift apart.
+        if self._rotation_frame_override == "identity":
+            return torch.eye(3, device=a.device, dtype=a.dtype).expand(a.shape[0], 3, 3)
+        if self._rotation_frame_override == "geometric":
+            return self._geometric_rotation_frame()
         if self._fixed_from_interaction:
-            # True interaction->EEF rotation, per env/step: R = R_(eef<-world) @ R_(world<-interaction).
-            env = self.unwrapped
-            R_eef = matrix_from_quat(env.fingertip_midpoint_quat)     # (E,3,3) world<-eef
-            R_int = env.interaction_frame_world()                     # (E,3,3) world<-interaction
-            return R_eef.transpose(1, 2) @ R_int                      # (E,3,3) eef<-interaction
+            return self._geometric_rotation_frame()
         if self._fixed_rot:
             return self._R_fixed.expand(a.shape[0], 3, 3)
         return rotation_6d_to_matrix(a[:, -6:])
+
+    def _geometric_rotation_frame(self):
+        """(E,3,3) TRUE geometric interaction->EEF rotation, per env/step:
+        ``R = R_(eef<-world) @ R_(world<-interaction)``. The SINGLE source of truth for the geometric
+        stiffness frame — used by BOTH ``fixed_rotation_from_interaction`` and the eval
+        ``rotation_frame_override='geometric'`` ablation, so changing it changes both."""
+        env = self.unwrapped
+        R_eef = matrix_from_quat(env.fingertip_midpoint_quat)     # (E,3,3) world<-eef
+        R_int = env.interaction_frame_world()                     # (E,3,3) world<-interaction
+        return R_eef.transpose(1, 2) @ R_int                      # (E,3,3) eef<-interaction
 
     @staticmethod
     def _rotate_blockdiag(R, kdiag):

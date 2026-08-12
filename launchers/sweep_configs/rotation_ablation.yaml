@@ -1,0 +1,20 @@
+# Eval sweep config for launchers/eval_sweep.bash — rotation-frame ablation.
+#
+# Re-evaluates each trained policy THREE times, overwriting the action-space stiffness rotation R
+# (leaves the action space untouched — the policy still emits rot6d, it's just ignored):
+#   none      -> R = the policy's own predicted rotation (native behavior)
+#   geometric -> R = the TRUE geometric interaction->EEF frame (same code as GAS_geo)
+#   identity  -> R = I (rotation removed; axis-aligned EEF stiffness)
+#
+# Comparing the three isolates the effect of the predicted rotation. Only meaningful for
+# gain_mapping='rotated' policies (GAS / GAS_geo); a no-op for VICES/diagonal (no R).
+#
+# Run:
+#   launchers/eval_sweep.bash --sweep_config launchers/sweep_configs/rotation_ablation.yaml \
+#       --wandb_tag pitch_sweep --wandb_group GAS_0 --num_envs 512
+#
+# -> per run: eval_rot_ablation_none_<ts>.parquet / _geometric_ / _identity_ in that run's Files.
+
+label: rot_ablation
+sweep_param: controller_cfg.rotation_frame_override
+sweep_values: [none, geometric, identity]
