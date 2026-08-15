@@ -1,0 +1,11 @@
+# Bare-bones config for the CURVED surface-following task (tasks/curved_surface_follow).
+#
+# Mirrors tests/bumpy_surface_test.yaml: everything not set here falls back to defaults
+# (agent_type=sac, control_type=pose, no contact sensor, no domain randomization). The curved
+# task adds a cylindrical ridge across the path whose curvature is a per-env scalar alpha in
+# [0, 1] (round-robin over n_curvature_levels difficulty levels). For quick wiring/smoke tests
+# only, NOT training.
+
+runner_cfg:
+  task: Isaac-FlatSurfaceFollow-Curved-Direct-v0
+  num_envs: 16

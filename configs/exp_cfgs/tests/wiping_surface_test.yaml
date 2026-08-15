@@ -1,0 +1,15 @@
+# Bare-bones config for the WIPING surface task (tasks/wiping_surface_follow).
+#
+# Mirrors tests/curved_surface_test.yaml: defaults elsewhere (agent_type=sac, control_type=pose, no
+# contact sensor, no domain randomization). The wiping task holds a rectangular sponge and wipes a
+# sequence of on-surface waypoints with the paper's base reward. For quick wiring/smoke tests only.
+
+runner_cfg:
+  task: Isaac-FlatSurfaceFollow-Wiping-Direct-v0
+  num_envs: 16
+
+# The surface tasks now hard-require the contact sensor for in-contact detection (no wrist-FT
+# fallback). Enable it; observe_in_contact stays off so the obs layout is unchanged.
+sensor_cfg:
+  contact:
+    enabled: true
