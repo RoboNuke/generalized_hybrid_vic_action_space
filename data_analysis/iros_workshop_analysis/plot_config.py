@@ -131,7 +131,7 @@ LEGEND_COLUMN_SPACING = 0.9
 LEGEND_HANDLETEXTPAD = 0.5
 LEGEND_BORDER_PAD = -0.0 #1.6
 LEGEND_CORNER_INSET = 0.0 #0.055
-LEGEND_BELOW_OFFSET = -1.32
+LEGEND_BELOW_OFFSET = -1.36
 
 # =========================================================================== #
 # Per-metric display scaling (e.g. success rate 0-1 -> 0-100 %)

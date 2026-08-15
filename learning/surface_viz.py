@@ -194,7 +194,7 @@ def _paste(dst, src, x, y):
 def compose_tile(frame, force_squash, orn_squash, inset, border_rgb=None, pad=6,
                  force_text=None, orn_text=None, force_fill=None, orn_fill=None,
                  status_label=None, status_color=None, force_target_frac=0.5, readouts=None,
-                 kp_counts=None):
+                 kp_counts=None, inset_frac=None):
     """One annotated tile: [force gauge | orientation gauge | frame], both gauges on the LEFT, with
     the top-down inset pasted into the frame's bottom-left corner. Gauge COLOUR = squash closeness;
     the FORCE gauge fills from the bottom (force_fill in [0,1], empty at <=0, yellow target tick at
@@ -209,7 +209,8 @@ def compose_tile(frame, force_squash, orn_squash, inset, border_rgb=None, pad=6,
     frame = np.asarray(frame, dtype=np.uint8).copy()
     H, W = frame.shape[:2]
     if inset is not None:
-        iw = int(W // 3 * 1.6)                       # top-down inset ~2x larger (scales with frame width)
+        # inset side = inset_frac * frame width when given, else the legacy ~0.53*W (W//3*1.6).
+        iw = int(W * inset_frac) if inset_frac else int(W // 3 * 1.6)
         ins = np.asarray(Image.fromarray(inset).resize((iw, iw)), dtype=np.uint8)
         _paste(frame, ins, pad, H - iw - pad)
     if border_rgb is not None:                       # green success border around the IMAGE frame only

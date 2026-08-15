@@ -434,7 +434,13 @@ def _collect_surface(
             radius = spacing * ball_frac / 2.0
             normal = snap["surface_normal"].numpy()
             env_origins = uenv.scene.env_origins.detach().cpu().numpy()
-            base = sv.keypoint_world_positions(snap["start_w"], snap["path_dir"], spacing, k)
+            # Keypoint path positions. A non-flat surface env (e.g. the curved task) exposes the ON-SURFACE
+            # keypoint positions so the drawn path hugs the curve; otherwise fall back to the straight
+            # start->goal chord. Both are env-relative -> add env_origins.
+            if hasattr(uenv, "keypoint_world_positions_on_surface"):
+                base = uenv.keypoint_world_positions_on_surface(k).detach().cpu().numpy()
+            else:
+                base = sv.keypoint_world_positions(snap["start_w"], snap["path_dir"], spacing, k)
             base = base + env_origins[:, None, :]
             goal_radius = radius * 4.0
             goal_lift = normal * goal_radius
@@ -468,7 +474,13 @@ def _collect_surface(
                 markers.update(cur_status[:, :k].reshape(-1).astype(np.int64))   # env status, set BEFORE the step renders
                 gidx = np.clip(cur_setpoint - 1, 0, k - 1)
                 goal_marker.update(base[np.arange(num_envs), gidx] + goal_lift)
-                pace_marker.update(start_w_env + cur_s_ref[:, None] * path_dir_np + goal_lift)
+                if hasattr(uenv, "path_point_on_surface"):
+                    _pace_w = uenv.path_point_on_surface(
+                        torch.as_tensor(cur_s_ref, device=uenv.device, dtype=torch.float32)
+                    ).detach().cpu().numpy() + env_origins
+                    pace_marker.update(_pace_w + goal_lift)
+                else:
+                    pace_marker.update(start_w_env + cur_s_ref[:, None] * path_dir_np + goal_lift)
                 actions, _ = agent.act(obs, state, timestep=10**9, timesteps=10**9)
                 step_obs, step_state = obs, state
                 obs, reward, terminated, truncated, info = env.step(actions)
@@ -613,7 +625,8 @@ def _collect_surface(
                     force_fill=float(force_fill), orn_fill=float(coll_ang[j][q] / 30.0),
                     force_target_frac=float(force_tf),
                     status_label=_STATUS_LABEL[_st], status_color=_STATUS_COLOR[_st],
-                    readouts=readouts, kp_counts=kp_counts))
+                    readouts=readouts, kp_counts=kp_counts,
+                    inset_frac=getattr(recorder_cfg, "inset_frac", None)))
             else:
                 tiles.append(sv.compose_tile(frame, 0, 0, None, border,
                                              status_label=_STATUS_LABEL[_st], status_color=_STATUS_COLOR[_st]))
@@ -629,6 +642,127 @@ def _collect_surface(
     return vid_path
 
 
+def _collect_wiping(
+    *,
+    env: Any,
+    agent: Any,
+    recorder_cfg: Any,
+    camera: Any,
+    max_episode_length: int,
+    num_trajectories: int,                    # accepted for symmetry; the wiping overlay tiles ALL envs
+    output_dir: str,
+    gif_name: str = "wiping.mp4",
+    step_trace: Any = None,
+) -> str:
+    """WIPING overlay: draw the N wiping WAYPOINTS as in-scene balls coloured by their cleaned state
+    (grey = pending, orange = the current target, green = cleaned), plus force/orientation gauges and a
+    ``Cleaned k/N`` tally per tile. Tiles ALL envs from ONE episode (so every tile is a fresh spawn).
+    Requires the wiping env (``env.wp_idx`` + the ``wipe_waypoints_w`` / ``wp_idx`` / ``n_waypoints``
+    keys its ``viz_snapshot`` adds). Returns the written mp4 path."""
+    from learning import surface_viz as sv
+    from wrappers.recording_grid import write_video
+
+    uenv = env.unwrapped
+    if not hasattr(uenv, "wp_idx"):
+        raise RuntimeError("the 'wiping' overlay requires the wiping env (env.wp_idx missing).")
+
+    num_envs = int(env.num_envs)
+    H, W = int(recorder_cfg.height), int(recorder_cfg.width)
+    T = int(max_episode_length)
+    cols = int(math.ceil(math.sqrt(num_envs)))
+    rows = int(math.ceil(num_envs / cols))
+    os.makedirs(output_dir, exist_ok=True)
+    ball_frac = float(getattr(recorder_cfg, "ball_diameter_frac", 2.0))
+    fmt = getattr(recorder_cfg, "video_format", "mp4")
+
+    GREEN = tuple(int(c) for c in sv.STATUS_RGB[1])    # cleaned
+    ORANGE = tuple(int(c) for c in sv.STATUS_RGB[2])   # current target
+    GREY = tuple(int(c) for c in sv.STATUS_RGB[0])     # pending
+    _PEND, _CLEAN, _CUR = 0, 1, 2                       # STATUS_RGB indices for the marker prototypes
+    print(f"[record] wiping overlay: 1 episode x {num_envs} envs ({rows}x{cols})", flush=True)
+
+    markers = None
+    video = None
+    set_camera_active(camera, True)
+    try:
+        obs, _ = env.reset()
+        state = _resolve_state(env, obs)
+        snap = uenv.viz_snapshot()
+        n = int(snap["n_waypoints"])
+        env_origins = uenv.scene.env_origins.detach().cpu().numpy()
+        wps_w = snap["wipe_waypoints_w"].numpy() + env_origins[:, None, :]      # (E, n, 3) world, on surface
+        wp_normals = snap["wipe_waypoint_normals_w"].numpy()                    # (E, n, 3) per-waypoint unit normals
+        Lm = snap["path_length"].numpy()
+        spacing = float(np.mean(Lm)) / max(n, 1)
+        radius = min(spacing * 0.3 * ball_frac, 0.015)                          # small balls that sit ON the surface
+        markers = sv.KeypointBallMarkers("/World/Visuals/wiping_waypoints", radius=radius)
+        # Lift EACH ball by its OWN local normal so its bottom rests on the surface at that point
+        # (perpendicular to the LOCAL curvature), not by a single shared normal.
+        markers.set_positions((wps_w + wp_normals * radius).reshape(-1, 3))
+
+        for t in range(T):
+            # Colour the waypoint balls by cleaned state BEFORE the render: [:k] cleaned, [k] current.
+            k_pre = snap["wp_idx"].numpy().astype(np.int64)
+            status = np.full((num_envs, n), _PEND, dtype=np.int64)
+            for e in range(num_envs):
+                k = int(k_pre[e])
+                if k > 0:
+                    status[e, : min(k, n)] = _CLEAN
+                if k < n:
+                    status[e, k] = _CUR
+            markers.update(status.reshape(-1))
+
+            actions, _ = agent.act(obs, state, timestep=10**9, timesteps=10**9)
+            step_obs, step_state = obs, state
+            obs, reward, terminated, truncated, info = env.step(actions)
+            if step_trace is not None:
+                step_trace.capture(observations=step_obs, states=step_state, actions=actions,
+                                   rewards=reward, terminated=terminated, truncated=truncated, infos=info)
+            rgb = read_camera_rgb(camera).numpy()                              # (E, H, W, 3)
+            snap = uenv.viz_snapshot()
+
+            fsq = snap["force_squash"].numpy(); osq = snap["orn_squash"].numpy()
+            fN = snap["force_N"].numpy(); shr = snap["shear_force_N"].numpy()
+            ang = snap["angle_dev_deg"].numpy(); contact = snap["in_contact"].numpy()
+            desF = np.maximum(snap["desired_force_N"].numpy(), 1e-6)
+            wp_now = snap["wp_idx"].numpy().astype(np.int64)
+
+            tiles = []
+            for e in range(num_envs):
+                k = int(min(wp_now[e], n)); remaining = n - k; done = k >= n
+                kp_counts = [
+                    (f"Cleaned: {k}/{n}", GREEN),
+                    ("Done" if done else f"Target: #{k + 1}", GREEN if done else ORANGE),
+                    (f"Remaining: {remaining}", GREY),
+                ]
+                shr_close = float(np.clip(1.0 - abs(float(shr[e])) / float(desF[e]), 0.0, 1.0))
+                readouts = [
+                    (f"N: {float(fN[e]):.1f}N", sv.closeness_color(float(fsq[e]))),
+                    (f"Shear: {float(shr[e]):.1f}N", sv.closeness_color(shr_close)),
+                    ("contact" if bool(contact[e]) else "no contact",
+                     (60, 200, 90) if bool(contact[e]) else (235, 90, 60)),
+                ]
+                tiles.append(sv.compose_tile(
+                    rgb[e], float(fsq[e]), float(osq[e]), None,
+                    (45, 200, 95) if done else None,
+                    force_text=f"{float(fN[e]):.1f}N", orn_text=f"{float(ang[e]):+.0f}°",
+                    force_fill=float(max(fN[e], 0.0) / (2.0 * float(desF[e]))),
+                    orn_fill=float(ang[e] / 30.0), force_target_frac=0.5,
+                    status_label="wiping", status_color=(180, 180, 185),
+                    readouts=readouts, kp_counts=kp_counts))
+            gframe = sv.montage(tiles, rows, cols)
+            if video is None:
+                video = np.zeros((T,) + gframe.shape, dtype=np.uint8)
+            video[t] = gframe
+    finally:
+        set_camera_active(camera, False)
+
+    vid_base = os.path.join(output_dir, os.path.splitext(gif_name)[0])
+    vid_path = write_video(video, vid_base, fps=int(recorder_cfg.fps), fmt=fmt)
+    print(f"[record] wrote wiping overlay video {vid_path} ({T} frames, {rows}x{cols})", flush=True)
+    return vid_path
+
+
 # ---------------------------------------------------------------------------------------------------
 # Overlay registry + THE single standalone trajectory recorder (mode='trajectories').
 # ---------------------------------------------------------------------------------------------------
@@ -636,6 +770,7 @@ def _collect_surface(
 # task overlay by writing its renderer (same kw signature) and registering it here — nothing else changes.
 OVERLAY_RENDERERS = {
     "surface_tracking": _collect_surface,   # keypoint-status balls + force/orientation gauges + path minimap
+    "wiping": _collect_wiping,              # wiping WAYPOINTS coloured by cleaned state + force gauges + tally
     "none": _collect_plain,                 # plain frames, no overlay -- env-agnostic (forge / peg / ...)
 }
 
@@ -757,7 +892,13 @@ def collect_reset_snapshots(
             radius = spacing * ball_frac / 2.0
             normal = snap["surface_normal"].numpy()
             env_origins = uenv.scene.env_origins.detach().cpu().numpy()
-            base = sv.keypoint_world_positions(snap["start_w"], snap["path_dir"], spacing, k)
+            # Keypoint path positions. A non-flat surface env (e.g. the curved task) exposes the ON-SURFACE
+            # keypoint positions so the drawn path hugs the curve; otherwise fall back to the straight
+            # start->goal chord. Both are env-relative -> add env_origins.
+            if hasattr(uenv, "keypoint_world_positions_on_surface"):
+                base = uenv.keypoint_world_positions_on_surface(k).detach().cpu().numpy()
+            else:
+                base = sv.keypoint_world_positions(snap["start_w"], snap["path_dir"], spacing, k)
             base = base + env_origins[:, None, :]
             goal_radius = radius * 4.0
             goal_lift = normal * goal_radius
@@ -770,7 +911,11 @@ def collect_reset_snapshots(
             gidx = np.full(num_envs, k - 1)
             goal_marker.update(base[np.arange(num_envs), gidx] + goal_lift)
             start_w_env = snap["start_w"].numpy() + env_origins
-            pace_marker.update(start_w_env + snap["s_ref"].numpy()[:, None] * snap["path_dir"].numpy() + goal_lift)
+            if hasattr(uenv, "path_point_on_surface"):
+                _pace_w = uenv.path_point_on_surface(snap["s_ref"].to(uenv.device)).detach().cpu().numpy() + env_origins
+                pace_marker.update(_pace_w + goal_lift)
+            else:
+                pace_marker.update(start_w_env + snap["s_ref"].numpy()[:, None] * snap["path_dir"].numpy() + goal_lift)
 
             # Per-env inset frame (fixed for this reset) + spawn tip, for the accumulating trace.
             start_w = snap["start_w"].numpy(); goal_w = snap["goal_w"].numpy()

@@ -181,8 +181,23 @@ class FragileObjectWrapper(gym.Wrapper):
     def _compute_violations(self):
         """Per-env FORCE break masks for the smoothed contact force: (total, normal, shear).
 
-        In magnitude mode ``normal``/``shear`` are None (no directional breakdown)."""
-        force = self.unwrapped.force_sensor_smooth[:, :3]  # (E,3) world-frame force
+        In magnitude mode ``normal``/``shear`` are None (no directional breakdown).
+
+        Force SOURCE follows env.cfg_task.force_source (default "oracle"): "oracle" breaks on the
+        peg<->plate CONTACT force (env.contact_force_world_ema — the true contact wrench, no wrist
+        inertia/motion contamination); "wrist_ft" keeps the FR3 wrist F/T. Oracle hard-requires the
+        ContactSensorWrapper (no silent fallback)."""
+        _src = str(getattr(getattr(self.unwrapped, "cfg_task", None), "force_source", "oracle"))
+        if _src == "oracle":
+            force = getattr(self.unwrapped, "contact_force_world_ema", None)
+            if not torch.is_tensor(force):
+                raise RuntimeError(
+                    "force_source='oracle' break requires the ContactSensorWrapper "
+                    "(env.contact_force_world_ema is missing). Attach it (sensor_cfg.contact.enabled=True)."
+                )
+            force = force[:, :3]  # (E,3) world-frame contact force
+        else:
+            force = self.unwrapped.force_sensor_smooth[:, :3]  # (E,3) world-frame wrist F/T
         if self.direction_break_force:
             # Peg long axis in WORLD frame: held body's local +z rotated by held_quat. Unit by
             # construction (held_quat is a unit quaternion); renormalize for numerical safety.

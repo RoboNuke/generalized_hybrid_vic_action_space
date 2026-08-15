@@ -286,6 +286,27 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         """
         return self._plate_normal, self._plate_path_dir
 
+    def _project_tip_to_surface(self, cyl_tip, start, plate_normal):
+        """Project the tool tip onto the surface -> ``(contact_point (E,3), tip_surface_dist (E,))``.
+
+        Flat: orthogonal projection onto the plate top plane (through ``start``, along the plate
+        normal). ``signed_dist`` is the height of the tip REFERENCE (flat tip => lower face center;
+        rounded/capsule tip => hemisphere CENTER) above the plane; the in-plane contact point is
+        unchanged by the rounding, while the returned ``tip_surface_dist`` subtracts the hemisphere
+        radius ``_tip_sphere_r`` so it is the clearance of the tip SURFACE (m): >0 above, ~0 in contact,
+        <0 penetrating (used by the orientation reward's near-surface gate). Extracted into a hook so a
+        non-flat surface subclass can project onto its curved surface instead."""
+        signed_dist = ((cyl_tip - start) * plate_normal).sum(-1, keepdim=True)
+        contact_point = cyl_tip - signed_dist * plate_normal
+        return contact_point, (signed_dist - self._tip_sphere_r).squeeze(-1)
+
+    def _point_on_path(self, start, path_dir, arclen):
+        """World point at along-path arc-length ``arclen`` (E,) from ``start`` (E,3).
+
+        Flat: the straight line ``start + arclen * path_dir``. A curved-surface subclass overrides this
+        to place the point ON the curved surface, so the observation setpoint follows the surface."""
+        return start + arclen.unsqueeze(-1) * path_dir
+
     # ------------------------------------------------------------------
     # Extension hooks (no-ops here; overridden by non-flat surface subclasses)
     # ------------------------------------------------------------------
@@ -308,7 +329,11 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         cw = getattr(self, "in_contact", None)
         if torch.is_tensor(cw):
             return cw.any(dim=1)
-        return self.measured_normal_force.abs() > 0.1
+        raise RuntimeError(
+            "in_contact detection requires the ContactSensorWrapper (env.in_contact is missing). "
+            "Attach it (sensor_cfg.contact.enabled=True). Refusing to silently fall back to the "
+            "wrist-FT normal-force threshold."
+        )
 
     def interaction_frame_world(self):
         """(E,3,3) world<-interaction rotation — columns are the interaction-frame axes in world.
@@ -383,6 +408,14 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.cfg_task.fixed_asset.spawn.physics_material.dynamic_friction = float(self.cfg_task.plate_friction)
         self.cfg_task.held_asset.spawn.physics_material.static_friction = float(self.cfg_task.held_friction)
         self.cfg_task.held_asset.spawn.physics_material.dynamic_friction = float(self.cfg_task.held_friction)
+        # Compliant (soft) contact: k>0 turns the rigid non-penetration constraint into a spring-damper
+        # (F = k*pen + d*pen_rate), smoothing the contact-force impulse chatter. Set on BOTH contacting
+        # materials so the compliant model activates regardless of PhysX's per-pair combine. 0 = rigid.
+        _kc = float(getattr(self.cfg_task, "plate_compliant_stiffness", 0.0))
+        _dc = float(getattr(self.cfg_task, "plate_compliant_damping", 0.0))
+        for _spawn in (self.cfg_task.fixed_asset.spawn, self.cfg_task.held_asset.spawn):
+            _spawn.physics_material.compliant_contact_stiffness = _kc
+            _spawn.physics_material.compliant_contact_damping = _dc
         # Optional rounded contact tip: respawn the held object as a CAPSULE (same radius/height/props),
         # so its bottom is a hemisphere of radius = the cylinder radius. Keeping height = the cylinder
         # segment length leaves the grip + `half` math unchanged; the hemisphere adds `radius` below the
@@ -414,6 +447,25 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.scene.clone_environments(copy_from_source=False)
         if self.device == "cpu":
             self.scene.filter_collisions()
+
+        # DIAGNOSTIC: read the compliant-contact stiffness/damping actually applied to the spawned
+        # plate + peg PhysX materials (confirms the cfg value reached USD/PhysX, incl. on the
+        # kinematic plate). Prints once at build; wrapped in try/except so it never breaks setup.
+        try:
+            from pxr import PhysxSchema
+            import isaacsim.core.utils.prims as _prim_utils
+            _stage = self.scene.stage if hasattr(self.scene, "stage") else None
+            for _root in ("/World/envs/env_0/FixedAsset", "/World/envs/env_0/HeldAsset"):
+                for _p in _prim_utils.get_all_matching_child_prims(
+                    _root, predicate=lambda pr: PhysxSchema.PhysxMaterialAPI(pr)
+                ):
+                    _api = PhysxSchema.PhysxMaterialAPI(_p)
+                    _k = _api.GetCompliantContactStiffnessAttr().Get()
+                    _d = _api.GetCompliantContactDampingAttr().Get()
+                    print(f"[flat_surface][compliance-readback] {_p.GetPath()}: "
+                          f"compliantContactStiffness={_k} compliantContactDamping={_d}", flush=True)
+        except Exception as _e:
+            print(f"[flat_surface][compliance-readback] skipped ({_e})", flush=True)
 
         self.scene.articulations["robot"] = self._robot
         self.scene.rigid_objects["fixed_asset"] = self._fixed_asset
@@ -454,7 +506,18 @@ class FlatSurfaceFollowEnv(ForgeEnv):
     # Intermediate values: stash task geometry after the Forge base compute
     # ------------------------------------------------------------------
     def _compute_intermediate_values(self, dt):
-        super()._compute_intermediate_values(dt)  # ForgeEnv: noise + FT sensing
+        super()._compute_intermediate_values(dt)  # ForgeEnv: noise + FT sensing (per physics substep)
+
+        # Refresh the contact-sensor (oracle) EMA EVERY PHYSICS SUBSTEP, matching the wrist-FT EMA
+        # that super() just updated: same alpha (ft_smoothing_factor), same per-substep rate, so the
+        # oracle averages over the decimation substeps instead of grabbing a single-substep snapshot
+        # once per env step (which under-sampled the spiky contact impulse). The ContactSensorWrapper
+        # installs this hook + gates it on the sim timestamp, so it is a no-op before the view is
+        # live and updates each substep exactly once. measured_normal_force (below) then reads the
+        # freshly-averaged oracle.
+        _rf = getattr(self, "_refresh_in_contact", None)
+        if callable(_rf):
+            _rf()
 
         # PATH parametrization from the fixed-asset (plate) pose: near/far edge centers on the top
         # surface. The plate's normal / near->far direction returned here are a BOOTSTRAP, used only
@@ -484,14 +547,12 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # signed_dist = height of the tip REFERENCE above the surface. For a flat tip that reference is
         # the lower face center; for a rounded (capsule) tip it is the hemisphere CENTER, whose lowest
         # surface point is self._tip_sphere_r closer to the plate — so subtract it for the clearance.
-        signed_dist = ((self.cyl_tip - start) * plate_normal).sum(-1, keepdim=True)
-        # Surface point under the tip (the hemisphere contact sits directly below the center along the
-        # normal, so the projected in-plane point is unchanged by the rounding).
-        self.contact_point = self.cyl_tip - signed_dist * plate_normal
-        # Signed height of the tool tip above the surface (m): >0 above, ~0 in contact, <0 penetrating.
-        # Used by the orientation reward's near-surface gate. Rounded tip => clearance of the hemisphere
-        # SURFACE (center height minus the radius); flat tip => face-center height (_tip_sphere_r == 0).
-        self.tip_surface_dist = (signed_dist - self._tip_sphere_r).squeeze(-1)
+        # Project onto the surface via a hook (flat plate here; a curved-surface subclass overrides it
+        # to project onto its ridge). Returns the in-plane contact point + the signed tip-surface
+        # clearance (the hook applies the rounded-tip _tip_sphere_r offset).
+        self.contact_point, self.tip_surface_dist = self._project_tip_to_surface(
+            self.cyl_tip, start, plate_normal
+        )
 
         # LOCAL surface frame AT THE CONTACT POINT — the normal + travel direction the reward and the
         # critic use. General hook: a non-flat surface overrides `_surface_normal_and_dir_at` to
@@ -552,12 +613,12 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # Reset to 0 in _reset_idx (and carried by the efficient-reset cache).
         self.setpoint_kp_idx = torch.maximum(self.setpoint_kp_idx, new_setpoint)
         setpoint_arclen = (self.setpoint_kp_idx.float() * self.keypoint_spacing).minimum(self.path_length)
-        self.setpoint_pos = start + setpoint_arclen.unsqueeze(-1) * path_dir
+        self.setpoint_pos = self._point_on_path(start, path_dir, setpoint_arclen)
         # The keypoint AFTER the current one (index+1, clamped to total/L). Used by interaction_frame_
         # world() as a fallback goal when the contact point sits essentially on the current keypoint,
         # where the direction to it (the frame's x-axis) is ill-defined.
         next_arclen = ((self.setpoint_kp_idx + 1).float() * self.keypoint_spacing).minimum(self.path_length)
-        self.next_setpoint_pos = start + next_arclen.unsqueeze(-1) * path_dir
+        self.next_setpoint_pos = self._point_on_path(start, path_dir, next_arclen)
 
         # Measured normal force = projection of the FT force onto the true surface normal.
         # The raw smoothed force (force_sensor_world_smooth) is in the force_sensor child-joint
@@ -570,7 +631,22 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # verified by a contact smoke test: this reads POSITIVE when pressing into the surface (matches
         # desired_force > 0) and is orientation-INDEPENDENT (world force . world normal), so it no
         # longer flips as the tool tilts.
-        self.measured_normal_force = (self.force_sensor_world_smooth[:, 0:3] * normal).sum(-1)
+        # Force SOURCE (see cfg.force_source): "oracle" projects the peg<->plate CONTACT force
+        # (env.contact_force_world_ema, from the ContactSensorWrapper) onto the surface normal — the
+        # true contact normal force, no wrist inertia/motion contamination; "wrist_ft" keeps the FR3
+        # wrist F/T reaction. Both give POSITIVE when pressing (world force . world normal). The oracle
+        # path HARD-REQUIRES the wrapper: no silent fallback to the wrist FT.
+        if str(getattr(self.cfg_task, "force_source", "oracle")) == "oracle":
+            _cf = getattr(self, "contact_force_world_ema", None)
+            if not torch.is_tensor(_cf):
+                raise RuntimeError(
+                    "force_source='oracle' requires the ContactSensorWrapper "
+                    "(env.contact_force_world_ema is missing). Attach it (sensor_cfg.contact.enabled=True). "
+                    "Refusing to silently fall back to the wrist F/T."
+                )
+            self.measured_normal_force = (_cf[:, 0:3] * normal).sum(-1)
+        else:
+            self.measured_normal_force = (self.force_sensor_world_smooth[:, 0:3] * normal).sum(-1)
 
         # Orientation: angle between the held cylinder's long axis and the surface NORMAL, in RADIANS
         # (arccos(|axis . normal|); 0 = axis parallel to the normal = tip-down/perpendicular, pi/2 =

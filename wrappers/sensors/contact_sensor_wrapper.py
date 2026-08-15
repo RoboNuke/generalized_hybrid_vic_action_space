@@ -189,8 +189,23 @@ class ContactSensorWrapper(gym.Wrapper):
         # the unnoised + EMA'd force). Same alpha as the Forge force sensor (ft_smoothing_factor,
         # default 0.25); updated once per env-step, and reset per-episode so a stale reading from the
         # previous episode never carries into a fresh spawn.
+        # EMA alpha for the contact (oracle) force — SAME as the Forge wrist-FT EMA
+        # (ft_smoothing_factor). The env drives _refresh_in_contact once per PHYSICS SUBSTEP (see
+        # flat_surface_follow_env._compute_intermediate_values), so this EMA averages over the
+        # substeps exactly like the wrist FT (matched filtering: same alpha, same update rate, so it
+        # scales with the physics rate the same way). A sim-timestamp gate (_last_refresh_ts) makes
+        # the refresh idempotent, so a redundant post-step call from step() is a no-op.
         self._ema_alpha = float(getattr(getattr(self.unwrapped, "cfg", None), "ft_smoothing_factor", 0.25))
+        self._last_refresh_ts = None
         self._force_ema = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=self.device)
+        # DIAGNOSTIC (force-source noise probe): world-frame EMA of the contact force + last raw
+        # reading, published each step into extras["per_env_trace"] alongside the wrist FT so an
+        # eval trace can compare the two sources' per-axis mean/std. Cheap; safe to leave in.
+        self._force_ema_w = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=self.device)
+        self._last_contact_w = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=self.device)
+        # Oracle contact force (world frame, EMA'd) exposed to the env for the "oracle" force_source
+        # (reward + fragile break read this instead of the wrist FT). Zeros until the view is live.
+        self.unwrapped.contact_force_world_ema = self._force_ema_w
 
         # Resolve the held (sensor) + fixed (filter) contact-reporting body paths from the env-0
         # prototype (a real USD prim at this point) and put them in PhysX GLOB form ('env_*', no
@@ -257,11 +272,29 @@ class ContactSensorWrapper(gym.Wrapper):
 
         if not self._ensure_view():
             return False
+        # Idempotency gate: the env calls this once per PHYSICS SUBSTEP; the wrapper's post-step
+        # step() also calls it. Only recompute when the sim has actually advanced since the last
+        # refresh, so a substep is EMA'd exactly once (mirrors Factory's per-substep FT-update gate).
+        try:
+            _ts = float(self.unwrapped._robot._data._sim_timestamp)
+            if self._last_refresh_ts is not None and _ts <= self._last_refresh_ts:
+                return True
+            self._last_refresh_ts = _ts
+        except Exception:
+            pass  # no robot timestamp available -> fall back to unconditional refresh
         # (num_envs, M_filters, 3) per-pair contact force; sum over filtered bodies -> world net.
         fmat = self._contact_view.get_contact_force_matrix(self._dt)
         force_w = fmat.sum(dim=1)
         # Rotate into the EE / force-torque frame so per-axis flags align with the control axes.
         force_ee = quat_rotate_inverse(self.unwrapped.fingertip_midpoint_quat, force_w)
+        # DIAGNOSTIC: keep the raw world contact force + a world-frame EMA (same alpha / seeding as
+        # the EE thresholding EMA below) so the trace can report the contact-source noise directly.
+        self._last_contact_w = force_w
+        _buf = getattr(self.unwrapped, "episode_length_buf", None)
+        _fresh = (_buf <= 1).unsqueeze(-1) if torch.is_tensor(_buf) else True
+        _blended_w = self._ema_alpha * force_w + (1.0 - self._ema_alpha) * self._force_ema_w
+        self._force_ema_w = torch.where(_fresh, force_w, _blended_w) if torch.is_tensor(_buf) else force_w
+        self.unwrapped.contact_force_world_ema = self._force_ema_w  # expose the fresh oracle to the env
         # EMA-smooth (unnoised) before thresholding. Envs at the very start of an episode
         # (episode_length_buf <= 1) seed the EMA with the raw reading so no history bleeds across the
         # per-episode reset; everyone else blends alpha*raw + (1-alpha)*prev.
@@ -276,6 +309,22 @@ class ContactSensorWrapper(gym.Wrapper):
         if not self._refresh_in_contact():
             return
         in_contact = self.unwrapped.in_contact
+        # DIAGNOSTIC force-source probe: publish both sources (raw + EMA, world frame) + the surface
+        # normal + per-axis in_contact into the per-env trace the StepTraceRecorder captures. The env
+        # rebuilt per_env_trace this step (in _get_observations); we merge, so nothing is clobbered.
+        ex = getattr(self.unwrapped, "extras", None)
+        pt = ex.get("per_env_trace") if isinstance(ex, dict) else None
+        if isinstance(pt, dict):
+            u = self.unwrapped
+            if hasattr(u, "force_sensor_world"):
+                pt["dbg_wrist_ft_w_raw"] = u.force_sensor_world[:, 0:3].detach()
+            if hasattr(u, "force_sensor_world_smooth"):
+                pt["dbg_wrist_ft_w_ema"] = u.force_sensor_world_smooth[:, 0:3].detach()
+            pt["dbg_contact_w_raw"] = self._last_contact_w.detach()
+            pt["dbg_contact_w_ema"] = self._force_ema_w.detach()
+            if hasattr(u, "surface_normal") and torch.is_tensor(u.surface_normal):
+                pt["dbg_surface_normal"] = u.surface_normal.detach()
+            pt["dbg_in_contact_axes"] = in_contact.float()
         if self._log_contact and hasattr(self.unwrapped, "extras"):
             to_log = self.unwrapped.extras.setdefault("to_log", {})
             for i, name in enumerate(_AXIS_NAMES):
@@ -298,4 +347,6 @@ class ContactSensorWrapper(gym.Wrapper):
         # first-step reading of the new episode starts fresh (the per-env buf<=1 seed handles
         # mid-episode resets).
         self._force_ema.zero_()
+        self._force_ema_w.zero_()
+        self._last_refresh_ts = None
         return super().reset(**kwargs)

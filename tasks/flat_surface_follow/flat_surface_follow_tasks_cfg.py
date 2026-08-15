@@ -242,6 +242,16 @@ class FlatSurfaceFollowTask(ForgeTask):
     # is projected onto the world surface normal for a fair (same-frame) difference.
     force_desired_min: float = 5.0                # N (fixed target for training: min == max => no per-run variation)
     force_desired_max: float = 5.0                # N
+    # Force SOURCE for the reward + fragile break (contact detection ALWAYS uses the oracle and hard-
+    # requires the ContactSensorWrapper). "oracle" = the peg<->plate contact force (get_contact_force_
+    # matrix, EMA'd, exposed as env.contact_force_world_ema); "wrist_ft" = the FR3 wrist F/T reaction
+    # (force_sensor_world_smooth). "oracle" also hard-requires the wrapper (no silent fallback).
+    force_source: str = "oracle"
+    # Compliant (soft) contact on the plate + peg: k>0 replaces PhysX's rigid non-penetration
+    # constraint with a spring-damper (F = k*penetration + d*penetration_rate), smoothing the contact
+    # impulse chatter. 0 = rigid (default / prior behavior). Applied to both contacting materials.
+    plate_compliant_stiffness: float = 0.0        # N/m
+    plate_compliant_damping: float = 0.0          # N*s/m
     force_weight: float = 1.0
     force_a: float = 0.25                         # squashing steepness over the force error (N); wide
                                                   # so there's a MONOTONIC gradient from light contact
