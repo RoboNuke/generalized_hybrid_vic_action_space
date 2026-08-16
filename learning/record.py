@@ -297,17 +297,28 @@ def _run_from_wandb(args) -> None:
         _PROJECT_ROOT, "runs", "eval_videos", f"{project.replace('/', '_')}_{args.wandb_tag}"))
 
     api = wandb.Api(timeout=60)
-    runs = list(api.runs(path, filters={"tags": args.wandb_tag}))
+    groups = args.wandb_group or args.methods
+    # Select runs by tag AND/OR group. Tag alone (the original from-wandb sweep usage), group
+    # alone (the e2e launcher's post-train eval: it has the experiment_name as the group but may
+    # not carry a --wandb_tag), or both. At least one selector is required.
+    if args.wandb_tag:
+        runs = list(api.runs(path, filters={"tags": args.wandb_tag}))
+    elif groups:
+        runs = list(api.runs(path, filters={"group": {"$in": list(groups)}}))
+    else:
+        raise SystemExit(f"[{mode}] need --wandb_tag and/or --wandb_group to select runs")
     if args.wandb_run_filter:
         runs = [r for r in runs if args.wandb_run_filter in (r.name or "")]
-    groups = args.wandb_group or args.methods
     if groups:
         runs = [r for r in runs if (r.group or "") in set(groups)]
     if not runs:
-        raise SystemExit(f"[{mode}] no runs in {path} tagged {args.wandb_tag!r}"
+        raise SystemExit(f"[{mode}] no runs in {path}"
+                         + (f" tagged {args.wandb_tag!r}" if args.wandb_tag else "")
                          + (f" in groups {groups}" if groups else "")
                          + (f" matching {args.wandb_run_filter!r}" if args.wandb_run_filter else ""))
-    print(f"[{mode}] {len(runs)} run(s) in {path} tagged {args.wandb_tag!r}", flush=True)
+    print(f"[{mode}] {len(runs)} run(s) in {path}"
+          + (f" tagged {args.wandb_tag!r}" if args.wandb_tag else "")
+          + (f" in groups {groups}" if groups else ""), flush=True)
 
     ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
     # Optional label (e.g. "<param-label>_<value>" from the sweep wrapper) -> filename-safe.

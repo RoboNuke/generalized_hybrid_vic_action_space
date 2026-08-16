@@ -82,18 +82,42 @@ class WipingSurfaceFollowTask(CurvedSurfaceFollowTask):
     # Distance (m) within which the sponge bottom-face centre counts as having REACHED the current
     # waypoint (must also be in contact). Advances the target and pays r_way.
     waypoint_reach_radius: float = 0.02
+    # Waypoints are placed at RANDOM (x, y) locations on the tabletop each reset (like the paper's
+    # randomized waypoints), then lifted onto the curved surface, and visited SEQUENTIALLY in near->far
+    # (along-path x) order. Kept at least this margin (m) inside the plate edges so a reached waypoint
+    # doesn't put the sponge off the rim.
+    waypoint_edge_margin: float = 0.02
 
     # --- Wiping reward (paper Eq. 1 base terms) -----------------------------------------------
-    wipe_contact_weight: float = 1.0      # w_con  : per-step reward while in contact
-    wipe_force_weight: float = 1.0        # w_force: peak of the Gaussian force reward (in contact + aligned)
-    wipe_force_target: float = 5.0        # mu (N) : target normal force (paper uses 60 N; ours is lighter)
-    wipe_force_sigma: float = 5.0         # sigma (N): Gaussian width of the force reward
+    # --- Bounded reward (arXiv:2502.12599 Eq. 6). When True, the quality reward (r_con + r_force) is
+    #     paid ONCE per concentric checkpoint RING crossed (in contact) on the approach to each
+    #     waypoint, instead of every step. This BOUNDS the cumulative quality reward to
+    #     ~n_checkpoints_per_waypoint * n_waypoints, so a "wipe forever in one spot" policy can't
+    #     out-earn finishing. False => the base per-step quality reward. ---
+    bounded_reward: bool = False
+    n_checkpoints_per_waypoint: int = 4     # concentric checkpoint rings around each target waypoint
+    checkpoint_outer_radius: float = 0.06   # m: outermost ring; innermost == waypoint_reach_radius
+
+    # Defaults aligned to arXiv:2502.12599 where the paper reports a number:
+    #   * mu = 60 N (target force), W_q^max = w_con + w_force = 29 (max per-step quality), W_T = 1000
+    #     (task-completion / final-waypoint reward). The paper does NOT report the w_con/w_force split,
+    #     w_way, w_ac, w_col, or sigma, so those are reasonable choices (marked "(unspecified)").
+    wipe_contact_weight: float = 1.0      # w_con  : contact flag. w_con + w_force = W_q^max = 29 (paper);
+    wipe_force_weight: float = 28.0       # w_force: split unspecified -> force-dominant (quality-critical).
+    wipe_force_target: float = 60.0       # mu (N) : target normal force (paper: 60 N)
+    wipe_force_sigma: float = 10.0        # sigma (N): Gaussian width (unspecified; sized for the 60 N target)
     wipe_align_cos: float = 0.8           # I_align: min cos-sim(EE motion dir, dir-to-waypoint) to pay force
-    wipe_waypoint_weight: float = 10.0    # w_way  : sparse reward each time a waypoint is reached
-    wipe_final_bonus: float = 50.0        # extra sparse reward when the FINAL waypoint is wiped (episode ends)
-    wipe_accel_weight: float = 0.001      # w_ac   : EE-acceleration (|ax|+|ay|+|az|) smoothness penalty
-    wipe_collision_weight: float = 10.0   # w_col  : penalty on an over-force "collision"
-    wipe_collision_force: float = 30.0    # N: |normal force| above this counts as a collision
+    wipe_waypoint_weight: float = 10.0    # w_way  : per-waypoint sparse reward (unspecified in the paper)
+    wipe_final_bonus: float = 1000.0      # W_T: extra sparse reward when the FINAL waypoint is wiped (paper: 1000)
+    wipe_accel_weight: float = 0.001      # w_ac   : EE-acceleration smoothness penalty (unspecified)
+    wipe_collision_weight: float = 0.0    # w_col  : over-force "collision" penalty. 0 = disabled (no
+                                          # collision failure mode); the paper uses a penalty but its value
+                                          # is unreported. Raise to re-enable the r_col penalty.
+    wipe_collision_force: float = 100.0   # N: |normal force| above this = collision (above the 60 N target)
+    # The observed target force (obs 'target_normal_force') = per-episode desired_force sampled in
+    # [min, max]. Pin it to the reward target mu = 60 N so the policy is shown the force it's rewarded on.
+    force_desired_min: float = 60.0
+    force_desired_max: float = 60.0
     # Terminate the episode on a collision (paper does). OFF by default: with per-env curvature this
     # task uses the FULL-reset path (no efficient reset), so frequent terminations = frequent settling
     # resets. Enable once the policy keeps force under control.

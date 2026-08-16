@@ -37,42 +37,85 @@ class WipingSurfaceFollowEnv(CurvedSurfaceFollowEnv):
         self._wp_reached_now = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
         self._wp_final_now = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
         self._collided = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        # Bounded-reward checkpoint state: highest concentric ring already CLAIMED for the CURRENT
+        # waypoint (per env), and this step's I_check (a NEW ring was crossed in contact -> pay the
+        # quality reward once). Reset when the waypoint advances so each waypoint has its own rings.
+        self._cp_claimed = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        self._icheck = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
         # Previous-step EEF linear velocity, for the acceleration penalty (finite difference).
         self._prev_linvel = torch.zeros((self.num_envs, 3), device=self.device)
         # Current waypoint set (E, n, 3), refreshed each _compute; init for safety.
         self.wipe_waypoints = torch.zeros((self.num_envs, self.n_waypoints, 3), device=self.device)
-        # Carry the wiping per-episode state across efficient-reset teleports (not used by default, but
-        # kept consistent with the parent's mechanism). alpha/caps come from the curved parent.
-        self._efficient_reset_extra_attrs = tuple(self._efficient_reset_extra_attrs) + ("wp_idx",)
+        # Per-env RANDOM waypoint (x, y) locations in the PLATE-LOCAL frame (sampled each reset). The
+        # world positions are these lifted onto the ridge; kept plate-local so they follow the plate.
+        self._wp_xy = torch.zeros((self.num_envs, self.n_waypoints, 2), device=self.device)
+        self._sample_waypoints(torch.arange(self.num_envs, device=self.device))
+        # Carry the wiping per-episode state across efficient-reset teleports (efficient reset IS
+        # supported here — see the curved parent's _efficient_reset_finalize; use it with the fragile /
+        # collision wrapper). alpha + the physical caps are handled by the curved parent.
+        self._efficient_reset_extra_attrs = tuple(self._efficient_reset_extra_attrs) + ("wp_idx", "_wp_xy", "_cp_claimed")
 
     # ------------------------------------------------------------------
     # Waypoints on the surface
     # ------------------------------------------------------------------
-    def _wipe_waypoints(self, n):
-        """(E, n, 3) env-relative waypoints along the wipe path, ON the ridge surface. Waypoint j
-        (1..n) sits at along-path arc-length (j/n)*path_length, lifted onto the surface — so the set
-        spans the path and the last waypoint is the far edge."""
-        L = self.path_length                                              # (E,)
-        cols = []
-        for j in range(1, n + 1):
-            arclen = (float(j) / n) * L                                   # (E,) arc-length of waypoint j
-            cols.append(self.path_point_on_surface(arclen))              # (E,3) on the surface
-        return torch.stack(cols, dim=1)                                   # (E, n, 3)
+    def _sample_waypoints(self, env_ids):
+        """Sample fresh RANDOM (x, y) waypoint locations on the tabletop (plate-local) for ``env_ids``,
+        sorted near->far along the path (x) so sequential visiting is a coherent forward sweep. Kept
+        ``waypoint_edge_margin`` inside the plate edges; y is the cross-path lateral spread."""
+        k = int(env_ids.shape[0])
+        n = self.n_waypoints
+        m = float(self.cfg_task.waypoint_edge_margin)
+        xr = max(self._ridge_w - m, 1e-3)                                # along-path half-extent (plate_length/2)
+        yr = max(0.5 * float(self.cfg_task.plate_width) - m, 1e-3)       # cross-path half-extent
+        xs = (2.0 * torch.rand((k, n), device=self.device) - 1.0) * xr
+        ys = (2.0 * torch.rand((k, n), device=self.device) - 1.0) * yr
+        xs, order = torch.sort(xs, dim=1)                                # visit near->far
+        ys = torch.gather(ys, 1, order)
+        self._wp_xy[env_ids] = torch.stack([xs, ys], dim=-1)
+
+    def _waypoint_world(self):
+        """(positions (E,n,3), normals (E,n,3)) env-relative world, from the stored plate-local (x, y)
+        waypoints lifted onto the ridge surface (z = plate_top + ridge_height(x)); the normal is the
+        local surface normal at each waypoint (the ridge is y-invariant, so it depends only on x)."""
+        xy = self._wp_xy                                                 # (E, n, 2)
+        n = xy.shape[1]
+        pos_cols, nrm_cols = [], []
+        for j in range(n):
+            x = xy[:, j, 0]
+            h, n_local, _ = self._ridge_geom_local(x)                    # h (E,), n_local (E,3) plate-local
+            loc = torch.stack([x, xy[:, j, 1], self._plate_top_local + h], dim=-1)   # (E,3) plate-local point
+            pos_cols.append(self._to_world(loc))
+            nrm = self._dir_to_world(n_local)
+            nrm_cols.append(nrm / torch.linalg.norm(nrm, dim=-1, keepdim=True).clamp_min(1e-8))
+        return torch.stack(pos_cols, dim=1), torch.stack(nrm_cols, dim=1)  # (E,n,3), (E,n,3)
 
     def _compute_intermediate_values(self, dt):
         super()._compute_intermediate_values(dt)
         n = self.n_waypoints
-        wps = self._wipe_waypoints(n)                                     # (E, n, 3)
+        wps, _ = self._waypoint_world()                                   # (E, n, 3) scattered, on surface
         self.wipe_waypoints = wps
         ar = torch.arange(self.num_envs, device=self.device)
         idx = self.wp_idx.clamp(max=n - 1)
         cur = wps[ar, idx]                                                # (E,3) current target waypoint
         # Reached = sponge bottom-face centre within reach radius AND in contact, and not already done.
         dist = torch.linalg.norm(self.held_end_pos - cur, dim=-1)
-        reached = (self.wp_idx < n) & (dist < float(self.cfg_task.waypoint_reach_radius)) & self.in_contact_any
+
+        # Bounded-reward CHECKPOINTS: M concentric rings around the current target, radii spanning
+        # [reach_radius, checkpoint_outer_radius]. ``level`` = how many rings the tool is currently
+        # inside (0 far, M at/inside the innermost). A NEW ring crossed IN CONTACT sets I_check=1 this
+        # step (quality reward paid once per ring); claims reset when the waypoint advances.
+        M = max(1, int(self.cfg_task.n_checkpoints_per_waypoint))
+        reach = float(self.cfg_task.waypoint_reach_radius)
+        outer = max(float(self.cfg_task.checkpoint_outer_radius), reach + 1e-4)
+        level = ((outer - dist) / ((outer - reach) / M)).floor().clamp(0, M).long()   # (E,) rings crossed
+        self._icheck = (level > self._cp_claimed) & self.in_contact_any & (self.wp_idx < n)
+        self._cp_claimed = torch.maximum(self._cp_claimed, level)
+
+        reached = (self.wp_idx < n) & (dist < reach) & self.in_contact_any
         self._wp_reached_now = reached
         self.wp_idx = torch.where(reached, self.wp_idx + 1, self.wp_idx)  # advance sequentially (ratchet)
         self._wp_final_now = reached & (self.wp_idx >= n)                 # the LAST waypoint was just wiped
+        self._cp_claimed = torch.where(reached, torch.zeros_like(self._cp_claimed), self._cp_claimed)
 
         # The SINGLE target shown to the policy = the (new) current waypoint. Overrides the curved
         # env's path setpoint; obs (setpoint_pos_rel) and the keypoint-servo both read this unchanged.
@@ -88,21 +131,14 @@ class WipingSurfaceFollowEnv(CurvedSurfaceFollowEnv):
         out = super().viz_snapshot()
         # Recompute the waypoints from the CURRENT plate pose (robust even if _compute has not run yet
         # right after a reset). Env-relative, like start_w -> the recorder adds env_origins.
-        start, goal, _, _, _ = self._surface_frame()
-        L = torch.linalg.norm(goal - start, dim=-1)
-        n = self.n_waypoints
-        wps = torch.stack([self.path_point_on_surface((float(j) / n) * L) for j in range(1, n + 1)], dim=1)
-        # Per-waypoint LOCAL surface normal (unit, world frame) AT EACH waypoint, so the recorder can
-        # lift each marker PERPENDICULAR to the surface there — a single contact-point normal would tilt
-        # the balls off the curve (some appear higher, some lower).
-        nrms = []
-        for j in range(n):
-            nj, _ = self._surface_normal_and_dir_at(wps[:, j, :])
-            nrms.append(nj / torch.linalg.norm(nj, dim=-1, keepdim=True).clamp_min(1e-8))
+        # The randomized waypoints lifted onto the surface + their per-waypoint LOCAL normals, so the
+        # recorder lifts each marker PERPENDICULAR to the surface there (a single shared normal would
+        # tilt the balls off the curve).
+        wps, nrms = self._waypoint_world()
         out["wipe_waypoints_w"] = wps.detach().cpu()                        # (E, n, 3) env-relative, on surface
-        out["wipe_waypoint_normals_w"] = torch.stack(nrms, dim=1).detach().cpu()  # (E, n, 3) unit normals
+        out["wipe_waypoint_normals_w"] = nrms.detach().cpu()               # (E, n, 3) unit normals
         out["wp_idx"] = self.wp_idx.detach().cpu()                          # (E,) waypoints cleaned so far
-        out["n_waypoints"] = int(n)
+        out["n_waypoints"] = int(self.n_waypoints)
         return out
 
     # ------------------------------------------------------------------
@@ -146,10 +182,16 @@ class WipingSurfaceFollowEnv(CurvedSurfaceFollowEnv):
         r_ac = -float(cfg.wipe_accel_weight) * accel.abs().sum(-1)
         self._prev_linvel = self.fingertip_midpoint_linvel.clone()
 
-        # Collision (over-force): r_col REPLACES the other terms this step (paper Eq. 1).
+        # Quality reward (r_con + r_force). BOUNDED reward (Eq. 6): gate it by I_check so it is paid
+        # only on a NEW checkpoint-ring crossing (finite total), instead of every step (Eq. 1 base).
+        quality = r_con + r_force
+        if bool(cfg.bounded_reward):
+            quality = quality * self._icheck.float()
+
+        # Collision (over-force): r_col REPLACES the other terms this step (paper Eq. 1 / Eq. 6).
         collided = self.measured_normal_force.abs() > float(cfg.wipe_collision_force)
         r_col = torch.full_like(contact, -float(cfg.wipe_collision_weight))
-        rew_buf = torch.where(collided, r_col, r_con + r_force + r_way + r_ac)
+        rew_buf = torch.where(collided, r_col, quality + r_way + r_ac)
 
         # --- logging ---
         curr_successes = self._get_curr_successes()
@@ -160,6 +202,7 @@ class WipingSurfaceFollowEnv(CurvedSurfaceFollowEnv):
             tl["Wipe / waypoints reached"] = self.wp_idx.float().detach()
             tl["Wipe / contact rate"] = contact.detach()
             tl["Wipe / aligned rate"] = i_align.detach()
+            tl["Wipe / checkpoint pulse"] = self._icheck.float().detach()   # I_check rate (bounded reward)
             # Per-episode wipe-complete success, bucketed by curvature quartile (perf vs difficulty).
             succeeded = curr_successes.float()
             nan = torch.full_like(succeeded, float("nan"))
@@ -193,10 +236,13 @@ class WipingSurfaceFollowEnv(CurvedSurfaceFollowEnv):
     # ------------------------------------------------------------------
     def _reset_idx(self, env_ids):
         super()._reset_idx(env_ids)
+        self._sample_waypoints(env_ids)                # fresh random waypoint locations on the tabletop
         self.wp_idx[env_ids] = 0
         self._wp_reached_now[env_ids] = False
         self._wp_final_now[env_ids] = False
         self._collided[env_ids] = False
+        self._cp_claimed[env_ids] = 0
+        self._icheck[env_ids] = False
         # Seed the acceleration finite-diff from the (near-zero) post-reset velocity so the first step
         # doesn't read a huge spurious acceleration.
         self._prev_linvel[env_ids] = self.fingertip_midpoint_linvel[env_ids].clone()

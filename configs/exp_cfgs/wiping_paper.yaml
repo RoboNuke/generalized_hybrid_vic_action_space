@@ -1,0 +1,39 @@
+# Wiping task matched to arXiv:2502.12599 as closely as our setup allows.
+#
+# The reward weights + MDP are already the WipingSurfaceFollowTask / EnvCfg DEFAULTS:
+#   20 Hz control (decimation 6) + H=200; mu=60 N target force; W_q^max = w_con+w_force = 29; W_T=1000
+#   (final-waypoint reward); randomized on-tabletop waypoints; sponge held object.
+# This config uses a pose controller (robosuite OSC_POSE-like) + contact sensor (surface tasks require it).
+#
+# COLLISION FAILURE MODE IS DISABLED for now (per request). To match the paper's collision, uncomment
+# the fragile + efficient-reset block below: the fragile-object wrapper == the paper's collision
+# (over-force >= break_force -> terminate), and efficient reset gives cheap per-env teleport resets (now
+# supported on curved/wiping via _efficient_reset_finalize). NOTE the paper never reports a numeric
+# collision force — its "collision" is likely a geometric sim event, not a force threshold — so break_force
+# is our own force-based proxy/ceiling (100 N here, above the 60 N target).
+#
+# NOT from the paper (it reports none of these): the RL ALGORITHM, policy/value NETWORK, and
+# hyperparameters are OURS (SAC + repo defaults). The paper only reports "800k training steps", set below.
+# The observation space is also OURS (23-D policy) per the task design, not the paper's 46-D vector.
+
+runner_cfg:
+  task: Isaac-FlatSurfaceFollow-Wiping-Direct-v0
+  agent_type: sac
+  num_envs: 128
+  num_agents: 1
+  total_timesteps: 800000            # the paper's reported training length
+
+  # Collision failure mode DISABLED for now. Uncomment to match the paper (over-force -> terminate) with
+  # cheap per-env teleport resets:
+  # fragile_peg_enabled: true
+  # efficient_reset_enabled: true
+  # break_force: 100.0               # N: collision threshold (magnitude mode), above the 60 N target
+  # require_contact_enabled: true    # OPTIONAL extra failure the paper does NOT have (break on losing
+                                     # contact after first touch); leave off to match the paper.
+
+controller_cfg:
+  control_type: pose                 # OSC_POSE-like end-effector pose control (paper: robosuite OSC_POSE)
+
+sensor_cfg:
+  contact:
+    enabled: true                    # required by the surface tasks; observe_in_contact off -> obs unchanged

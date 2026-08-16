@@ -40,6 +40,7 @@ EXPERIMENT_DIRECTORY=""
 RECORD=0
 RECORD_CONFIG=""
 WANDB_TAG_FLAGS=()   # collected --wandb_tag flags, forwarded verbatim to runner.py
+FIRST_WANDB_TAG=""   # first tag value, used to narrow the post-train per-step eval's run query
 OVERLAY_FLAGS=()     # collected --overlay flags, forwarded verbatim to runner.py (train + eval)
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -49,7 +50,9 @@ while [[ $# -gt 0 ]]; do
             EXPERIMENT_DIRECTORY="$2"; shift ;;
         --wandb_tag)
             [[ $# -ge 2 ]] || { echo "[launcher] --wandb_tag requires a value" >&2; exit 2; }
-            WANDB_TAG_FLAGS+=("--wandb_tag" "$2"); shift ;;
+            WANDB_TAG_FLAGS+=("--wandb_tag" "$2")
+            [[ -z "$FIRST_WANDB_TAG" ]] && FIRST_WANDB_TAG="$2"
+            shift ;;
         --overlay)
             # A deep-merged YAML overlay applied over --config by runner.py BEFORE validation.
             # Repeatable; forwarded to BOTH train and eval so the env matches (e.g. a sweep
@@ -79,7 +82,7 @@ RUNNER="$PROJECT_ROOT/learning/runner.py"
 # The family subdir is sac_cfg.experiment.directory, which --experiment_directory
 # overrides. Replicate the runner's legacy collapse: if family basename equals the
 # logdir basename, the family level is dropped (runs/runs/<exp> -> runs/<exp>).
-# EXP_FAMILY_DIR / EXP_DIR / EVAL_EXP_NAME are computed below — AFTER the config's
+# EXP_FAMILY_DIR / EXP_DIR / WANDB_PROJECT are computed below — AFTER the config's
 # sac_cfg.experiment.directory is read — so the worker's checkpoint/eval paths match
 # runner.py's output dir even when --experiment_directory was not passed.
 
@@ -123,7 +126,13 @@ if [[ -n "$FAMILY" && "$(basename "$FAMILY")" != "$(basename "$LOGDIR")" ]]; the
     EXP_FAMILY_DIR="$LOGDIR/$FAMILY"
 fi
 EXP_DIR="$EXP_FAMILY_DIR/$EXPERIMENT_NAME"
-EVAL_EXP_NAME="${EXPERIMENT_NAME}_eval"
+
+# wandb identity for the post-train PER-STEP eval (record.py from-wandb pipeline). Mirrors
+# make_wandb_run: project = wandb_kwargs.project if set, else the basename of the experiment
+# family dir; entity from wandb_kwargs.entity. The just-trained runs live in this project under
+# group = EXPERIMENT_NAME (runs "<EXPERIMENT_NAME>_agentN"), which is how record.py selects them.
+WANDB_ENTITY="$("$PYTHON" -c "import yaml; c=yaml.safe_load(open('$CONFIG_PATH')) or {}; e=(c.get('sac_cfg') or {}).get('experiment') or {}; wk=e.get('wandb_kwargs') or {}; print(wk.get('entity') or '')" 2>/dev/null || true)"
+WANDB_PROJECT="$("$PYTHON" -c "import os,yaml; c=yaml.safe_load(open('$CONFIG_PATH')) or {}; e=(c.get('sac_cfg') or {}).get('experiment') or {}; wk=e.get('wandb_kwargs') or {}; print(wk.get('project') or os.path.basename('$FAMILY'.rstrip('/')))" 2>/dev/null || true)"
 
 echo "[launcher] python=$(command -v "$PYTHON")  config=$CONFIG_PATH  experiment=$EXPERIMENT_NAME  num_agents=$NUM_AGENTS"
 
@@ -181,22 +190,39 @@ if [[ "$TRAIN_HARD_FAIL" -eq 0 ]]; then
         echo "[launcher]   agent $i: $latest_for_agent"
     done
 
-    # Pass the experiment dir as --checkpoint; the runner walks 0/, 1/, ... and resolves the
-    # latest ckpt per agent. A fresh experiment name keeps eval's tensorboard events out of the
-    # training agent dirs. `--mode eval` uses runner_cfg.eval_timesteps.
+    # PER-STEP eval: instead of the old aggregate-metrics eval (runner.py --mode eval into a
+    # separate "<name>_eval" wandb run), run the from-wandb per-step pipeline (learning/record.py
+    # --mode eval). For each just-trained agent run it downloads its ckpt_best.pt + runtime_config,
+    # rolls out the deterministic policy while capturing a full per-step/per-env trace, and uploads
+    # that trace as eval_<ts>.parquet to the ORIGINAL training run's Files — NO separate eval run is
+    # created. Runs are selected by this experiment's wandb group (EXPERIMENT_NAME), narrowed to
+    # "<EXPERIMENT_NAME>_agent*". Requires the training runs to be on wandb (ckpt_best.pt is
+    # uploaded live during training); if a run never hit a best it is skipped by record.py.
     if [[ "$RUN_EVAL" -eq 1 ]]; then
-        echo "[launcher] === EVAL (config=$CONFIG_PATH, checkpoint=$EXP_DIR) ==="
-        "$PYTHON" "$RUNNER" \
-            --config "$CONFIG_PATH" \
-            --experiment_name "$EVAL_EXP_NAME" \
-            --logdir "$LOGDIR" \
-            "${EXP_DIR_FLAG[@]}" \
-            "${WANDB_TAG_FLAGS[@]}" \
-            "${OVERLAY_FLAGS[@]}" \
-            --checkpoint "$EXP_DIR" \
+        echo "[launcher] === EVAL (per-step trace, group=$EXPERIMENT_NAME, project=$WANDB_PROJECT) ==="
+        REC_TAG_FLAG=()
+        [[ -n "$FIRST_WANDB_TAG" ]] && REC_TAG_FLAG=(--wandb_tag "$FIRST_WANDB_TAG")
+        REC_ENTITY_FLAG=()
+        [[ -n "$WANDB_ENTITY" ]] && REC_ENTITY_FLAG=(--wandb_entity "$WANDB_ENTITY")
+        # NON-FATAL: unlike the old in-process eval, this pipeline needs the just-trained runs to be
+        # ONLINE on wandb (it downloads ckpt_best.pt + runtime_config from them and uploads the trace
+        # back). A wandb hiccup / offline run must NOT fail an already-successful training — warn and
+        # continue (re-run record.py --mode eval to retry). `|| EVAL_RC=$?` neutralizes set -e here.
+        EVAL_RC=0
+        "$PYTHON" "$PROJECT_ROOT/learning/record.py" \
             --mode eval \
-            --headless
-        echo "[launcher] done. train=$EXP_DIR  eval=$EXP_FAMILY_DIR/$EVAL_EXP_NAME"
+            "${REC_ENTITY_FLAG[@]}" \
+            --wandb_project "$WANDB_PROJECT" \
+            --wandb_group "$EXPERIMENT_NAME" \
+            --wandb_run_filter "${EXPERIMENT_NAME}_agent" \
+            "${REC_TAG_FLAG[@]}" \
+            --headless || EVAL_RC=$?
+        if [[ "$EVAL_RC" -ne 0 ]]; then
+            echo "[launcher] WARNING: per-step eval failed (exit $EVAL_RC) — training is preserved. "\
+"Re-run: learning/record.py --mode eval --wandb_project $WANDB_PROJECT --wandb_group $EXPERIMENT_NAME" >&2
+        else
+            echo "[launcher] done. train=$EXP_DIR  eval=per-step traces uploaded to the training runs"
+        fi
     else
         echo "[launcher] === EVAL skipped (--no_eval) ==="
         echo "[launcher] done. train=$EXP_DIR"

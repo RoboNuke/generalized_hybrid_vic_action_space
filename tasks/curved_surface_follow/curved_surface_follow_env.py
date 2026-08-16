@@ -33,11 +33,13 @@ Metrics: on top of the inherited success rate, per-episode success is also publi
 four alpha quartiles ([0,0.25), [0.25,0.5), [0.5,0.75), [0.75,1.0]) so the success-vs-difficulty curve
 is directly readable.
 
-NOTE on efficient reset: alpha (and the per-env cap layout) is per-env CONSTANT, so the efficient-reset
-wrapper's single-donor teleport would place a donor's peg pose (solved for the donor's curvature) under
-a differently-curved env — a mismatch, exactly as with the bumpy task's per-env bumps. Do NOT enable
-``terminate_on_lag`` / ``terminate_on_success`` with this task; leave the default full-reset path
-(which re-places the caps relative to each freshly randomized plate every reset).
+NOTE on efficient reset: SUPPORTED. The held object is spawned at the NEAR EDGE, which sits at plate-top
+height (ridge h = 0) for EVERY curvature, so a donor's held-object pose teleports validly onto any
+alpha env. ``scene.reset_to`` teleports the robot + plate + held object but NOT the RigidObjectCollection
+caps, so ``_efficient_reset_finalize`` re-places each env's own (fixed-alpha) cap relative to the
+teleported plate (mirroring the bumpy task's bump re-placement). This lets ``terminate_on_lag`` /
+``terminate_on_success`` AND the fragile-object / over-force collision wrapper drive cheap per-env
+teleport resets on the curved + wiping tasks.
 """
 
 import torch
@@ -165,6 +167,17 @@ class CurvedSurfaceFollowEnv(FlatSurfaceFollowEnv):
     def _register_extra_assets(self):
         if getattr(self, "_caps", None) is not None:
             self.scene.rigid_object_collections["caps"] = self._caps
+
+    def _efficient_reset_finalize(self, env_ids):
+        """Called by EfficientResetWrapper at the end of a partial (teleport) reset. ``scene.reset_to``
+        teleports the robot + plate + held object but NOT the RigidObjectCollection caps (they aren't in
+        the scene-state dict), so re-place each env's ACTIVE cap relative to the just-teleported plate.
+        This is valid because the held object is spawned at the NEAR EDGE, which sits at plate-top height
+        (ridge h = 0) for EVERY curvature — so a donor's held-object pose is correct under any env's
+        alpha, and only the cap (the env keeps its own fixed alpha) needs re-placing. Enables efficient
+        reset (and thus the fragile-object / collision-termination wrapper) for the curved + wiping tasks."""
+        if getattr(self, "_caps", None) is not None:
+            self._place_caps(env_ids)
 
     # ------------------------------------------------------------------
     # Reset: place each env's active cap on its (re)placed plate; park the rest
