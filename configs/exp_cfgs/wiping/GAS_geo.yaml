@@ -23,7 +23,7 @@ runner_cfg:
   # --- Cylinder grasp tilt (rotation of the cylinder RELATIVE TO THE GRIPPER), folded into the
   #     rigid weld frame once at startup. pitch = the angle in this file's name. ---
   grasp_rot_mode: fixed                  # 'none' = aligned grip; 'fixed' = constant weld tilt below
-  rel_grasp_rot_init_deg: [0.0, 45.0, 0.0]   # [roll, pitch, yaw] deg; cylinder pitch in the gripper
+  rel_grasp_rot_init_deg: [0.0, 0.0, 0.0]   # [roll, pitch, yaw] deg; cylinder pitch in the gripper
   # --- Fragile peg (directional break). To enable: flip the three bools on, and set break_force to
   #     [shear_N, normal_N]. efficient_reset is REQUIRED by fragile; direction_break_force makes
   #     break_force a [shear, normal] pair; require_contact_enabled also breaks on loss of contact
