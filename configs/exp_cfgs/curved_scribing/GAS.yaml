@@ -8,7 +8,7 @@
 # every surface reward-term weight. The one per-file difference is the cylinder's fixed grasp
 # PITCH relative to the gripper (rel_grasp_rot_init_deg), set to the angle in the file name.
 runner_cfg:
-  task: Isaac-FlatSurfaceFollow-Direct-v0
+  task: Isaac-FlatSurfaceFollow-Curved-Direct-v0
   agent_type: sac
   num_envs: 512
   num_agents: 5
@@ -35,6 +35,11 @@ runner_cfg:
   require_contact_debounce_steps: 3   # loss-of-contact must persist this many CONSECUTIVE steps to count (tolerates a 1-step bounce)
   # Surface-task params on FlatSurfaceFollowTask via dotted env_cfg overrides.
   env_cfg_overrides:
+    # --- Curved surface: per-env curvature ridge (knobs this env adds; at defaults) ---
+    task.force_source: wrist_ft   # ridge-cap contact isn't seen by the plate contact sensor -> use the wrist F/T
+    task.n_curvature_levels: 11   # curvature levels, round-robin per env (alpha in {0, 0.1, ..., 1.0})
+    task.cap_curvature_radius: 0.20   # base ridge circle radius before the per-level alpha z-squash (must exceed plate_length/2)
+    task.use_spherical_tip: true   # rounded (capsule) contact tip on the held cylinder
     task.desired_speed_cm_s: 5.0
     task.force_desired_min: 10.0
     task.force_desired_max: 10.0
@@ -48,7 +53,6 @@ runner_cfg:
     # roll/pitch/yaw (deg), nominal = peg straight up/down.
     task.spawn_tip_pos_mean: [0.0, 0.0, 0.0005]   # spawn tip 0.5mm above the plate (closer, still not in contact)
     task.spawn_tip_pos_std: [0.0, 0.0, 0.0]
-    task.use_spherical_tip: true   # rounded (capsule) hemispherical contact tip (single tilt-independent contact point)
     task.keypoint_track_tol: 0.005   # on-track gate for keypoint scoring: 5mm (was 3mm)
     task.spawn_orn_mean_deg: [0.0, 0.0, 0.0]   # cylinder spawns straight (perpendicular to the surface); the reset AUTO-COMPENSATES for the grasp tilt (the eef/wrist absorbs it), so leave this zero
     task.spawn_orn_std_deg: [0.0, 0.0, 0.0]
@@ -127,7 +131,7 @@ sac_cfg:
   recorder:
     enabled: false
   experiment:
-    directory: flat_scribing
+    directory: curved_scribing
     experiment_name: "GAS"
     write_interval: 75
     checkpoint_interval: auto

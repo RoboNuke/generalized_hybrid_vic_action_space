@@ -1,6 +1,9 @@
-# GAS: identical to simp_low-F_high-P/VICES (force 10N, EMA 0.08, keypoint-servo
-# + fix_orientation + normal_offset -0.01, gains, all reward/env settings; baked at grasp pitch 45)
-# EXCEPT the stiffness-frame method: gain_mapping=rotated (policy-emitted stiffness-frame rotation).
+# GAS_geo: identical to simp_low-F_high-P/fixed_geo (gain_mapping=rotated, geometric interaction
+# frame; baked at grasp pitch 45) EXCEPT the stiffness-frame rotation is LEARNED (policy-emitted, as
+# in GAS) rather than fixed, and is supervised toward the GEOMETRIC interaction frame via a
+# chordal supervised-rotation loss (loss_cfg.supervised_rotation_enabled). I.e. GAS + geometric
+# interaction mode + supervised-rotation loss (the learned analog of fixed_geo). Mirrors the
+# fixed->learned delta in glued_surface/4_GAS_fixed_rot.yaml -> 8_GAS_geo.yaml.
 # Surface Path-Following experiment: simp_low-F_high-P (VICES / variable_diagonal).
 # Copied from glued_surface/2_VICES.yaml. Adds the knobs this sweep tunes, exposed at their
 # DEFAULT values (flip/edit as needed): directional fragile peg (+ require-contact + reset-in-
@@ -8,7 +11,7 @@
 # every surface reward-term weight. The one per-file difference is the cylinder's fixed grasp
 # PITCH relative to the gripper (rel_grasp_rot_init_deg), set to the angle in the file name.
 runner_cfg:
-  task: Isaac-FlatSurfaceFollow-Direct-v0
+  task: Isaac-FlatSurfaceFollow-Curved-Direct-v0
   agent_type: sac
   num_envs: 512
   num_agents: 5
@@ -35,6 +38,11 @@ runner_cfg:
   require_contact_debounce_steps: 3   # loss-of-contact must persist this many CONSECUTIVE steps to count (tolerates a 1-step bounce)
   # Surface-task params on FlatSurfaceFollowTask via dotted env_cfg overrides.
   env_cfg_overrides:
+    # --- Curved surface: per-env curvature ridge (knobs this env adds; at defaults) ---
+    task.force_source: wrist_ft   # ridge-cap contact isn't seen by the plate contact sensor -> use the wrist F/T
+    task.n_curvature_levels: 11   # curvature levels, round-robin per env (alpha in {0, 0.1, ..., 1.0})
+    task.cap_curvature_radius: 0.20   # base ridge circle radius before the per-level alpha z-squash (must exceed plate_length/2)
+    task.use_spherical_tip: true   # rounded (capsule) contact tip on the held cylinder
     task.desired_speed_cm_s: 5.0
     task.force_desired_min: 10.0
     task.force_desired_max: 10.0
@@ -42,13 +50,13 @@ runner_cfg:
     task.orientation_desired_angle_deg: 0.0
     task.success_orn_tol_deg: 180.0   # angle success check DISABLED (drag angle must not gate success in the tilted-grasp experiment)
     task.plate_tilt_range_deg: 0.0
+    task.interaction_frame_mode: geometric   # target frame for the supervised-rotation loss (below)
     # Held-cylinder spawn: TIP 1 mm above the starting keypoint (along the surface normal), peg straight
     # up/down (no rotation), no jitter. Each DOF has a mean + std; std == 0 => mean used exactly (no
     # sampling). pos = surface-local (x=along-path, y=cross-track, z=normal, m); orn = WORLD-frame
     # roll/pitch/yaw (deg), nominal = peg straight up/down.
     task.spawn_tip_pos_mean: [0.0, 0.0, 0.0005]   # spawn tip 0.5mm above the plate (closer, still not in contact)
     task.spawn_tip_pos_std: [0.0, 0.0, 0.0]
-    task.use_spherical_tip: true   # rounded (capsule) hemispherical contact tip (single tilt-independent contact point)
     task.keypoint_track_tol: 0.005   # on-track gate for keypoint scoring: 5mm (was 3mm)
     task.spawn_orn_mean_deg: [0.0, 0.0, 0.0]   # cylinder spawns straight (perpendicular to the surface); the reset AUTO-COMPENSATES for the grasp tilt (the eef/wrist absorbs it), so leave this zero
     task.spawn_orn_std_deg: [0.0, 0.0, 0.0]
@@ -101,6 +109,12 @@ loss_cfg:
   supervised_selection_enabled: false
   supervised_selection_policy_weight: 1.0
   supervised_selection_critic_weight: 0.0
+  # Supervise the policy's LEARNED rot6d stiffness frame toward the geometric interaction frame
+  # (R_eefᵀ·interaction_frame_world), the noise-free target a fixed-rot controller would use.
+  # This is what makes GAS_geo the "learned" analog of fixed_geo. Policy-only (critic weight 0).
+  supervised_rotation_enabled: true
+  supervised_rotation_policy_weight: 1.0   # tune on HPC (chordal loss in [0,8])
+  supervised_rotation_critic_weight: 0.0
 
 sac_cfg:
   tensorboard: false        # log ONLY to wandb (requires experiment.wandb: true)
@@ -127,8 +141,8 @@ sac_cfg:
   recorder:
     enabled: false
   experiment:
-    directory: flat_scribing
-    experiment_name: "GAS"
+    directory: curved_scribing
+    experiment_name: "GAS_geo"
     write_interval: 75
     checkpoint_interval: auto
     wandb: true
@@ -174,6 +188,9 @@ controller_cfg:
   # "rotated"           : diagonal K (6) + 6-D rotation vector (6) = 12 dims; R applied as
   #                       blkdiag(R,R) to the full 6x6.
   gain_mapping: rotated #"constant" #
+  # Rotation is LEARNED (policy-emitted rot6d frame), NOT fixed: fixed_rotation_from_interaction is
+  # intentionally OMITTED (cf. fixed_geo, which sets it true). The learned frame is instead pulled
+  # toward the geometric interaction frame by loss_cfg.supervised_rotation_enabled above.
   #fixed_rotation_rpy: [0.0, 30.0, 0.0]   # stiffness-frame R; aligned to the 30deg grasp tilt (used only when gain_mapping=rotated)
 
   # Toggle force control. When false: NO selection/force-target dims, K_f = zeros, and

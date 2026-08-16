@@ -49,6 +49,7 @@ runner_cfg:
     # roll/pitch/yaw (deg), nominal = peg straight up/down.
     task.spawn_tip_pos_mean: [0.0, 0.0, 0.0005]   # spawn tip 0.5mm above the plate (closer, still not in contact)
     task.spawn_tip_pos_std: [0.0, 0.0, 0.0]
+    task.use_spherical_tip: true   # rounded (capsule) hemispherical contact tip (single tilt-independent contact point)
     task.keypoint_track_tol: 0.005   # on-track gate for keypoint scoring: 5mm (was 3mm)
     task.spawn_orn_mean_deg: [0.0, 0.0, 0.0]   # cylinder spawns straight (perpendicular to the surface); the reset AUTO-COMPENSATES for the grasp tilt (the eef/wrist absorbs it), so leave this zero
     task.spawn_orn_std_deg: [0.0, 0.0, 0.0]

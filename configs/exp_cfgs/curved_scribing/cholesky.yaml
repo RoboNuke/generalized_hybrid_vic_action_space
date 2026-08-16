@@ -1,14 +1,20 @@
-# GAS: identical to simp_low-F_high-P/VICES (force 10N, EMA 0.08, keypoint-servo
-# + fix_orientation + normal_offset -0.01, gains, all reward/env settings; baked at grasp pitch 45)
-# EXCEPT the stiffness-frame method: gain_mapping=rotated (policy-emitted stiffness-frame rotation).
-# Surface Path-Following experiment: simp_low-F_high-P (VICES / variable_diagonal).
-# Copied from glued_surface/2_VICES.yaml. Adds the knobs this sweep tunes, exposed at their
+# cholesky: identical to simp_low-F_high-P/VICES EXCEPT the stiffness formulation:
+# gain_mapping=cholesky — a variable SPD stiffness K with within-block axis COUPLING. With
+# full_gain_matrix=false the policy sets the POSITION 3x3 block (3 Cholesky-diagonal + 3
+# off-diagonal dims = 6 dims, same policy action width as VICES); the rotation block is held at
+# the constants. Cross term chol_offdiag_rho=1.0 (full correlation range; the other configs use 0.9).
+# All other settings (gains bounds, keypoint-servo, force/EMA, reward weights, 5 agents, 12_500 steps)
+# match the other methods.
+# Surface Path-Following experiment: simp_low-F_high-P (cholesky / SPD-coupled).
+# Copied from VICES.yaml. Adds the knobs this sweep tunes, exposed at their
 # DEFAULT values (flip/edit as needed): directional fragile peg (+ require-contact + reset-in-
 # contact), the keypoint-servo action override (target offsets + fixed EEF orientation), and
-# every surface reward-term weight. The one per-file difference is the cylinder's fixed grasp
-# PITCH relative to the gripper (rel_grasp_rot_init_deg), set to the angle in the file name.
+# every surface reward-term weight. The cylinder's fixed grasp PITCH relative to the gripper
+# (rel_grasp_rot_init_deg) defaults to 0 (aligned); sweep it across jobs with
+# launchers/hpc/sweep_launcher.bash (--sweep_param runner_cfg.rel_grasp_rot_init_deg) rather
+# than maintaining one config per angle.
 runner_cfg:
-  task: Isaac-FlatSurfaceFollow-Direct-v0
+  task: Isaac-FlatSurfaceFollow-Curved-Direct-v0
   agent_type: sac
   num_envs: 512
   num_agents: 5
@@ -20,7 +26,7 @@ runner_cfg:
   # --- Cylinder grasp tilt (rotation of the cylinder RELATIVE TO THE GRIPPER), folded into the
   #     rigid weld frame once at startup. pitch = the angle in this file's name. ---
   grasp_rot_mode: fixed                  # 'none' = aligned grip; 'fixed' = constant weld tilt below
-  rel_grasp_rot_init_deg: [0.0, 45.0, 0.0]   # [roll, pitch, yaw] deg; cylinder pitch in the gripper
+  rel_grasp_rot_init_deg: [0.0, 0.0, 0.0]   # [roll, pitch, yaw] deg; cylinder pitch in the gripper
   # --- Fragile peg (directional break). To enable: flip the three bools on, and set break_force to
   #     [shear_N, normal_N]. efficient_reset is REQUIRED by fragile; direction_break_force makes
   #     break_force a [shear, normal] pair; require_contact_enabled also breaks on loss of contact
@@ -28,13 +34,18 @@ runner_cfg:
   fragile_peg_enabled: true
   efficient_reset_enabled: true
   direction_break_force: true
-  break_force: [1000, 20]                       # scalar N (magnitude) when direction_break_force=false;
+  break_force: [1000, 20]                      # scalar N (magnitude) when direction_break_force=false;
                                          # set to [shear_N, normal_N] when direction_break_force=true
   require_contact_enabled: true
   require_contact_grace_steps: 7   # no loss-of-contact break for the first N steps; earliest failure at step N+1 (peg spawns 1mm above, descends into contact)
   require_contact_debounce_steps: 3   # loss-of-contact must persist this many CONSECUTIVE steps to count (tolerates a 1-step bounce)
   # Surface-task params on FlatSurfaceFollowTask via dotted env_cfg overrides.
   env_cfg_overrides:
+    # --- Curved surface: per-env curvature ridge (knobs this env adds; at defaults) ---
+    task.force_source: wrist_ft   # ridge-cap contact isn't seen by the plate contact sensor -> use the wrist F/T
+    task.n_curvature_levels: 11   # curvature levels, round-robin per env (alpha in {0, 0.1, ..., 1.0})
+    task.cap_curvature_radius: 0.20   # base ridge circle radius before the per-level alpha z-squash (must exceed plate_length/2)
+    task.use_spherical_tip: true   # rounded (capsule) contact tip on the held cylinder
     task.desired_speed_cm_s: 5.0
     task.force_desired_min: 10.0
     task.force_desired_max: 10.0
@@ -48,7 +59,6 @@ runner_cfg:
     # roll/pitch/yaw (deg), nominal = peg straight up/down.
     task.spawn_tip_pos_mean: [0.0, 0.0, 0.0005]   # spawn tip 0.5mm above the plate (closer, still not in contact)
     task.spawn_tip_pos_std: [0.0, 0.0, 0.0]
-    task.use_spherical_tip: true   # rounded (capsule) hemispherical contact tip (single tilt-independent contact point)
     task.keypoint_track_tol: 0.005   # on-track gate for keypoint scoring: 5mm (was 3mm)
     task.spawn_orn_mean_deg: [0.0, 0.0, 0.0]   # cylinder spawns straight (perpendicular to the surface); the reset AUTO-COMPENSATES for the grasp tilt (the eef/wrist absorbs it), so leave this zero
     task.spawn_orn_std_deg: [0.0, 0.0, 0.0]
@@ -127,8 +137,8 @@ sac_cfg:
   recorder:
     enabled: false
   experiment:
-    directory: flat_scribing
-    experiment_name: "GAS"
+    directory: curved_scribing
+    experiment_name: "cholesky"
     write_interval: 75
     checkpoint_interval: auto
     wandb: true
@@ -173,7 +183,7 @@ controller_cfg:
   #                       (per block: 3 L-diagonal + 3 L-off-diagonal). D = zeros for now.
   # "rotated"           : diagonal K (6) + 6-D rotation vector (6) = 12 dims; R applied as
   #                       blkdiag(R,R) to the full 6x6.
-  gain_mapping: rotated #"constant" #
+  gain_mapping: cholesky
   #fixed_rotation_rpy: [0.0, 30.0, 0.0]   # stiffness-frame R; aligned to the 30deg grasp tilt (used only when gain_mapping=rotated)
 
   # Toggle force control. When false: NO selection/force-target dims, K_f = zeros, and
@@ -186,7 +196,7 @@ controller_cfg:
   # A lower bound < ~1e-6 disables that channel (k=0) instead of producing NaN, so use > 0 for
   # meaningful variable impedance. Translation and rotation differ ~10x, hence the split values.
   gain_min: [300, 300, 100, 80, 80, 80] # pose stiffness K (position x3, rotation x3)
-  gain_max: [4000, 4000, 2000, 80, 80, 80]  
+  gain_max: [4000, 4000, 2000, 80, 80, 80] 
 
   # Policy commands the pose stiffness directly, so disable the base Forge env's per-reset
   # multiplicative gain randomization (default [0.41]x6) to avoid randomizing on top of the
@@ -200,7 +210,7 @@ controller_cfg:
   # Cholesky-only: off-diagonal L entry = chol_offdiag_rho * sqrt(lo*hi) * clamp(a,-1,1).
   # 0.0 => diagonal-only (equivalent to variable_diagonal but with 12 dims). Increase to
   # allow within-block (translation- or rotation-) axis coupling.
-  chol_offdiag_rho: 0.9
+  chol_offdiag_rho: 1.0    # cross term = 1.0 (full correlation range; other configs use 0.9)
 
   # cholesky/rotated only: learn the full 6-DOF gain matrix (position + orientation)
   # instead of the translational 3x3 block alone. Changes action dim => re-tune
