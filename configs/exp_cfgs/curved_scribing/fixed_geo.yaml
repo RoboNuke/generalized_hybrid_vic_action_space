@@ -12,7 +12,7 @@ runner_cfg:
   agent_type: sac
   num_envs: 512
   num_agents: 5
-  total_timesteps: 12_500
+  total_timesteps: 25_000
   eval_timesteps: 75
   memory_size: 1_000_000
   seed: -1
@@ -121,7 +121,7 @@ sac_cfg:
   learning_starts: 300
   learn_entropy: true
   initial_entropy_value: 0.05
-  target_entropy: -13    # fixed low entropy target (well below -action_dim/2) to curb over-exploration
+  target_entropy: -1.5    # -action_dim/2 (dim=3)
   grad_norm_clip: 1.0
   mixed_precision: false
   observation_preprocessor: RunningStandardScaler
@@ -149,7 +149,7 @@ model_cfg:
     last_layer_scale: 0.1
     clip_log_std: true
     min_log_std: -20.0
-    max_log_std: -2.5
+    max_log_std: -1.5    # sigma_max~0.22; loosened from -2.5 to preserve late-training exploration
     reduction: sum
     use_state_dependent_std: false
     bernoulli_action_dims: null
