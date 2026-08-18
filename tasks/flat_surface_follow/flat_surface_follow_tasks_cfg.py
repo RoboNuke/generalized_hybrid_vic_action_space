@@ -214,9 +214,11 @@ class FlatSurfaceFollowTask(ForgeTask):
     # In BOTH modes x points from the contact point to the CURRENT goal keypoint (setpoint_pos),
     # projected ⊥ the mode's z-axis; y = z × x (cross-track).
     # "geometric": z = surface normal — pure surface frame; x = goal-keypoint dir projected ⊥ normal.
-    # "dynamic":   z = direction of the measured contact REACTION (force_sensor_world_smooth, clean/
-    #              EMA-smoothed, peg-gravity off), so the frame tilts off the normal by the friction
-    #              angle; x = goal-keypoint dir with its component parallel to z (reaction) subtracted.
+    # "dynamic":   z = direction of the measured contact REACTION, so the frame tilts off the normal by
+    #              the friction angle; x = goal-keypoint dir with its component parallel to z (reaction)
+    #              subtracted. The reaction vector follows force_source: "oracle" (default) = the true
+    #              peg<->plate contact force (contact_force_world_ema); "wrist_ft" = the FR3 wrist F/T
+    #              reaction (force_sensor_world_smooth).
     # OFF-CONTACT (env.in_contact_any False — the single contact source of truth) BOTH modes collapse
     # to the control/EEF frame (identity stiffness rotation): no surface, so stiffness is control-frame.
     interaction_frame_mode: str = "geometric"

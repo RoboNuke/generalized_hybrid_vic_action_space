@@ -351,10 +351,12 @@ class FlatSurfaceFollowEnv(ForgeEnv):
           * "geometric" (default): z = surface normal — the pure surface frame; x = the goal-keypoint
             direction projected ⊥ normal (in-plane), y = z × x (cross-track). Recomputed each step at the
             contact point, so it's the LOCAL frame for curved surfaces too.
-          * "dynamic": z = direction of the measured contact reaction (force_sensor_world_smooth, clean
-            & EMA-smoothed; peg gravity is disabled so it's contact-only), which tilts off the normal
-            by the friction angle. x = the goal-keypoint direction with its component parallel to the
-            reaction (z) subtracted, y = z × x (cross-track).
+          * "dynamic": z = direction of the measured contact reaction, which tilts off the normal by
+            the friction angle. The reaction VECTOR follows the reward's force_source (cfg): "oracle"
+            (default) uses the peg<->plate contact force (contact_force_world_ema — the true contact
+            wrench, no wrist inertia/motion contamination); "wrist_ft" uses the FR3 wrist F/T reaction
+            (force_sensor_world_smooth). x = the goal-keypoint direction with its component parallel to
+            the reaction (z) subtracted, y = z × x (cross-track).
 
         OFF-CONTACT, BOTH modes return R_eef (world<-eef), so the controller's R = R_eefᵀ·this =
         IDENTITY — with no surface to interact with, the stiffness is applied in the control (EEF)
@@ -367,7 +369,21 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         goal_pos = torch.where(at_goal[:, None], self.next_setpoint_pos, self.setpoint_pos)  # (E,3)
         to_goal = goal_pos - self.contact_point                                      # (E,3) toward goal keypoint
         if getattr(self.cfg_task, "interaction_frame_mode", "geometric") == "dynamic":
-            f = self.force_sensor_world_smooth[:, 0:3]                                # (E,3) world reaction
+            # Reaction vector follows the reward's force_source: "oracle" = the true peg<->plate contact
+            # force (contact_force_world_ema, no wrist inertia/motion contamination); "wrist_ft" = the FR3
+            # wrist F/T reaction (force_sensor_world_smooth). The oracle path HARD-REQUIRES the
+            # ContactSensorWrapper (no silent fallback to the wrist FT), same as the force reward.
+            if str(getattr(self.cfg_task, "force_source", "oracle")) == "oracle":
+                f = getattr(self, "contact_force_world_ema", None)
+                if not torch.is_tensor(f):
+                    raise RuntimeError(
+                        "interaction_frame_mode='dynamic' with force_source='oracle' requires the "
+                        "ContactSensorWrapper (env.contact_force_world_ema is missing). Attach it "
+                        "(sensor_cfg.contact.enabled=True). Refusing to silently fall back to the wrist F/T."
+                    )
+                f = f[:, 0:3]                                                         # (E,3) world contact reaction
+            else:
+                f = self.force_sensor_world_smooth[:, 0:3]                            # (E,3) world wrist reaction
             z = f / torch.linalg.norm(f, dim=-1, keepdim=True).clamp_min(1e-6)        # z along the reaction
         else:
             z = self.surface_normal                                                  # z along the surface normal
