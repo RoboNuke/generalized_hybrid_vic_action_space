@@ -26,6 +26,7 @@ METHOD_COLORS = {
     "GAS":   "#5193C9",
     "GAS_geo":       "#3cc53c",
     "VICES":     "#df7486",
+    "cholesky":     "#b436c5",
     #"fixed_geo": "#2a78d6",   # blue
     #"GAS_geo":   "#eb6834",   # orange
     #"GAS":       "#1baf7a",   # teal
@@ -36,6 +37,7 @@ METHOD_NAMES = {
     "GAS_geo":   "RA-GAS",
     "GAS":       "RA-Free",
     "VICES":     "VICES",
+    "cholesky":  "Chol"
 }
 
 # Grasp-angle palette (ordinal: one blue hue, light -> dark with the angle).
@@ -78,8 +80,8 @@ ERROR_CAPSIZE = 5       # bar-chart error-bar caps
 # Used by every single-axes figure (read at draw time). Multi-panel / combo layouts scale each
 # panel to (DEFAULT_FIG_WIDTH / ncols, DEFAULT_FIG_HEIGHT / ncols), so the whole figure stays
 # DEFAULT_FIG_WIDTH wide. Figures that pass an explicit figsize keep their own size.
-DEFAULT_FIG_WIDTH = 3.5
-DEFAULT_FIG_HEIGHT = 2.2     # 3.5 * 4.8/8 -- keeps the previous 8x4.8 aspect ratio
+DEFAULT_FIG_WIDTH = 3.5 #8 #3.5
+DEFAULT_FIG_HEIGHT = 2.2 #4.8 #2.2     # 3.5 * 4.8/8 -- keeps the previous 8x4.8 aspect ratio
 
 # =========================================================================== #
 # Bar value labels (the mean printed on each bar, near its lower error cap)

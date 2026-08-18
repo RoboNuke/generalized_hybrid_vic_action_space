@@ -353,8 +353,17 @@ def _run_from_wandb(args) -> None:
             r.file("runtime_config.yaml").download(root=agent_dir, replace=True)
             os.replace(os.path.join(agent_dir, "runtime_config.yaml"), os.path.join(agent_dir, "config.yaml"))
         else:
-            print(f"[{mode}]   WARNING: {label} has no runtime_config.yaml; the run's exact "
-                  "env can't be reconstructed.", flush=True)
+            # HARD FAIL: without the run's own runtime_config we cannot reconstruct its exact
+            # env. Refuse to proceed — running the eval without --config makes runner.py fall
+            # back to configs/exp_cfgs/default.yaml (a WRONG env, or a crash if absent), which
+            # would silently produce a trace for the wrong environment. Mark failed and skip.
+            print(f"[{mode}] FAILED {label}: no runtime_config.yaml on wandb — refusing to "
+                  "eval without the run's exact env (never fall back to a default/other config). "
+                  "Retrain the run or re-upload its runtime_config.yaml.", flush=True)
+            failed.append(label)
+            if not args.keep_local:
+                shutil.rmtree(agent_dir, ignore_errors=True)
+            continue
 
         if args.download_only:
             ok.append(label); continue
