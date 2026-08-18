@@ -51,7 +51,3 @@ class BumpySurfaceFollowTask(FlatSurfaceFollowTask):
     bump_edge_margin: float = 0.0
 
     # |FT force| (N) above which the bumpy env counts the peg as in contact. The plate-filtered
-    # ContactSensor doesn't see peg<->bump contact, so the bumpy env OR-s in this force-based signal
-    # (the FT joint-force reaction IS source-agnostic and captures bump contact). Used by both the
-    # runtime in_contact_any and the reset press-to-contact latch.
-    bump_contact_force_threshold: float = 0.1

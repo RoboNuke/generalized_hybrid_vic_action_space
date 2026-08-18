@@ -260,6 +260,7 @@ class FragileObjectWrapper(gym.Wrapper):
         z = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         violations = z
         normal_violation = shear_violation = None
+        force_violations = z
         contact_violations = z
         if self._fragile:
             force_violations, normal_violation, shear_violation = self._compute_violations()
@@ -268,6 +269,20 @@ class FragileObjectWrapper(gym.Wrapper):
             contact_violations = self._contact_loss_violations()
             violations = torch.logical_or(violations, contact_violations)
         self._last_violations = violations
+
+        # Augment the env's single per-env termination CAUSE (base _get_dones stamped success/lag/
+        # timeout/traversed; NaN for envs it didn't finish). Fill only still-NaN envs so a base cause
+        # (e.g. a same-step success) wins; peg_break is written before contact_loss so a break wins
+        # over a simultaneous loss-of-contact. See learning.termination_cause.
+        from learning import termination_cause as _tc
+        cause = getattr(self.unwrapped, "_termination_cause", None)
+        if not torch.is_tensor(cause):
+            cause = torch.full((self.num_envs,), float("nan"), dtype=torch.float32, device=self.device)
+        still = torch.isnan(cause)
+        cause = torch.where(force_violations & still, cause.new_full((), float(_tc.PEG_BREAK)), cause)
+        still = torch.isnan(cause)
+        cause = torch.where(contact_violations & still, cause.new_full((), float(_tc.CONTACT_LOSS)), cause)
+        self.unwrapped._termination_cause = cause
 
         # PER-EPISODE metrics (NOT per-step): each entry is averaged by block_agent over the episodes
         # that FINISH this step (mask = env.reset_buf, NaN-skipped) via per_env_episode_stat, merged in

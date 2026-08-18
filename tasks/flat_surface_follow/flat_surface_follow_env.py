@@ -664,16 +664,24 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         else:
             self.measured_normal_force = (self.force_sensor_world_smooth[:, 0:3] * normal).sum(-1)
 
-        # Orientation: angle between the held cylinder's long axis and the surface NORMAL, in RADIANS
-        # (arccos(|axis . normal|); 0 = axis parallel to the normal = tip-down/perpendicular, pi/2 =
-        # axis in the plane = flat). The cylinder is axisymmetric (|.| folds the axis to the acute
-        # angle), so only this axis-vs-normal angle is constrained (free to spin about the normal).
-        # REALIZED from the physics held orientation. orn_error = desired - actual (signed, RADIANS)
-        # — the value the orientation reward squashes (and |orn_error| gates success). The config gives
-        # the desired angle in DEGREES (human-readable); it is converted to radians here.
+        # Orientation: angle between the held cylinder's long axis and the REFERENCE axis, in RADIANS
+        # (arccos(|axis . ref|); 0 = axis parallel to ref = "straight", pi/2 = axis perpendicular to
+        # ref). The cylinder is axisymmetric (|.| folds the axis to the acute angle), so only this
+        # axis-vs-ref angle is constrained (free to spin about ref). REALIZED from the physics held
+        # orientation. orn_error = desired - actual (signed, RADIANS) — the value the orientation reward
+        # squashes (and |orn_error| gates success). The config gives the desired angle in DEGREES
+        # (human-readable); it is converted to radians here.
+        # angle_target (task cfg) selects the reference: "normal" = the local surface normal (perpendicular
+        # to the surface); "vertical" = the WORLD z-axis (globally upright, independent of surface tilt).
+        # self.surface_normal is the flat world-up [0,0,1] here but tracks the surface on tilted/curved
+        # variants; the "vertical" branch pins the reference to world-up regardless.
+        if str(getattr(self.cfg_task, "angle_target", "normal")) == "vertical":
+            ref_axis = torch.tensor([0.0, 0.0, 1.0], device=self.device).expand(self.num_envs, 3)
+        else:
+            ref_axis = normal
         self.angle_from_normal = torch.arccos(
-            (self.cyl_axis * normal).sum(-1).abs().clamp(0.0, 1.0)
-        )                                                                    # rad, 0 = tip-down
+            (self.cyl_axis * ref_axis).sum(-1).abs().clamp(0.0, 1.0)
+        )                                                                    # rad, 0 = aligned with ref
         self.orn_error = float(np.deg2rad(self.cfg_task.orientation_desired_angle_deg)) - self.angle_from_normal
 
         # --- Held-object END frame (the un-held / contact end) ---
@@ -874,6 +882,15 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "keypoints_passed": self.keypoints_passed.detach().float(),
             "keypoints_total": self.keypoints_total.detach().float(),
         }
+        # Curved-surface subclasses carry a fixed per-env curvature scalar (env.alpha in [0, 1],
+        # 0 = flat). Publish it so an eval trace can break metrics down by curvature difficulty.
+        # No-op on the flat base env (no `alpha` attribute), so nothing extra is logged there.
+        if hasattr(self, "alpha"):
+            self.extras["per_env_trace"]["curvature_alpha"] = self.alpha.detach().float()
+        # Per-env termination CAUSE for THIS step (set in _get_dones; NaN except on the step an env
+        # finishes). The single source of truth for break / failure-mode plots downstream.
+        if hasattr(self, "_termination_cause"):
+            self.extras["per_env_trace"]["termination_cause"] = self._termination_cause.detach().float()
 
         obs_tensors = factory_utils.collapse_obs_dict(obs_dict, self.cfg.obs_order + ["prev_actions"])
         state_tensors = factory_utils.collapse_obs_dict(state_dict, self.cfg.state_order + ["prev_actions"])
@@ -1000,6 +1017,12 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         kp_curr = torch.floor(self.progress / self.keypoint_spacing).clamp_min(0).long().minimum(Ktot)
         on_track = self.cross_track.abs() < float(cfg.keypoint_track_tol)
         gate = self.in_contact_any & on_track                                # in contact AND on-track this step
+        # OPTIONAL orientation gate: also require the peg within orientation_gate_keypoint_deg of the
+        # active angle_target reference (angle_from_normal already measured against it). Off by default
+        # (legacy contact + on-track gate); on => uncredit keypoints dragged while the peg is tilted.
+        if bool(getattr(cfg, "orientation_gate_keypoint_enabled", False)):
+            oriented_kp = self.angle_from_normal < float(np.deg2rad(cfg.orientation_gate_keypoint_deg))
+            gate = gate & oriented_kp
         # Newly achieved = boundaries beyond BOTH last step's index and the achieved frontier, but only
         # when gated (so uncredited air/off-track crossings between kp_prev and the frontier are lost).
         newly_achieved = (kp_curr - torch.maximum(kp_prev, self.kp_ach_frontier)).clamp_min(0)
@@ -1286,13 +1309,26 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         truncated = time_out | passed_all
         terminated = torch.zeros_like(time_out)
         self._term_lag = torch.zeros_like(time_out)   # this step's lag-termination flag (for the metric)
+        succ_term = torch.zeros_like(time_out)
         if bool(cfg.terminate_on_lag):
             lag = self.s_ref - self.progress                          # (E,) m, positive = behind
             lag_max = float(cfg.pace_lag_frac) * self.path_length     # (E,) m
             self._term_lag = (lag > lag_max) & torch.isfinite(self.t_contact)
             terminated = terminated | self._term_lag
         if bool(cfg.terminate_on_success):
-            terminated = terminated | (self._get_curr_successes() & self.in_contact_any)
+            succ_term = self._get_curr_successes() & self.in_contact_any
+            terminated = terminated | succ_term
+        # Single per-env termination CAUSE (learning.termination_cause codes; NaN = didn't finish this
+        # step), stashed for the eval trace to publish. Written low -> high priority so a terminated
+        # cause (lag/success) overrides a same-step truncation (timeout/traversed); the fragile wrapper
+        # augments this with peg_break / contact_loss for the envs it terminates.
+        from learning import termination_cause as _tc
+        cause = torch.full_like(time_out, float("nan"), dtype=torch.float32)
+        cause = torch.where(time_out, cause.new_full((), float(_tc.TIMEOUT)), cause)
+        cause = torch.where(passed_all, cause.new_full((), float(_tc.TRAVERSED)), cause)
+        cause = torch.where(self._term_lag, cause.new_full((), float(_tc.LAG)), cause)
+        cause = torch.where(succ_term, cause.new_full((), float(_tc.SUCCESS)), cause)
+        self._termination_cause = cause
         return terminated, truncated
 
     # ------------------------------------------------------------------

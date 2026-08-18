@@ -41,8 +41,3 @@ class CurvedSurfaceFollowTask(FlatSurfaceFollowTask):
     # surface normal, keeping the footprint fixed and the peak height linear in alpha.)
     cap_curvature_radius: float = 0.20
 
-    # |FT force| (N) above which peg<->ridge contact counts as in-contact. The plate-filtered contact
-    # sensor does not see the separate ridge prim, so the curved env OR-s in this force-based signal
-    # (the FT joint-force reaction IS source-agnostic). Used by both the runtime in_contact_any and the
-    # reset press-to-contact latch. Mirrors the bumpy task's bump_contact_force_threshold.
-    cap_contact_force_threshold: float = 0.1

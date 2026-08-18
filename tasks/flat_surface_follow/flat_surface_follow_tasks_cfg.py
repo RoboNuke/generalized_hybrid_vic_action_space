@@ -203,6 +203,15 @@ class FlatSurfaceFollowTask(ForgeTask):
     # Max lateral (cross-track) error for a keypoint crossing to count as achieved. Keeps "achieved"
     # meaningful — the tool must be near the path, not dragging far off to the side.
     keypoint_track_tol: float = 0.003
+    # OPTIONAL orientation gate on keypoint achievement. When True, a keypoint crossing counts as
+    # achieved only if the tool is ALSO within orientation_gate_keypoint_deg of "straight" (the active
+    # angle_target reference — surface normal or world vertical), i.e. the gate becomes
+    # in_contact AND on-track AND (angle_from_normal < thresh). When False (default), the gate is the
+    # legacy contact + on-track only (no orientation requirement). Pushes the policy to keep the peg
+    # upright while dragging (pairs with the orientation reward), e.g. once plate pitch/roll is
+    # randomized and "on the surface" no longer implies "upright".
+    orientation_gate_keypoint_enabled: bool = False
+    orientation_gate_keypoint_deg: float = 10.0   # max angle off the reference for a keypoint to count (deg)
 
     # Fixed reward paid ONCE per keypoint, the first time it is cleanly ACHIEVED (crossed in contact,
     # one at a time, advancing the achieved frontier). A dense forward-progress signal that — unlike
@@ -272,6 +281,15 @@ class FlatSurfaceFollowTask(ForgeTask):
     # height (m) above the contact point (tip_surface_dist < gate; contact/penetration count). Keeps
     # "hold the commanded angle on final approach" but prevents farming it while hovering high.
     orientation_gate_dist: float = 0.1           # 10 cm - user changed to mostly disable this
+    # Reference axis the orientation angle is measured AGAINST (drives both the orientation reward's
+    # angle_from_normal AND the optional keypoint orientation gate above):
+    #   * "normal"   (default): the local SURFACE NORMAL — keep the peg perpendicular to the surface.
+    #                On a flat, level plate this coincides with world vertical; on a tilted/curved
+    #                surface it tracks the surface, so the peg leans with the surface.
+    #   * "vertical": the WORLD Z-AXIS — keep the peg globally straight up/down regardless of surface
+    #                pitch/roll. Use this once the plate spawn pitch/roll is randomized so "on the
+    #                surface" no longer implies "upright" and you want to reward true world-vertical.
+    angle_target: str = "normal"
 
     # Contact bonus: per-step +1 while the held object is in contact (0 otherwise), scaled by weight.
     # DISABLED (0.0): the CONTACT pull now comes from the contact-gated force reward (wide a=0.25),

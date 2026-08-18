@@ -1,5 +1,12 @@
-# Surface Path-Following experiment: simp_low-F_high-P (VICES / variable_diagonal).
-# Copied from glued_surface/2_VICES.yaml. Adds the knobs this sweep tunes, exposed at their
+# cholesky: identical to simp_low-F_high-P/VICES EXCEPT the stiffness formulation:
+# gain_mapping=cholesky — a variable SPD stiffness K with within-block axis COUPLING. With
+# full_gain_matrix=false the policy sets the POSITION 3x3 block (3 Cholesky-diagonal + 3
+# off-diagonal dims = 6 dims, same policy action width as VICES); the rotation block is held at
+# the constants. Cross term chol_offdiag_rho=1.0 (full correlation range; the other configs use 0.9).
+# All other settings (gains bounds, keypoint-servo, force/EMA, reward weights, 5 agents, 12_500 steps)
+# match the other methods.
+# Surface Path-Following experiment: simp_low-F_high-P (cholesky / SPD-coupled).
+# Copied from VICES.yaml. Adds the knobs this sweep tunes, exposed at their
 # DEFAULT values (flip/edit as needed): directional fragile peg (+ require-contact + reset-in-
 # contact), the keypoint-servo action override (target offsets + fixed EEF orientation), and
 # every surface reward-term weight. The cylinder's fixed grasp PITCH relative to the gripper
@@ -40,7 +47,7 @@ runner_cfg:
     ft_smoothing_factor: 0.08                    # force EMA (Forge default 0.25); heavier smoothing for the noisier drag-contact signal (~0.10s time constant at 120Hz), pairs with the 10N target
     task.orientation_desired_angle_deg: 0.0
     task.success_orn_tol_deg: 180.0   # angle success check DISABLED (drag angle must not gate success in the tilted-grasp experiment)
-    task.plate_tilt_range_deg: 30.0   # plate roll & pitch each ~ U(-30, +30) deg (uniform half-range, NOT a std dev)
+    task.plate_tilt_range_deg: 0.0
     # Held-cylinder spawn: TIP 1 mm above the starting keypoint (along the surface normal), peg straight
     # up/down (no rotation), no jitter. Each DOF has a mean + std; std == 0 => mean used exactly (no
     # sampling). pos = surface-local (x=along-path, y=cross-track, z=normal, m); orn = WORLD-frame
@@ -67,7 +74,10 @@ runner_cfg:
     # --- Reward-term weights (all exposed for tuning). keypoint_reward_weight and
     #     vel_based_pace_weight are set above; the rest are at their task defaults. ---
     task.force_weight: 1.0
-    task.orientation_weight: 0.0
+    task.orientation_weight: 1.0   # = force reward (force_weight); reward keeping the peg upright
+    task.angle_target: vertical   # measure the peg tilt vs WORLD vertical (not the surface normal)
+    task.orientation_gate_keypoint_enabled: true   # a keypoint counts as achieved only if the peg is near-upright
+    task.orientation_gate_keypoint_deg: 10.0   # within 10 deg of vertical
     task.contact_weight: 0.0
     task.straightness_weight: 1.0
     task.pace_weight: 1.0
@@ -115,7 +125,7 @@ sac_cfg:
   learning_starts: 300
   learn_entropy: true
   initial_entropy_value: 0.05
-  target_entropy: -3.0    # -action_dim/2 (dim=6)
+  target_entropy: -10.5    # -action_dim/2 (dim=21; full_gain_matrix cholesky: 6 diag + 15 off-diag, servo removes the 6 pose dims)
   grad_norm_clip: 1.0
   mixed_precision: false
   observation_preprocessor: RunningStandardScaler
@@ -126,8 +136,8 @@ sac_cfg:
   recorder:
     enabled: false
   experiment:
-    directory: flat_scribing
-    experiment_name: "VICES"
+    directory: flat_scribing_fullgain_upright
+    experiment_name: "cholesky"
     write_interval: 75
     checkpoint_interval: auto
     wandb: true
@@ -172,7 +182,7 @@ controller_cfg:
   #                       (per block: 3 L-diagonal + 3 L-off-diagonal). D = zeros for now.
   # "rotated"           : diagonal K (6) + 6-D rotation vector (6) = 12 dims; R applied as
   #                       blkdiag(R,R) to the full 6x6.
-  gain_mapping: variable_diagonal #"constant" #
+  gain_mapping: cholesky
   #fixed_rotation_rpy: [0.0, 30.0, 0.0]   # stiffness-frame R; aligned to the 30deg grasp tilt (used only when gain_mapping=rotated)
 
   # Toggle force control. When false: NO selection/force-target dims, K_f = zeros, and
@@ -184,8 +194,8 @@ controller_cfg:
   # ---- shared per-axis bounds [x,y,z,Rx,Ry,Rz], geometric scaling k = lo*(hi/lo)^((a+1)/2) ----
   # A lower bound < ~1e-6 disables that channel (k=0) instead of producing NaN, so use > 0 for
   # meaningful variable impedance. Translation and rotation differ ~10x, hence the split values.
-  gain_min: [300, 300, 100, 80, 80, 80] # pose stiffness K (position x3, rotation x3)
-  gain_max: [4000, 4000, 2000, 80, 80, 80] 
+  gain_min: [300, 300, 100, 20, 20, 20] # pose stiffness K (position x3, rotation x3)
+  gain_max: [4000, 4000, 2000, 150, 150, 150] 
 
   # Policy commands the pose stiffness directly, so disable the base Forge env's per-reset
   # multiplicative gain randomization (default [0.41]x6) to avoid randomizing on top of the
@@ -199,12 +209,12 @@ controller_cfg:
   # Cholesky-only: off-diagonal L entry = chol_offdiag_rho * sqrt(lo*hi) * clamp(a,-1,1).
   # 0.0 => diagonal-only (equivalent to variable_diagonal but with 12 dims). Increase to
   # allow within-block (translation- or rotation-) axis coupling.
-  chol_offdiag_rho: 0.9
+  chol_offdiag_rho: 1.0    # cross term = 1.0 (full correlation range; other configs use 0.9)
 
   # cholesky/rotated only: learn the full 6-DOF gain matrix (position + orientation)
   # instead of the translational 3x3 block alone. Changes action dim => re-tune
   # target_entropy if enabled.
-  full_gain_matrix: false
+  full_gain_matrix: true
 
   # Full 3-DOF orientation control: command roll/pitch/yaw as a delta-axis-angle rotation
   # scaled by rot_action_bounds, instead of the default yaw-only map (roll/pitch forced to 0).

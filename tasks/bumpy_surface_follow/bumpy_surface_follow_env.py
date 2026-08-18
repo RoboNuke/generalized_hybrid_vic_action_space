@@ -11,9 +11,11 @@ This subclass therefore overrides only:
                                                            called both on the initial reset and on
                                                            every IK-retry board re-sample, so the bumps
                                                            always follow the plate.
-  * ``_compute_in_contact_any`` / ``_reset_contact_mask`` — OR-in a force-based contact signal so
-                                                           peg<->bump contact (which the plate-filtered
-                                                           ContactSensor doesn't see) still registers.
+
+Contact needs NO override: the bump spheres are ``activate_contact_sensors=True`` and are added to the
+oracle contact sensor's filter (``_register_extra_assets`` sets ``_extra_contact_filter_globs``), so
+``env.in_contact`` and the oracle contact force already include peg<->bump contact — same machinery and
+same source as the flat plate.
 
 The whole surface-frame / reward / obs / keypoint machinery is inherited untouched (it reads the flat
 plate), so the policy sees a flat surface and feels the bumps only through the physics.
@@ -91,6 +93,7 @@ class BumpySurfaceFollowEnv(FlatSurfaceFollowEnv):
                 prim_path=f"/World/envs/env_.*/Bump_{i}",
                 spawn=sim_utils.SphereCfg(
                     radius=R,
+                    activate_contact_sensors=True,                           # oracle contact sensor sees peg<->bump contact (filtered in)
                     # Kinematic (never moves under the peg's push), gravity off — mirrors the plate.
                     rigid_props=sim_utils.RigidBodyPropertiesCfg(
                         kinematic_enabled=True,
@@ -115,6 +118,15 @@ class BumpySurfaceFollowEnv(FlatSurfaceFollowEnv):
     def _register_extra_assets(self):
         if getattr(self, "_bumps", None) is not None:
             self.scene.rigid_object_collections["bumps"] = self._bumps
+            # The peg contacts the bump spheres (separate rigid bodies), not the plate — so add them to
+            # the oracle contact sensor's filter. The ContactSensorWrapper sums peg<->{plate,bump} force,
+            # so force + in_contact stay on the SAME oracle source as the flat task (no FT-force OR-in).
+            # ONE glob per bump index (each matches exactly num_envs bodies — PhysX's contact view
+            # requires per-env filters, so a single "Bump_*" wildcard (num_envs*num_bumps) is rejected).
+            # The peg touches at most a couple of bumps; the untouched ones read ~0 in the summed force.
+            self._extra_contact_filter_globs = [
+                f"/World/envs/env_*/Bump_{i}" for i in range(self._num_bumps)
+            ]
 
     # ------------------------------------------------------------------
     # Reset: place the bumps relative to the (re)placed plate
@@ -172,16 +184,6 @@ class BumpySurfaceFollowEnv(FlatSurfaceFollowEnv):
         pose = torch.cat([world, ident], dim=-1)                 # (k, n, 7)
         self._bumps.write_object_pose_to_sim(pose, env_ids=env_ids)
 
-    # ------------------------------------------------------------------
-    # Contact: the plate-filtered ContactSensor misses peg<->bump contact, so OR-in the (source-
-    # agnostic) FT joint-force reaction. Used at runtime and by the reset press-to-contact latch.
-    # ------------------------------------------------------------------
-    def _force_in_contact(self):
-        thr = float(self.cfg_task.bump_contact_force_threshold)
-        return torch.linalg.norm(self.force_sensor_world_smooth[:, 0:3], dim=-1) > thr
-
-    def _compute_in_contact_any(self):
-        return super()._compute_in_contact_any() | self._force_in_contact()
-
-    def _reset_contact_mask(self):
-        return super()._reset_contact_mask() | self._force_in_contact()
+    # Contact detection needs NO override here: the bump spheres are in the oracle contact sensor's
+    # filter (see _register_extra_assets), so env.in_contact and the oracle force already include
+    # peg<->bump contact — same machinery and same source as the flat plate.

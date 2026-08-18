@@ -237,10 +237,16 @@ class ContactSensorWrapper(gym.Wrapper):
         psv = SimulationManager.get_physics_sim_view()
         if psv is None:
             return False
+        # Extra filter bodies the peg can contact besides the plate (e.g. the curved-ridge CAPS or the
+        # bumpy BUMPS — separate rigid bodies with activate_contact_sensors=True). The task env exposes
+        # them as PhysX globs via ``_extra_contact_filter_globs``; adding them to filter_patterns makes
+        # the SAME oracle contact force include peg<->{cap,bump} contact, since _refresh_in_contact sums
+        # get_contact_force_matrix over ALL filters. No force_source switch, no FT-force detection hacks.
+        extra = list(getattr(self.unwrapped, "_extra_contact_filter_globs", None) or [])
         try:
             cv = psv.create_rigid_contact_view(
                 self._peg_glob,
-                filter_patterns=[self._hole_glob],
+                filter_patterns=[self._hole_glob, *extra],
                 # Cap on simultaneous peg<->hole contact POINTS PhysX aggregates into the force
                 # matrix each step. The prior 64*num_envs was an untuned over-guess from the
                 # leak-fix rewrite; the native contact-data collection scales with this, and host
@@ -258,7 +264,7 @@ class ContactSensorWrapper(gym.Wrapper):
         self._dt = float(self.unwrapped.sim.get_physics_dt())
         print(
             f"[contact-sensor] Fabric contact view ready: sensor_count={cv.sensor_count} "
-            f"peg={self._peg_glob} filter={self._hole_glob}",
+            f"peg={self._peg_glob} filters={[self._hole_glob, *extra]}",
             flush=True,
         )
         return True

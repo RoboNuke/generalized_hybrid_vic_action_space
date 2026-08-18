@@ -39,7 +39,6 @@ runner_cfg:
   # Surface-task params on FlatSurfaceFollowTask via dotted env_cfg overrides.
   env_cfg_overrides:
     # --- Curvature ridge (inherited from the curved env) ---
-    task.force_source: wrist_ft   # ridge-cap contact isn't seen by the plate contact sensor -> use the wrist F/T
     task.n_curvature_levels: 11
     task.cap_curvature_radius: 0.20
     # --- Wiping reward (arXiv:2502.12599 base terms; WipingSurfaceFollowTask defaults). bounded_reward

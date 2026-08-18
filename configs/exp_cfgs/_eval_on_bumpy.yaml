@@ -1,0 +1,11 @@
+# Eval overlay: roll a FLAT-trained policy on the BUMPY surface (zero-shot generalization).
+# Only swaps the task + adds bumps. force_source stays ORACLE (default) — the bump spheres are now in
+# the oracle contact sensor's filter, so peg<->bump force + in_contact match the flat task (no FT hacks).
+runner_cfg:
+  task: Isaac-FlatSurfaceFollow-Bumpy-Direct-v0
+  env_cfg_overrides:
+    task.bump_density: 250.0           # ~10 bumps over the 0.20 x 0.20 m plate
+    task.bump_curvature_radius: 0.02
+    task.bump_min_height: 0.001
+    task.bump_max_height: 0.004
+    task.use_spherical_tip: true       # rounded contact tip (matches how the policies trained)

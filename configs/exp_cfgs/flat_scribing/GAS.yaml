@@ -41,7 +41,7 @@ runner_cfg:
     ft_smoothing_factor: 0.08                    # force EMA (Forge default 0.25); heavier smoothing for the noisier drag-contact signal (~0.10s time constant at 120Hz), pairs with the 10N target
     task.orientation_desired_angle_deg: 0.0
     task.success_orn_tol_deg: 180.0   # angle success check DISABLED (drag angle must not gate success in the tilted-grasp experiment)
-    task.plate_tilt_range_deg: 0.0
+    task.plate_tilt_range_deg: 30.0   # plate roll & pitch each ~ U(-30, +30) deg (uniform half-range, NOT a std dev)
     # Held-cylinder spawn: TIP 1 mm above the starting keypoint (along the surface normal), peg straight
     # up/down (no rotation), no jitter. Each DOF has a mean + std; std == 0 => mean used exactly (no
     # sampling). pos = surface-local (x=along-path, y=cross-track, z=normal, m); orn = WORLD-frame

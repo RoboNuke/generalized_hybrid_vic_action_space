@@ -1,11 +1,15 @@
+# GAS_geo: identical to simp_low-F_high-P/fixed_geo (gain_mapping=rotated, geometric interaction
+# frame; baked at grasp pitch 45) EXCEPT the stiffness-frame rotation is LEARNED (policy-emitted, as
+# in GAS) rather than fixed, and is supervised toward the GEOMETRIC interaction frame via a
+# chordal supervised-rotation loss (loss_cfg.supervised_rotation_enabled). I.e. GAS + geometric
+# interaction mode + supervised-rotation loss (the learned analog of fixed_geo). Mirrors the
+# fixed->learned delta in glued_surface/4_GAS_fixed_rot.yaml -> 8_GAS_geo.yaml.
 # Surface Path-Following experiment: simp_low-F_high-P (VICES / variable_diagonal).
 # Copied from glued_surface/2_VICES.yaml. Adds the knobs this sweep tunes, exposed at their
 # DEFAULT values (flip/edit as needed): directional fragile peg (+ require-contact + reset-in-
 # contact), the keypoint-servo action override (target offsets + fixed EEF orientation), and
-# every surface reward-term weight. The cylinder's fixed grasp PITCH relative to the gripper
-# (rel_grasp_rot_init_deg) defaults to 0 (aligned); sweep it across jobs with
-# launchers/hpc/sweep_launcher.bash (--sweep_param runner_cfg.rel_grasp_rot_init_deg) rather
-# than maintaining one config per angle.
+# every surface reward-term weight. The one per-file difference is the cylinder's fixed grasp
+# PITCH relative to the gripper (rel_grasp_rot_init_deg), set to the angle in the file name.
 runner_cfg:
   task: Isaac-FlatSurfaceFollow-Direct-v0
   agent_type: sac
@@ -19,7 +23,7 @@ runner_cfg:
   # --- Cylinder grasp tilt (rotation of the cylinder RELATIVE TO THE GRIPPER), folded into the
   #     rigid weld frame once at startup. pitch = the angle in this file's name. ---
   grasp_rot_mode: fixed                  # 'none' = aligned grip; 'fixed' = constant weld tilt below
-  rel_grasp_rot_init_deg: [0.0, 0.0, 0.0]   # [roll, pitch, yaw] deg; cylinder pitch in the gripper
+  rel_grasp_rot_init_deg: [0.0, 45.0, 0.0]   # [roll, pitch, yaw] deg; cylinder pitch in the gripper
   # --- Fragile peg (directional break). To enable: flip the three bools on, and set break_force to
   #     [shear_N, normal_N]. efficient_reset is REQUIRED by fragile; direction_break_force makes
   #     break_force a [shear, normal] pair; require_contact_enabled also breaks on loss of contact
@@ -27,7 +31,7 @@ runner_cfg:
   fragile_peg_enabled: true
   efficient_reset_enabled: true
   direction_break_force: true
-  break_force: [1000, 20]                      # scalar N (magnitude) when direction_break_force=false;
+  break_force: [1000, 20]                       # scalar N (magnitude) when direction_break_force=false;
                                          # set to [shear_N, normal_N] when direction_break_force=true
   require_contact_enabled: true
   require_contact_grace_steps: 7   # no loss-of-contact break for the first N steps; earliest failure at step N+1 (peg spawns 1mm above, descends into contact)
@@ -40,7 +44,8 @@ runner_cfg:
     ft_smoothing_factor: 0.08                    # force EMA (Forge default 0.25); heavier smoothing for the noisier drag-contact signal (~0.10s time constant at 120Hz), pairs with the 10N target
     task.orientation_desired_angle_deg: 0.0
     task.success_orn_tol_deg: 180.0   # angle success check DISABLED (drag angle must not gate success in the tilted-grasp experiment)
-    task.plate_tilt_range_deg: 30.0   # plate roll & pitch each ~ U(-30, +30) deg (uniform half-range, NOT a std dev)
+    task.plate_tilt_range_deg: 0.0
+    task.interaction_frame_mode: geometric   # target frame for the supervised-rotation loss (below)
     # Held-cylinder spawn: TIP 1 mm above the starting keypoint (along the surface normal), peg straight
     # up/down (no rotation), no jitter. Each DOF has a mean + std; std == 0 => mean used exactly (no
     # sampling). pos = surface-local (x=along-path, y=cross-track, z=normal, m); orn = WORLD-frame
@@ -67,7 +72,10 @@ runner_cfg:
     # --- Reward-term weights (all exposed for tuning). keypoint_reward_weight and
     #     vel_based_pace_weight are set above; the rest are at their task defaults. ---
     task.force_weight: 1.0
-    task.orientation_weight: 0.0
+    task.orientation_weight: 1.0   # = force reward (force_weight); reward keeping the peg upright
+    task.angle_target: vertical   # measure the peg tilt vs WORLD vertical (not the surface normal)
+    task.orientation_gate_keypoint_enabled: true   # a keypoint counts as achieved only if the peg is near-upright
+    task.orientation_gate_keypoint_deg: 10.0   # within 10 deg of vertical
     task.contact_weight: 0.0
     task.straightness_weight: 1.0
     task.pace_weight: 1.0
@@ -100,6 +108,12 @@ loss_cfg:
   supervised_selection_enabled: false
   supervised_selection_policy_weight: 1.0
   supervised_selection_critic_weight: 0.0
+  # Supervise the policy's LEARNED rot6d stiffness frame toward the geometric interaction frame
+  # (R_eefᵀ·interaction_frame_world), the noise-free target a fixed-rot controller would use.
+  # This is what makes GAS_geo the "learned" analog of fixed_geo. Policy-only (critic weight 0).
+  supervised_rotation_enabled: true
+  supervised_rotation_policy_weight: 1.0   # tune on HPC (chordal loss in [0,8])
+  supervised_rotation_critic_weight: 0.0
 
 sac_cfg:
   tensorboard: false        # log ONLY to wandb (requires experiment.wandb: true)
@@ -115,7 +129,7 @@ sac_cfg:
   learning_starts: 300
   learn_entropy: true
   initial_entropy_value: 0.05
-  target_entropy: -3.0    # -action_dim/2 (dim=6)
+  target_entropy: -13    # kept at -13 (GAS_geo's proven target); a higher target would push the gain dims' noise up and risk re-binding the cap
   grad_norm_clip: 1.0
   mixed_precision: false
   observation_preprocessor: RunningStandardScaler
@@ -126,8 +140,8 @@ sac_cfg:
   recorder:
     enabled: false
   experiment:
-    directory: flat_scribing
-    experiment_name: "VICES"
+    directory: flat_scribing_fullgain_upright
+    experiment_name: "GAS_geo"
     write_interval: 75
     checkpoint_interval: auto
     wandb: true
@@ -143,7 +157,7 @@ model_cfg:
     last_layer_scale: 0.1
     clip_log_std: true
     min_log_std: -20.0
-    max_log_std: -1.5    # sigma_max~0.22; loosened from -2.5 to preserve late-training exploration
+    max_log_std: -1.5    # sigma_max~0.22 (uniform); loose enough for the gain dims (want sigma~0.17) to carry entropy vs the supervised rotation -> no alpha-runaway
     reduction: sum
     use_state_dependent_std: false
     bernoulli_action_dims: null
@@ -172,7 +186,10 @@ controller_cfg:
   #                       (per block: 3 L-diagonal + 3 L-off-diagonal). D = zeros for now.
   # "rotated"           : diagonal K (6) + 6-D rotation vector (6) = 12 dims; R applied as
   #                       blkdiag(R,R) to the full 6x6.
-  gain_mapping: variable_diagonal #"constant" #
+  gain_mapping: rotated #"constant" #
+  # Rotation is LEARNED (policy-emitted rot6d frame), NOT fixed: fixed_rotation_from_interaction is
+  # intentionally OMITTED (cf. fixed_geo, which sets it true). The learned frame is instead pulled
+  # toward the geometric interaction frame by loss_cfg.supervised_rotation_enabled above.
   #fixed_rotation_rpy: [0.0, 30.0, 0.0]   # stiffness-frame R; aligned to the 30deg grasp tilt (used only when gain_mapping=rotated)
 
   # Toggle force control. When false: NO selection/force-target dims, K_f = zeros, and
@@ -184,8 +201,8 @@ controller_cfg:
   # ---- shared per-axis bounds [x,y,z,Rx,Ry,Rz], geometric scaling k = lo*(hi/lo)^((a+1)/2) ----
   # A lower bound < ~1e-6 disables that channel (k=0) instead of producing NaN, so use > 0 for
   # meaningful variable impedance. Translation and rotation differ ~10x, hence the split values.
-  gain_min: [300, 300, 100, 80, 80, 80] # pose stiffness K (position x3, rotation x3)
-  gain_max: [4000, 4000, 2000, 80, 80, 80] 
+  gain_min: [300, 300, 100, 20, 20, 20] # pose stiffness K (position x3, rotation x3)
+  gain_max: [4000, 4000, 2000, 150, 150, 150]  
 
   # Policy commands the pose stiffness directly, so disable the base Forge env's per-reset
   # multiplicative gain randomization (default [0.41]x6) to avoid randomizing on top of the
@@ -204,7 +221,7 @@ controller_cfg:
   # cholesky/rotated only: learn the full 6-DOF gain matrix (position + orientation)
   # instead of the translational 3x3 block alone. Changes action dim => re-tune
   # target_entropy if enabled.
-  full_gain_matrix: false
+  full_gain_matrix: true
 
   # Full 3-DOF orientation control: command roll/pitch/yaw as a delta-axis-angle rotation
   # scaled by rot_action_bounds, instead of the default yaw-only map (roll/pitch forced to 0).

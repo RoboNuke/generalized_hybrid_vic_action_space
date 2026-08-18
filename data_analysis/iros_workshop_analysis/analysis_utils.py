@@ -547,17 +547,20 @@ def tag_scalar(runs: list, tag: str, reduce: str = "last", step_ceiling: float =
 # METHOD_ORDER (canonical method display order) now lives in plot_config.py.
 
 
-def parse_group(group: str):
+def parse_group(group: str, default_angle: str | None = None):
     """Split a ``"{method}_{angle}"`` group key into ``(method, angle_str)``.
 
     The angle is the trailing numeric token, so a method that itself contains an
     underscore (``GAS_geo``) parses correctly: ``"GAS_geo_15" -> ("GAS_geo", "15")``.
-    Returns ``(group, None)`` if there is no trailing numeric token.
+    When there is no trailing numeric token, returns ``(group, default_angle)`` -- i.e.
+    ``(group, None)`` by default (caller skips it), or ``(group, "0")`` when
+    ``default_angle="0"`` so a non-swept "basic test" run (a bare ``"{method}"`` group with
+    no pitch angle) is treated as pitch 0 rather than dropped.
     """
     method, sep, angle = group.rpartition("_")
     if sep and angle.isdigit():
         return method, angle
-    return group, None
+    return group, default_angle
 
 
 def _ordered_methods(methods) -> list:
@@ -589,11 +592,15 @@ class Collections:
     angles: list
 
 
-def build_collections(data: dict, verbose: bool = True) -> Collections:
+def build_collections(data: dict, verbose: bool = True,
+                      default_angle: str | None = None) -> Collections:
     """Parse ``data``'s ``"{method}_{angle}"`` groups into a :class:`Collections` view.
 
     Groups whose key does not parse to ``(method, numeric angle)`` are skipped with a
-    warning (so stray folders don't silently pollute a pooled series).
+    warning (so stray folders don't silently pollute a pooled series). Pass
+    ``default_angle="0"`` to instead treat such a group as pitch 0 (the whole key is the
+    method) -- for a basic, non-pitch-swept test where runs are named ``"{method}"`` with
+    no trailing angle.
     """
     by_method: dict = {}
     by_angle: dict = {}
@@ -601,7 +608,7 @@ def build_collections(data: dict, verbose: bool = True) -> Collections:
     methods: set = set()
     angles: set = set()
     for group, runs in data.items():
-        method, angle = parse_group(group)
+        method, angle = parse_group(group, default_angle)
         if angle is None:
             if verbose:
                 print(f"[collections] skip unparseable group: {group!r}")

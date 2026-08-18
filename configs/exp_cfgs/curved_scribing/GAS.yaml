@@ -36,7 +36,6 @@ runner_cfg:
   # Surface-task params on FlatSurfaceFollowTask via dotted env_cfg overrides.
   env_cfg_overrides:
     # --- Curved surface: per-env curvature ridge (knobs this env adds; at defaults) ---
-    task.force_source: wrist_ft   # ridge-cap contact isn't seen by the plate contact sensor -> use the wrist F/T
     task.n_curvature_levels: 11   # curvature levels, round-robin per env (alpha in {0, 0.1, ..., 1.0})
     task.cap_curvature_radius: 0.20   # base ridge circle radius before the per-level alpha z-squash (must exceed plate_length/2)
     task.use_spherical_tip: true   # rounded (capsule) contact tip on the held cylinder

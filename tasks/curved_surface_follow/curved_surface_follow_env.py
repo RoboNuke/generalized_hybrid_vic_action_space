@@ -113,6 +113,7 @@ class CurvedSurfaceFollowEnv(FlatSurfaceFollowEnv):
                     radius=R,
                     height=height,
                     axis="Y",                                                # long axis across the path
+                    activate_contact_sensors=True,                           # oracle contact sensor sees peg<->ridge contact (filtered in)
                     # Kinematic (never moves under the peg), gravity off — mirrors the plate.
                     rigid_props=sim_utils.RigidBodyPropertiesCfg(
                         kinematic_enabled=True,
@@ -167,6 +168,16 @@ class CurvedSurfaceFollowEnv(FlatSurfaceFollowEnv):
     def _register_extra_assets(self):
         if getattr(self, "_caps", None) is not None:
             self.scene.rigid_object_collections["caps"] = self._caps
+            # The peg rides the ridge CAP (a separate rigid body), not the plate — so add the caps to
+            # the oracle contact sensor's filter. The ContactSensorWrapper reads this and includes it in
+            # its rigid-contact-view filter_patterns, then sums peg<->{plate,cap} force. Keeps force +
+            # in_contact on the SAME oracle source as the flat task (no force_source switch, no FT hacks).
+            # ONE glob per cap index (each matches exactly num_envs bodies — PhysX's contact view
+            # requires per-env filters, so a single "Cap_*" wildcard (num_envs*num_caps) is rejected).
+            # Only one cap is active per env; the parked ones read ~0 and drop out of the summed force.
+            self._extra_contact_filter_globs = [
+                f"/World/envs/env_*/Cap_{m}" for m in range(self._num_caps)
+            ]
 
     def _efficient_reset_finalize(self, env_ids):
         """Called by EfficientResetWrapper at the end of a partial (teleport) reset. ``scene.reset_to``
@@ -307,19 +318,9 @@ class CurvedSurfaceFollowEnv(FlatSurfaceFollowEnv):
             cols.append(self.path_point_on_surface(arclen))
         return torch.stack(cols, dim=1)  # (E, k, 3)
 
-    # ------------------------------------------------------------------
-    # Contact: the plate-filtered ContactSensor misses peg<->ridge contact, so OR-in the (source-
-    # agnostic) FT joint-force reaction. Used at runtime and by the reset press-to-contact latch.
-    # ------------------------------------------------------------------
-    def _force_in_contact(self):
-        thr = float(self.cfg_task.cap_contact_force_threshold)
-        return torch.linalg.norm(self.force_sensor_world_smooth[:, 0:3], dim=-1) > thr
-
-    def _compute_in_contact_any(self):
-        return super()._compute_in_contact_any() | self._force_in_contact()
-
-    def _reset_contact_mask(self):
-        return super()._reset_contact_mask() | self._force_in_contact()
+    # Contact detection needs NO override here: the ridge caps are in the oracle contact sensor's
+    # filter (see _register_extra_assets), so env.in_contact and the oracle force already include
+    # peg<->ridge contact — same machinery and same source as the flat plate.
 
     # ------------------------------------------------------------------
     # Metrics: success bucketed by curvature difficulty (alpha quartiles)

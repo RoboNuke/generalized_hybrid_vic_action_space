@@ -1,0 +1,11 @@
+# Eval overlay: roll a FLAT-trained policy on the CURVED surface (zero-shot generalization).
+# Only swaps the task + curved geometry. force_source stays ORACLE (default) — the ridge caps are
+# now in the oracle contact sensor's filter, so peg<->ridge force + in_contact match the flat task.
+runner_cfg:
+  task: Isaac-FlatSurfaceFollow-Curved-Direct-v0
+  env_cfg_overrides:
+    task.n_curvature_levels: 11        # curvature alpha 0..1 round-robin across envs
+    task.cap_curvature_radius: 0.20    # ridge base radius (must exceed plate_length/2)
+    task.use_spherical_tip: true       # rounded contact tip (matches curved_scribing)
+    # plate_tilt_range_deg intentionally NOT set -> inherits the policy's training value (30 deg).
+    # _place_caps uses the plate's FULL world transform, so the ridge rides the tilt correctly.
