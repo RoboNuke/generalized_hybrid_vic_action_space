@@ -4,8 +4,7 @@
 runner_cfg:
   task: Isaac-FlatSurfaceFollow-Bumpy-Direct-v0
   env_cfg_overrides:
-    task.bump_density: 250.0           # ~10 bumps over the 0.20 x 0.20 m plate
+    task.bump_density: 500.0           # ~20 bumps over the 0.20 x 0.20 m plate
     task.bump_curvature_radius: 0.02
     task.bump_min_height: 0.001
     task.bump_max_height: 0.004
-    task.use_spherical_tip: true       # rounded contact tip (matches how the policies trained)
