@@ -11,7 +11,7 @@ runner_cfg:
   agent_type: sac
   num_envs: 512
   num_agents: 5
-  total_timesteps: 12_500
+  total_timesteps: 3_000
   eval_timesteps: 75
   memory_size: 1_000_000
   seed: -1
@@ -207,7 +207,7 @@ controller_cfg:
   full_gain_matrix: false
   # Declared for consistency across the config families; NO-OP for gain_mapping=variable_diagonal
   # (VICES stiffness is already an axis-aligned diagonal in the control frame — no rotation R).
-  rotate_orientation_block: false
+  rotate_orientation_block: true
 
   # Full 3-DOF orientation control: command roll/pitch/yaw as a delta-axis-angle rotation
   # scaled by rot_action_bounds, instead of the default yaw-only map (roll/pitch forced to 0).

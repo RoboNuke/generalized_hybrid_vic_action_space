@@ -12,7 +12,7 @@ runner_cfg:
   agent_type: sac
   num_envs: 512
   num_agents: 5
-  total_timesteps: 12_500
+  total_timesteps: 3_000
   eval_timesteps: 75
   memory_size: 1_000_000
   seed: -1
@@ -214,7 +214,7 @@ controller_cfg:
   # ABLATION (6d): rotate ONLY the position ellipsoid; keep the orientation gains axis-aligned
   # instead of dragging them around with the shared R. Set consistently across the rotated methods
   # (GAS/GAS_geo/fixed_geo). Does not change the action dim, so target_entropy is unchanged.
-  rotate_orientation_block: false
+  rotate_orientation_block: true
 
   # Full 3-DOF orientation control: command roll/pitch/yaw as a delta-axis-angle rotation
   # scaled by rot_action_bounds, instead of the default yaw-only map (roll/pitch forced to 0).
