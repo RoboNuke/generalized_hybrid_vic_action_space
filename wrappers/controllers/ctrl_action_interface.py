@@ -102,6 +102,9 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         self._mode = cfg.gain_mapping
         self._use_hybrid = cfg.use_hybrid_force
         self._full = bool(cfg.full_gain_matrix)
+        # rotated only: apply R to the orientation gain block too (True, historical) or rotate only
+        # the position ellipsoid and keep the orientation stiffness axis-aligned (False).
+        self._rotate_orient = bool(getattr(cfg, "rotate_orientation_block", True))
         # Fixed-rotation variants of ``rotated`` (R is NOT policy-emitted, so the rot6d dims drop):
         #   * fixed_rotation_rpy set          -> R = a constant config frame.
         #   * fixed_rotation_from_interaction -> R = the TRUE interaction->EEF rotation read from the
@@ -542,10 +545,12 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
 
         For ``rotated`` / ``cholesky`` the policy controls the position 3x3 block's gains by
         default; with ``full_gain_matrix`` it controls all 6 DOFs (position + orientation).
-        ``rotated`` always applies the shared R to BOTH the position and orientation blocks —
-        ``full_gain_matrix`` only switches the orientation diagonal gains between policy-set
-        and the constants, never whether they are rotated. ``cholesky``'s non-full orientation
-        block is the constant diagonal (``_const_rot_block``), since it has no rotation frame.
+        ``rotated`` applies the shared R to the position block always; whether it ALSO rotates
+        the orientation block is set by ``rotate_orientation_block`` (default True = both blocks;
+        False = position-only, orientation stays an axis-aligned diagonal). ``full_gain_matrix``
+        independently switches the orientation diagonal gains between policy-set and the constants.
+        ``cholesky``'s non-full orientation block is the constant diagonal (``_const_rot_block``),
+        since it has no rotation frame.
         """
         E = self.num_envs
         if self._mode == "constant":
@@ -576,8 +581,8 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
                 kdiag = torch.cat((kpos, krot), dim=1)                                # (E,6)
             # Native principal gains are the interaction-frame diagonal (pre-rotation R).
             self._k_native = kdiag[:, 0:3]
-            K = self._rotate_blockdiag(R, kdiag)
-            D = self._rotate_blockdiag(R, self._crit_damp(kdiag))
+            K = self._rotate_blockdiag(R, kdiag, self._rotate_orient)
+            D = self._rotate_blockdiag(R, self._crit_damp(kdiag), self._rotate_orient)
             return K, D
 
         # cholesky: full SPD K with matrix critical damping. Full mode builds the whole 6x6;
@@ -669,16 +674,20 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         return R_eef.transpose(1, 2) @ R_int                      # (E,3,3) eef<-interaction
 
     @staticmethod
-    def _rotate_blockdiag(R, kdiag):
+    def _rotate_blockdiag(R, kdiag, rotate_orient: bool = True):
         """Block-diagonal congruence ``blkdiag(R,R) diag(k) blkdiag(R,R)ᵀ`` for (E,6) ``k``.
 
-        The shared 3x3 rotation ``R`` is applied to both the position (k[:,0:3]) and
-        orientation (k[:,3:6]) sub-blocks, yielding a (E,6,6) block-diagonal SPD matrix
-        whose translation/orientation blocks stay decoupled.
+        The shared 3x3 rotation ``R`` is applied to the position (k[:,0:3]) sub-block always.
+        ``rotate_orient`` decides the orientation (k[:,3:6]) sub-block: True (default) rotates it
+        by the same R; False leaves it as an axis-aligned diagonal. Either way the result is a
+        (E,6,6) block-diagonal SPD matrix whose translation/orientation blocks stay decoupled.
         """
         RT = R.transpose(1, 2)
         top = R @ torch.diag_embed(kdiag[:, 0:3]) @ RT
-        bot = R @ torch.diag_embed(kdiag[:, 3:6]) @ RT
+        if rotate_orient:
+            bot = R @ torch.diag_embed(kdiag[:, 3:6]) @ RT
+        else:
+            bot = torch.diag_embed(kdiag[:, 3:6])
         return block_diag_2(top, bot)
 
     def _const_rot_block(self, k_const, E):

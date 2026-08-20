@@ -209,6 +209,11 @@ controller_cfg:
   # instead of the translational 3x3 block alone. Changes action dim => re-tune
   # target_entropy if enabled.
   full_gain_matrix: true
+  # ABLATION (6d): rotate ONLY the position ellipsoid; keep the policy-set orientation gains
+  # axis-aligned instead of dragging them around with the shared learned R. Does not change the
+  # action dim (rot6d still emitted, still orients the position block) so target_entropy is unchanged.
+  # Set true (or delete) to restore the historical "rotate both blocks" behavior.
+  rotate_orientation_block: false
 
   # Full 3-DOF orientation control: command roll/pitch/yaw as a delta-axis-angle rotation
   # scaled by rot_action_bounds, instead of the default yaw-only map (roll/pitch forced to 0).

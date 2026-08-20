@@ -83,6 +83,16 @@ class ControlCfg(ForgeCtrlCfg):
     # instead of the translational 3x3 block alone (rotation block fixed to constant gains).
     full_gain_matrix: bool = False
 
+    # rotated only: whether the learned/fixed stiffness rotation R is applied to the ORIENTATION
+    # gain block as well as the position block. Default True reproduces the historical behavior
+    # (shared R rotates both blocks). Set False to rotate ONLY the position 3x3 ellipsoid and keep
+    # the orientation 3x3 as an axis-aligned diagonal of the (policy-set or constant) rotation gains.
+    # Motivation: under full_gain_matrix the shared R drags the orientation stiffness axes around
+    # with the position ellipsoid while both are still being learned, hurting orientation control;
+    # decoupling keeps the orientation stiffness stable. Does NOT change the action dimension (rot6d
+    # is still emitted and still orients the position block). No-op for non-rotated gain_mappings.
+    rotate_orientation_block: bool = True
+
     # rotated only: when set to [roll, pitch, yaw] (DEGREES) the K/D/K_f rotation frame R
     # is FIXED to this orientation instead of being emitted by the policy. Drops the 6 rot6d
     # action dims (and their force-block mirror when use_hybrid_force); the policy still sets

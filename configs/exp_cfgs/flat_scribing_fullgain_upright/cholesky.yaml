@@ -215,6 +215,9 @@ controller_cfg:
   # instead of the translational 3x3 block alone. Changes action dim => re-tune
   # target_entropy if enabled.
   full_gain_matrix: true
+  # Declared for consistency across the flat_6d family; NO-OP for gain_mapping=cholesky (the full
+  # SPD matrix has no shared rotation frame R to withhold from the orientation block).
+  rotate_orientation_block: false
 
   # Full 3-DOF orientation control: command roll/pitch/yaw as a delta-axis-angle rotation
   # scaled by rot_action_bounds, instead of the default yaw-only map (roll/pitch forced to 0).
