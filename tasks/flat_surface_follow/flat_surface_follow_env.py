@@ -1335,6 +1335,25 @@ class FlatSurfaceFollowEnv(ForgeEnv):
     # Reset: grandparent (Factory) reset + our placement, then Forge dynamics rand
     # ------------------------------------------------------------------
     def _reset_idx(self, env_ids):
+        # LANDMINE GUARD — this reset is inherently an ALL-ENVS operation. Two reasons a partial
+        # `env_ids` here is unsafe: (1) FactoryEnv._reset_idx -> randomize_initial_state runs
+        # step_sim_no_action()/DLS-IK loops that advance the WHOLE sim's physics (Factory: "we assume
+        # all envs reset at the same time"); (2) the Forge dynamics randomization + per-episode
+        # accumulators below reallocate full (num_envs, ...) tensors, so a subset call clobbers every
+        # still-running env. The EfficientResetWrapper is what makes partial (async fragile/lag/success)
+        # resets safe — it intercepts them and teleports from a donor WITHOUT calling this path, so this
+        # method only ever legitimately sees the full env set. If it is ever called with a subset, the
+        # wrapper is missing on a config that terminates asynchronously: fail LOUD here rather than
+        # silently corrupt the survivors' progress/keypoints/force/pace state.
+        if int(env_ids.numel() if hasattr(env_ids, "numel") else len(env_ids)) < int(self.num_envs):
+            raise RuntimeError(
+                f"FlatSurfaceFollowEnv._reset_idx called with a PARTIAL env set "
+                f"({int(env_ids.numel())}/{int(self.num_envs)}). This all-envs reset would corrupt the "
+                f"still-running envs (whole-sim physics settling + full-tensor reallocation of the "
+                f"per-episode reward accumulators). Attach the EfficientResetWrapper (set "
+                f"runner_cfg.efficient_reset_enabled=true, or enable a task termination flag which "
+                f"auto-attaches it) so partial resets teleport from a donor instead of running this path."
+            )
         # FactoryEnv._reset_idx: default poses + _set_franka_to_default_pose +
         # our randomize_initial_state (dispatched via self). Skips ForgeEnv._reset_idx,
         # which writes the success-prediction action dim (6) we don't have.

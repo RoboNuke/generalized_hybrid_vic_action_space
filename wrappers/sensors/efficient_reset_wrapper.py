@@ -165,6 +165,18 @@ class EfficientResetWrapper(gym.Wrapper):
             if hasattr(u, name):
                 getattr(u, name)[env_ids] = 0.0
 
+        # 4b) Clear the surface task's per-keypoint STATUS rows for the broken envs. Unlike the reward
+        #    accumulators (keypoints_achieved / kp_ach_frontier), keypoint_status is a (num_envs, Kmax)
+        #    viz/logging buffer that canNOT ride in _efficient_reset_extra_attrs — it is None until the
+        #    first _get_rewards, so the donor-copy path would crash on it. The full reset zeros it via
+        #    the "= None -> realloc" sentinel, which the partial path skips; left alone, the broken env
+        #    would keep its PREVIOUS episode's achieved/off-contact/off-track marks, corrupting the
+        #    recorder's keypoint balls/counts and the keypoints_passed_off_* per-episode logging. Zero
+        #    the reset rows here (guarded: absent on non-surface tasks, None before the first reward).
+        ks = getattr(u, "keypoint_status", None)
+        if ks is not None:
+            ks[env_ids] = 0
+
         # 5) Task-specific finalize hook for per-env state that scene.get_state()/reset_to() do NOT
         #    cover. Notably a RigidObjectCollection (e.g. the bumpy surface's procedural bumps) is not
         #    part of the scene state dict, so its physical poses aren't teleported. The donor's per-env
@@ -173,6 +185,30 @@ class EfficientResetWrapper(gym.Wrapper):
         finalize = getattr(u, "_efficient_reset_finalize", None)
         if callable(finalize):
             finalize(env_ids)
+
+        # 6) Refresh the env's DERIVED kinematic state (fingertip / peg tip / contact point / progress /
+        #    the observation setpoint) after the teleport. scene.reset_to() wrote the broken envs' new
+        #    poses to sim, but the env's CACHED intermediate tensors still hold the pre-teleport
+        #    (terminal, mid-path) pose. The next env step runs its CONTROL in _pre_physics_step BEFORE
+        #    _get_dones recomputes them, so a stale tip/setpoint makes the surface task's keypoint-servo
+        #    drive the arm toward where the peg BROKE — lurching it forward along the path (measured:
+        #    prog jumps 0 -> ~0.3-0.5 L over the first 1-3 steps, spuriously crediting those keypoints).
+        #    Recompute now so the first post-teleport control step sees the true (start) pose.
+        #    Caveat: _compute_intermediate_values advances the velocity finite-difference base
+        #    (prev_fingertip_pos <- current, ee_linvel_fd = d(pos)/dt) for ALL envs, which would zero the
+        #    STILL-RUNNING envs' EE velocity for this step. So snapshot those buffers and restore the
+        #    survivors' rows — the broken envs keep the fresh (~0, donor-based) velocity, which is correct
+        #    for a teleport discontinuity.
+        if hasattr(u, "_compute_intermediate_values"):
+            _vel_bufs = ("prev_fingertip_pos", "prev_fingertip_quat", "prev_joint_pos",
+                         "ee_linvel_fd", "ee_angvel_fd", "joint_vel_fd")
+            _snap = {nm: getattr(u, nm).clone() for nm in _vel_bufs if hasattr(u, nm)}
+            u._compute_intermediate_values(u.physics_dt)
+            if _snap:
+                survivors = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+                survivors[env_ids] = False
+                for nm, old in _snap.items():
+                    getattr(u, nm)[survivors] = old[survivors]
 
     # ------------------------------------------------------------------ utils
     def _shuffle_state(self, state, source_idxs):
