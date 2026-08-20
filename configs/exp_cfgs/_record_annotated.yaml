@@ -1,0 +1,9 @@
+# Record overlay: enable the surface-tracking ANNOTATIONS on each grid tile — in-scene keypoint-status
+# balls, force + orientation (theta) gauges, and the top-down path minimap inset. RecorderCfg.overlay
+# defaults to "none" (plain frames), so this must be layered on to get the annotated view. Env-neutral
+# (drawing only); works on flat / curved / bumpy. Use AFTER the base recorder overlay:
+#   --record_config configs/exp_cfgs/flat_scribing/_record.yaml \
+#   --record_config configs/exp_cfgs/_record_annotated.yaml
+sac_cfg:
+  recorder:
+    overlay: surface_tracking

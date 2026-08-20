@@ -1,0 +1,20 @@
+# Extra record overlay for the CURVED surface: lay the recorded grid out as 3 x n_curvature_levels
+# instead of the default 3x4 best/median/worst. Each COLUMN is one curvature level (0 = flat …
+# K-1 = most curved); the rows are that level's BEST / MEDIAN / WORST trajectory by return.
+#
+# Use it AFTER the base recorder overlay, e.g.:
+#   --record_config configs/exp_cfgs/flat_scribing/_record.yaml \
+#   --record_config configs/exp_cfgs/_record_curved_grid.yaml \
+#   --overlay configs/exp_cfgs/_eval_on_curved.yaml --record_allow_env_overlay
+runner_cfg:
+  # 2 envs per curvature level per episode (11 levels). num_trajectories=44 -> 2 episodes -> 4/level,
+  # enough to rank best/median/worst per column while keeping the frame buffer modest (~4 GB host RAM).
+  num_envs: 22
+sac_cfg:
+  recorder:
+    overlay: surface_tracking     # force/theta gauges + keypoint balls + path minimap
+    grid_by_curvature: true
+    num_trajectories: 44
+    # Smaller tiles so an 11-column grid isn't enormous (11*320 wide x 3*420 tall).
+    width: 320
+    height: 420
