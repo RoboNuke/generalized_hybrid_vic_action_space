@@ -123,6 +123,14 @@ class RecorderCfg:
                              best/median/worst ranking is meaningless. Set num_trajectories == num_envs
                              so exactly one fresh-spawn episode fills the grid (e.g. 16 -> 4x4)."""
 
+    grid_by_curvature: bool = False
+    """CURVED surface only (surface_tracking overlay): lay the grid out as ``3 x n_curvature_levels``
+    where each COLUMN is one curvature level (0 = flat … K-1 = most curved) and the rows are that
+    level's BEST / MEDIAN / WORST trajectory by return. Requires the env to expose ``_env_level_idx``
+    (the curved task does). Ignored on non-curved surfaces. For a well-filled grid, set ``num_envs``
+    to a multiple of ``n_curvature_levels`` (e.g. 3-4 envs per level) so each column has enough
+    trajectories to rank. Overrides ``grid_select`` when on."""
+
     # ---- DEPRECATED (backward-compat only; IGNORED by the recorder) ----------------------------------
     # Replaced by ``mode`` + ``overlay`` above. Kept ONLY so that already-snapshotted training
     # config.yaml files (which serialized the full old RecorderCfg) still load under the strict

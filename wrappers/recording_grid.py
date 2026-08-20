@@ -128,8 +128,15 @@ def build_grid_video(
     values: torch.Tensor | None,
     engaged: torch.Tensor | None = None,
     success_seq: torch.Tensor | None = None,
+    selected: torch.Tensor | None = None,
+    grid_shape: tuple[int, int] | None = None,
 ) -> np.ndarray:
-    """Compose the 3x4 grid video.
+    """Compose the grid video (default 3x4 best/median/worst).
+
+    :param selected: optional explicit trajectory indices to tile, ROW-MAJOR into
+        ``grid_shape``. When None, the default best-4/median-4/worst-4 selection is used.
+    :param grid_shape: optional ``(n_rows, n_cols)`` override (default ``(3, 4)``). Lets a
+        caller lay the tiles out differently, e.g. the curvature grid (3 x num_curvatures).
 
     :param frames: ``(num_envs, T, H, W, 3)`` uint8 tensor on CPU. Frames at
         ``t > term_step[i]`` may be stale; this function freezes them.
@@ -150,9 +157,12 @@ def build_grid_video(
         used for the orange border. Ignored unless ``success_seq`` is provided.
     :returns: ``(T, gridH, gridW, 3)`` uint8 numpy array.
     """
-    selected = select_grid_indices(returns)
+    n_rows, n_cols = grid_shape if grid_shape is not None else (GRID_ROWS, GRID_COLS)
+    n_tiles = n_rows * n_cols
+    if selected is None:
+        selected = select_grid_indices(returns)
     n_sel = int(selected.numel())
-    n_show = min(n_sel, TILES)
+    n_show = min(n_sel, n_tiles)
     selected = selected[:n_show]
 
     # Subset to the selected tiles FIRST, then freeze only those. Freezing the full
@@ -178,8 +188,8 @@ def build_grid_video(
     T = sel_frames.shape[1]
     H = sel_frames.shape[2]
     W = sel_frames.shape[3]
-    grid_h = GRID_ROWS * H
-    grid_w = GRID_COLS * W
+    grid_h = n_rows * H
+    grid_w = n_cols * W
 
     try:
         font = ImageFont.load_default()
@@ -190,8 +200,8 @@ def build_grid_video(
     for t in range(T):
         canvas = Image.new("RGB", (grid_w, grid_h), (0, 0, 0))
         for tile_idx in range(n_show):
-            row = tile_idx // GRID_COLS
-            col = tile_idx % GRID_COLS
+            row = tile_idx // n_cols
+            col = tile_idx % n_cols
             x = col * W
             y = row * H
             ts = int(sel_term[tile_idx])
@@ -230,6 +240,53 @@ def build_grid_video(
             )
         out[t] = np.asarray(canvas)
     return out
+
+
+def select_curvature_grid_indices(
+    returns: torch.Tensor, levels: torch.Tensor, num_levels: int
+) -> torch.Tensor:
+    """Indices for a (3, num_levels) grid, ROW-MAJOR: row 0 = per-level BEST by return,
+    row 1 = per-level MEDIAN, row 2 = per-level WORST. Column j holds the trajectories whose
+    curvature ``level == j``. A level with no trajectory falls back to a global best/median/worst
+    pick so its column is never blank."""
+    best: list[torch.Tensor] = []
+    med: list[torch.Tensor] = []
+    worst: list[torch.Tensor] = []
+    g = torch.argsort(returns)  # ascending, for the empty-level fallback
+    for L in range(num_levels):
+        idx = (levels == L).nonzero(as_tuple=False).view(-1)
+        if idx.numel() == 0:
+            best.append(g[-1]); med.append(g[g.numel() // 2]); worst.append(g[0])
+            continue
+        order = idx[torch.argsort(returns[idx])]  # ascending return within this curvature
+        best.append(order[-1])
+        worst.append(order[0])
+        med.append(order[order.numel() // 2])
+    # row-major: all BEST (row 0), then all MEDIAN (row 1), then all WORST (row 2)
+    return torch.stack(best + med + worst).to(returns.device)
+
+
+def build_curvature_grid_video(
+    frames: torch.Tensor,
+    returns: torch.Tensor,
+    term_step: torch.Tensor,
+    is_success: torch.Tensor,
+    levels: torch.Tensor,
+    num_levels: int,
+    values: torch.Tensor | None = None,
+    engaged: torch.Tensor | None = None,
+    success_seq: torch.Tensor | None = None,
+) -> np.ndarray:
+    """Compose a ``3 x num_levels`` grid where each COLUMN is one curvature level
+    (0 = flat … num_levels-1 = most curved) and the rows are that level's BEST / MEDIAN /
+    WORST trajectory by return. ``levels`` is ``(M,)`` — the curvature-level index of each
+    of the M collected trajectories."""
+    selected = select_curvature_grid_indices(returns, levels, int(num_levels))
+    return build_grid_video(
+        frames=frames, returns=returns, term_step=term_step, is_success=is_success,
+        values=values, engaged=engaged, success_seq=success_seq,
+        selected=selected, grid_shape=(3, int(num_levels)),
+    )
 
 
 def write_gif(grid: np.ndarray, path: str, fps: int) -> None:

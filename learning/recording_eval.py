@@ -332,7 +332,7 @@ def _collect_surface(
     ``env.viz_snapshot``). Returns the written mp4 path.
     """
     from learning import surface_viz as sv
-    from wrappers.recording_grid import select_grid_indices, write_video
+    from wrappers.recording_grid import select_grid_indices, select_curvature_grid_indices, write_video
 
     uenv = env.unwrapped
     if not hasattr(uenv, "viz_snapshot"):
@@ -344,7 +344,16 @@ def _collect_surface(
     if T <= 0:
         raise RuntimeError(f"max_episode_length must be > 0; got {max_episode_length!r}.")
     grid_select = str(getattr(recorder_cfg, "grid_select", "ranked"))
-    if grid_select == "all":
+    # Curvature grid (curved surface only): each COLUMN is one curvature level (0 = flat …
+    # K-1 = most curved), rows = that level's best / median / worst trajectory by return.
+    # Requires env._env_level_idx (the per-env round-robin curvature index).
+    _lvl = getattr(env.unwrapped, "_env_level_idx", None)
+    by_curvature = bool(getattr(recorder_cfg, "grid_by_curvature", False)) and _lvl is not None
+    _lvl_cpu = _lvl.detach().cpu() if by_curvature else None
+    if by_curvature:
+        num_levels = int(getattr(env.unwrapped.cfg_task, "n_curvature_levels", int(_lvl_cpu.max()) + 1))
+        rows, cols = 3, num_levels
+    elif grid_select == "all":
         # Tile ALL envs from one episode (square-ish) — for random/untrained rollouts where the
         # best/median/worst ranking is meaningless. num_trajectories should == num_envs.
         cols = int(math.ceil(math.sqrt(num_envs)))
@@ -384,6 +393,7 @@ def _collect_surface(
     coll_term: list[int] = []
     coll_succ: list[bool] = []
     coll_status: list[int] = []                       # terminal status per trajectory (see _ST_* below)
+    coll_levels: list[int] = []                       # curvature-level index per trajectory (by_curvature grid)
     coll_fsq: list[np.ndarray] = []; coll_osq: list[np.ndarray] = []
     coll_fN: list[np.ndarray] = [];  coll_ang: list[np.ndarray] = []
     coll_tru: list[np.ndarray] = []; coll_trv: list[np.ndarray] = []
@@ -552,6 +562,8 @@ def _collect_surface(
                 coll_frames.append(frames[e].clone())
                 coll_returns.append(float(returns[e])); coll_term.append(int(term_step[e]))
                 coll_succ.append(bool(success[e])); coll_status.append(int(status[e]))
+                if by_curvature:
+                    coll_levels.append(int(_lvl_cpu[e]))
                 coll_fsq.append(fsq[e].copy()); coll_osq.append(osq[e].copy())
                 coll_fN.append(fN[e].copy());   coll_ang.append(ang[e].copy())
                 coll_tru.append(tru[e].copy()); coll_trv.append(trv[e].copy())
@@ -568,7 +580,11 @@ def _collect_surface(
         set_camera_active(camera, False)
 
     R = torch.tensor(coll_returns)
-    if grid_select == "all":
+    if by_curvature:
+        sel = select_curvature_grid_indices(R, torch.tensor(coll_levels), num_levels).tolist()
+        print(f"[record] curvature grid {rows}x{cols}: column = curvature level 0..{num_levels - 1}, "
+              f"rows = best/median/worst by return (from {len(coll_frames)} trajectories)", flush=True)
+    elif grid_select == "all":
         # All trajectories in collection order (one episode of num_envs fresh spawns), capped to the grid.
         sel = list(range(min(n_sel, len(coll_frames))))
         print(f"[record] tiling all {len(sel)} trajectories ({rows}x{cols}, grid_select=all)", flush=True)

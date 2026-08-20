@@ -137,6 +137,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "eval_<label>_<ts>.parquet (record: rec_eval_<label>_<ts>). Used by the sweep "
                         "wrapper to encode <param-label>_<value> so each swept value's file is distinct.")
     p.add_argument("--device", type=str, default=None, help="Torch/sim device, e.g. cuda:0.")
+    p.add_argument("--record_allow_env_overlay", action="store_true",
+                   help="Record mode: allow record overlays / --overlay to change the ENV "
+                        "(runner_cfg.env_cfg_overrides), skipping the env-neutrality guard. Opt-in for "
+                        "DELIBERATE cross-surface recording (flat policy on curved/bumpy). Forwarded to runner.")
     p.add_argument("--headless", action="store_true", help="Run Isaac headless (still records).")
     p.add_argument("--enable_cameras", action="store_true",
                    help="Usually auto-forced by recorder.enabled; pass to be explicit.")
@@ -181,6 +185,8 @@ def _record_single(args) -> None:
         argv += ["--headless"]
     if args.enable_cameras:
         argv += ["--enable_cameras"]
+    if getattr(args, "record_allow_env_overlay", False):
+        argv += ["--record_allow_env_overlay"]
 
     from learning import runner
     try:
@@ -269,6 +275,8 @@ def _record_cmd(agent_dir: str, trace_path: str, video_dir: str, args) -> list[s
         cmd += ["--headless"]
     if args.enable_cameras:
         cmd += ["--enable_cameras"]
+    if getattr(args, "record_allow_env_overlay", False):
+        cmd += ["--record_allow_env_overlay"]
     return cmd
 
 

@@ -160,6 +160,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Eval mode: load the checkpoint's WEIGHTS (+ preprocessor) only, skipping "
                              "optimizer state — required to eval a single-agent checkpoint that was "
                              "sliced from a multi-agent training run. No effect in train mode.")
+    parser.add_argument("--record_allow_env_overlay", action="store_true",
+                        help="Record mode ONLY: skip the env-neutrality guard that normally refuses a "
+                             "record overlay carrying runner_cfg.env_cfg_overrides. Opt-in for DELIBERATE "
+                             "cross-surface recording (e.g. a flat-trained policy rolled out on the "
+                             "curved/bumpy surface). Off by default so accidental env drift is still caught.")
     AppLauncher.add_app_launcher_args(parser)  # adds --headless, --device
     return parser
 
@@ -213,7 +218,7 @@ def main(argv: list[str] | None = None) -> None:
         # base --config (the agent's snapshot) legitimately owns the training overrides; only the
         # overlays are policed here. Collect offenders and raise AFTER this try (a raise inside it
         # would be swallowed by the broad except below).
-        if _recorder_on:
+        if _recorder_on and not getattr(args, "record_allow_env_overlay", False):
             for _ov_path in (args.overlay or []):
                 with open(_ov_path) as _ovf:
                     _ovp = _yaml.safe_load(_ovf) or {}
