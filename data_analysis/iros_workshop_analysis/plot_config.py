@@ -26,7 +26,7 @@ METHOD_COLORS = {
     "GAS":   "#5193C9",
     "GAS_geo":       "#3cc53c",
     "VICES":     "#df7486",
-    "cholesky":     "#b436c5",
+    #"cholesky":     "#b436c5",
     #"fixed_geo": "#2a78d6",   # blue
     #"GAS_geo":   "#eb6834",   # orange
     #"GAS":       "#1baf7a",   # teal
@@ -37,7 +37,7 @@ METHOD_NAMES = {
     "GAS_geo":   "RA-GAS",
     "GAS":       "RA-Free",
     "VICES":     "VICES",
-    "cholesky":  "Chol"
+    #"cholesky":  "Chol"
 }
 
 # Grasp-angle palette (ordinal: one blue hue, light -> dark with the angle).
