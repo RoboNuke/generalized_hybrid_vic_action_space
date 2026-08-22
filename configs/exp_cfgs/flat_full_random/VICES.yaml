@@ -40,7 +40,7 @@ runner_cfg:
     ft_smoothing_factor: 0.08                    # force EMA (Forge default 0.25); heavier smoothing for the noisier drag-contact signal (~0.10s time constant at 120Hz), pairs with the 10N target
     task.orientation_desired_angle_deg: 0.0
     task.success_orn_tol_deg: 180.0   # angle success check DISABLED (drag angle must not gate success in the tilted-grasp experiment)
-    task.plate_tilt_range_deg: 30.0   # plate roll & pitch each ~ U(-30, +30) deg (uniform half-range)
+    task.plate_tilt_range_deg: 0.0   # plate FLAT (no roll/pitch); only yaw is randomized (plate_yaw_range_deg below)
     # --- Grasp-angle randomization (weld OFF): cylinder pitch in the gripper ~ U(0, 45) deg per
     #     reset, per env. Requires glue_peg_to_gripper=false + grasp_rot_mode=none (the rigid weld
     #     holds ONE constant tilt and cannot be re-randomized). min==max on an axis => constant. ---

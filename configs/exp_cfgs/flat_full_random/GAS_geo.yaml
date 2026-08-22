@@ -23,7 +23,7 @@ runner_cfg:
   # --- Cylinder grasp tilt (rotation of the cylinder RELATIVE TO THE GRIPPER), folded into the
   #     rigid weld frame once at startup. pitch = the angle in this file's name. ---
   grasp_rot_mode: none                   # weld-free: per-reset grasp tilt comes from task.grasp_tilt_min/max_deg
-  rel_grasp_rot_init_deg: [0.0, 45.0, 0.0]   # IGNORED now (weld off + grasp_rot_mode=none); grasp tilt is set by task.grasp_tilt_max_deg below
+  rel_grasp_rot_init_deg: [0.0, 0.0, 0.0]   # IGNORED now (weld off + grasp_rot_mode=none); grasp tilt is set by task.grasp_tilt_max_deg below
   # --- Fragile peg (directional break). To enable: flip the three bools on, and set break_force to
   #     [shear_N, normal_N]. efficient_reset is REQUIRED by fragile; direction_break_force makes
   #     break_force a [shear, normal] pair; require_contact_enabled also breaks on loss of contact
@@ -44,7 +44,7 @@ runner_cfg:
     ft_smoothing_factor: 0.08                    # force EMA (Forge default 0.25); heavier smoothing for the noisier drag-contact signal (~0.10s time constant at 120Hz), pairs with the 10N target
     task.orientation_desired_angle_deg: 0.0
     task.success_orn_tol_deg: 180.0   # angle success check DISABLED (drag angle must not gate success in the tilted-grasp experiment)
-    task.plate_tilt_range_deg: 30.0   # plate roll & pitch each ~ U(-30, +30) deg (uniform half-range)
+    task.plate_tilt_range_deg: 0.0   # plate FLAT (no roll/pitch); only yaw is randomized (plate_yaw_range_deg below)
     # --- Grasp-angle randomization (weld OFF): cylinder pitch in the gripper ~ U(0, 45) deg per
     #     reset, per env. Requires glue_peg_to_gripper=false + grasp_rot_mode=none (the rigid weld
     #     holds ONE constant tilt and cannot be re-randomized). min==max on an axis => constant. ---
