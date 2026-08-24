@@ -37,6 +37,7 @@ runner_cfg:
     task.desired_speed_cm_s: 5.0
     task.force_desired_min: 10.0
     task.force_desired_max: 10.0
+    task.force_obs_frame: eef   # ft_force/ft_torque OBS frame (policy+critic): "eef" (body-fixed, tool frame) | "world"
     ft_smoothing_factor: 0.08                    # force EMA (Forge default 0.25); heavier smoothing for the noisier drag-contact signal (~0.10s time constant at 120Hz), pairs with the 10N target
     task.orientation_desired_angle_deg: 0.0
     task.success_orn_tol_deg: 180.0   # angle success check DISABLED (drag angle must not gate success in the tilted-grasp experiment)

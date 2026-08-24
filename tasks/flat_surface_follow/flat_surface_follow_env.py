@@ -754,23 +754,35 @@ class FlatSurfaceFollowEnv(ForgeEnv):
     # ------------------------------------------------------------------
     # Observations (all EEF-frame): goal-relative pose (sign-aligned) + EEF vel/force
     # ------------------------------------------------------------------
-    def _fingertip_wrench(self):
-        """Clean 6-D wrench (F, T) expressed in the fingertip-midpoint (EEF) frame.
+    def _wrench_obs(self):
+        """6-D wrench (F, T) for the policy/critic obs, in the frame set by cfg_task.force_obs_frame.
 
-        force_sensor_world_smooth is in the WORLD frame (Forge: get_link_incoming_joint_force,
-        EMA-smoothed; its change_FT_frame keeps identity rotation, so the force vector stays world).
-        Express it in the EEF frame the policy acts/controls in: (1) re-reference the torque from the
-        sensor origin to the fingertip origin (add (p_sensor - p_fingertip) x F, world frame), then
-        (2) rotate both F and T by the fingertip's world->local rotation. The result is BODY-FIXED —
-        independent of the randomized world/plate orientation. (The prior version mislabeled the
-        world force as sensor-frame in change_FT_frame, over-rotating it by R_sensor.)
+        force_sensor_world_smooth is get_link_incoming_joint_force() at the force_sensor body. PhysX
+        and IsaacLab report that wrench in the sensor's BODY-LOCAL frame, NOT world (PhysX docstring:
+        "child joint frame"; IsaacLab body_incoming_joint_wrench_b: "parent body frame"; the legacy
+        `_world` name is a misnomer). So convert it to world FIRST, using the sensor body's world
+        orientation (R_sensor); then re-reference the torque from the sensor origin to the fingertip
+        origin (world frame); then express in the selected frame:
+          "world" -> keep world axes.
+          "eef"   -> rotate world->fingertip => BODY-FIXED (independent of the world/plate orientation,
+                     the tool frame the policy acts/controls in).
+        NOTE: previously this rotated the body-local force by fq_conj while TREATING it as world,
+        i.e. an extra R_fingertip^-1 — a grasp-tilt-dependent double rotation of the force obs.
         """
         raw = self.force_sensor_world_smooth
-        F_w, T_w = raw[:, 0:3], raw[:, 3:6]
+        F_b, T_b = raw[:, 0:3], raw[:, 3:6]
+        bq = self._robot.data.body_quat_w
         bp = self._robot.data.body_pos_w
-        fq = self._robot.data.body_quat_w[:, self.fingertip_body_idx]           # world<-fingertip
+        R_sensor = bq[:, self.force_sensor_body_idx]                            # world<-sensor (body-local)
+        # sensor body-local -> world
+        F_w = quat_apply(R_sensor, F_b)
+        T_w = quat_apply(R_sensor, T_b)
+        # re-reference the torque from the sensor origin to the fingertip origin (world frame)
         r = bp[:, self.force_sensor_body_idx] - bp[:, self.fingertip_body_idx]  # sensor - fingertip (world)
-        T_at_ft_w = T_w + torch.cross(r, F_w, dim=-1)                           # move reference to fingertip origin
+        T_at_ft_w = T_w + torch.cross(r, F_w, dim=-1)
+        if str(getattr(self.cfg_task, "force_obs_frame", "eef")) == "world":
+            return F_w, T_at_ft_w
+        fq = bq[:, self.fingertip_body_idx]                                     # world<-fingertip
         fq_conj = torch_utils.quat_conjugate(fq)                               # fingertip<-world
         return quat_apply(fq_conj, F_w), quat_apply(fq_conj, T_at_ft_w)
 
@@ -786,7 +798,7 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         def _to_eef(vec, eef_quat):
             return quat_apply(torch_utils.quat_conjugate(eef_quat), vec)
 
-        F_ft, T_ft = self._fingertip_wrench()  # clean EEF-frame wrench
+        F_ft, T_ft = self._wrench_obs()  # obs wrench in cfg_task.force_obs_frame ("eef" | "world")
         force_noise = torch.randn((self.num_envs, 3), device=self.device) * float(self.cfg.obs_rand.ft_force)
 
         tnf = self.desired_force[:, None]  # per-episode desired normal force (the force target)

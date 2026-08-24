@@ -258,6 +258,14 @@ class FlatSurfaceFollowTask(ForgeTask):
     # matrix, EMA'd, exposed as env.contact_force_world_ema); "wrist_ft" = the FR3 wrist F/T reaction
     # (force_sensor_world_smooth). "oracle" also hard-requires the wrapper (no silent fallback).
     force_source: str = "oracle"
+    # Reference frame the ft_force / ft_torque_eef OBSERVATION (policy + critic) is expressed in.
+    # The raw wrist sensor (get_link_incoming_joint_force) is reported in the sensor's BODY-LOCAL
+    # frame; _wrench_obs converts it to world using the sensor body's world orientation, then:
+    #   "eef"   -> rotate into the fingertip (EEF) frame => BODY-FIXED force, independent of the
+    #              world/plate orientation (the tool-frame force the policy acts in). [default]
+    #   "world" -> keep world axes => the force in the fixed world frame.
+    # (This ONLY changes the observation frame; the reward/break force_source path is unaffected.)
+    force_obs_frame: str = "eef"
     # Compliant (soft) contact on the plate + peg: k>0 replaces PhysX's rigid non-penetration
     # constraint with a spring-damper (F = k*penetration + d*penetration_rate), smoothing the contact
     # impulse chatter. 0 = rigid (default / prior behavior). Applied to both contacting materials.
