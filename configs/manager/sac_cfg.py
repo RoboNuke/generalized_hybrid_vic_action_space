@@ -192,6 +192,17 @@ class SAC_CFG(AgentCfg):
     The entropy optimizer is intentionally excluded — pulling log_alpha toward 0
     has no principled meaning. Set to 0.0 to disable (equivalent to Adam)."""
 
+    lr_schedule: str = "constant"
+    """Built-in actor+critic learning-rate schedule. ``"constant"`` (default) keeps the
+    LRs fixed (today's behavior). ``"cosine"`` decays actor_lr/critic_lr from their initial
+    value to :attr:`lr_end` on a cosine schedule over training (FlashSAC uses 3e-4->1.5e-4).
+    T_max is derived automatically from the run length. Ignored if an explicit
+    :attr:`learning_rate_scheduler` is provided (that takes precedence)."""
+
+    lr_end: float = 1.5e-4
+    """Final learning rate for ``lr_schedule="cosine"`` (CosineAnnealingLR ``eta_min``).
+    Applies to the actor and critic optimizers; the entropy LR is left constant."""
+
     learning_rate_scheduler: type | tuple[type | None, type | None, type | None] | None = None
     """Learning rate scheduler class for the actor and critic networks, and entropy coefficient.
 
@@ -281,6 +292,43 @@ class SAC_CFG(AgentCfg):
 
     mixed_precision: bool = False
     """Whether to enable automatic mixed precision for higher performance."""
+
+    # ------------------------------------------------------------------
+    # FlashSAC knobs (only honored when model_cfg.architecture == "flashsac";
+    # all default to the vanilla-SAC behavior so existing configs are unaffected).
+    # ------------------------------------------------------------------
+    reward_scaling_enabled: bool = False
+    """FlashSAC adaptive reward scaling (Eq. 6): divide sampled rewards by
+    ``max(sqrt(running_return_var + eps), G_r_max / g_max)``. Off = no scaling."""
+    reward_scaling_g_max: float = 5.0
+    """``G_max`` in the Eq. 6 denominator. Must equal ``model_cfg.critic.v_max`` so the
+    normalized returns land inside the categorical support (validated in the runner)."""
+    reward_scaling_eps: float = 1e-8
+    """Numerical epsilon under the variance sqrt in Eq. 6."""
+
+    weight_norm_enabled: bool = False
+    """FlashSAC weight normalization: after each optimizer step, project every linear's
+    output rows onto the unit sphere and every norm param vector to sqrt(d)."""
+
+    noise_repeat_enabled: bool = False
+    """FlashSAC noise repetition: hold the policy's sampling noise for k consecutive
+    rollout steps, k ~ truncated Zeta. Off = fresh reparameterized sample each step."""
+    noise_repeat_zeta_mu: float = 2.0
+    """Zeta exponent for the repeat-length distribution (pmf ~ k^-mu)."""
+    noise_repeat_max: int = 16
+    """Maximum repeat length (Zeta truncation)."""
+
+    actor_update_period: int = 1
+    """Update the actor (and entropy coefficient) once every N gradient steps
+    (FlashSAC delays it, e.g. 2). 1 = every step (vanilla SAC)."""
+
+    target_entropy_mode: str = "neg_action_dim"
+    """How the automatic-entropy target is set (when ``learn_entropy`` and
+    ``target_entropy`` is null). ``"neg_action_dim"`` (default) = ``-|A|`` (today's
+    behavior). ``"unified"`` = FlashSAC's ``0.5*|A|*log(2*pi*e*sigma^2)`` using
+    ``entropy_sigma_target``."""
+    entropy_sigma_target: float = 0.15
+    """Per-dimension action std defining the unified entropy target (FlashSAC)."""
 
     periodic_reset_enabled: bool = False
     """SimBa-style periodic parameter reset (primacy-bias / plasticity-loss mitigation). When True,

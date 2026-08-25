@@ -278,6 +278,7 @@ def main(argv: list[str] | None = None) -> None:
         HybridControlBlockSimBaActor,
     )
     from learning.sac import SAC
+    from learning.flash_sac_agent import FlashSAC
     from learning.ppo import PPO
     from learning.losses import AuxLossManager
     from configs.manager import ConfigManager
@@ -469,11 +470,50 @@ def main(argv: list[str] | None = None) -> None:
     # Critic input space: state_space when asymmetric, else obs_space.
     critic_input_space = state_space if state_space is not None else obs_space
 
+    if model_cfg.architecture not in ("simba", "flashsac"):
+        raise ValueError(
+            f"model_cfg.architecture must be 'simba' or 'flashsac', got {model_cfg.architecture!r}"
+        )
+
     # Actor: hybrid control types get the selection-gated HybridControlBlockSimBaActor
     # (product / match), otherwise the plain squashed-Gaussian actor. Wrapped in a factory so
     # SimBa periodic resets (sac_cfg.periodic_reset_*) can rebuild fresh, identically-constructed
     # models mid-training (see learning/sac.py::_periodic_reset).
     def make_models():
+        if model_cfg.architecture == "flashsac":
+            # FlashSAC networks (block-parallel across agents), self-contained in
+            # models/flash_sac.py. Force-free continuous control only for now.
+            from models.flash_sac import FlashCategoricalQCritic, FlashSimBaActor
+            if agent_type != "sac":
+                raise ValueError("model_cfg.architecture='flashsac' requires runner_cfg.agent_type='sac'.")
+            if ctrl_wrapper is not None and any(len(x) for x in ctrl_wrapper.policy_selection_layout):
+                raise NotImplementedError(
+                    "FlashSAC currently supports force-free (continuous) control only; the active "
+                    "control wrapper requests selection/force dims (use_hybrid_force / force_axes)."
+                )
+            policy = FlashSimBaActor(
+                observation_space=obs_space,
+                action_space=act_space,
+                device=device,
+                num_agents=n_agents,
+                **actor_kwargs,
+            )
+
+            def make_q():
+                return FlashCategoricalQCritic(
+                    observation_space=critic_input_space,
+                    action_space=act_space,
+                    device=device,
+                    num_agents=n_agents,
+                    **critic_kwargs,
+                )
+            return {
+                "policy": policy,
+                "critic_1": make_q(),
+                "critic_2": make_q(),
+                "target_critic_1": make_q(),
+                "target_critic_2": make_q(),
+            }
         if ctrl_wrapper is not None:
             sel_dims, pos_dims, force_dims = ctrl_wrapper.policy_selection_layout
             policy = HybridControlBlockSimBaActor(
@@ -709,7 +749,10 @@ def main(argv: list[str] | None = None) -> None:
     # what ConfigManager.dump writes to runtime_config.yaml below (nothing mutates
     # `loaded` in between), so wandb.config and that file carry identical parameters.
     run_config = ConfigManager.to_serializable(loaded)
-    agent_cls = SAC if agent_type == "sac" else PPO
+    if agent_type == "sac":
+        agent_cls = FlashSAC if model_cfg.architecture == "flashsac" else SAC
+    else:
+        agent_cls = PPO
     agent = agent_cls(
         models=models,
         memory=memory,

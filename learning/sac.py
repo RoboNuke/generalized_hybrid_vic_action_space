@@ -176,6 +176,13 @@ class SAC(BlockAgent):
                     self.critic_optimizer, **self.cfg.learning_rate_scheduler_kwargs[1]
                 )
 
+        # Built-in cosine LR schedule (cfg.lr_schedule="cosine"): built lazily on the
+        # first update() once the total run length is known (T_max derived from it). Only
+        # fills scheduler slots left None by cfg.learning_rate_scheduler — an explicit
+        # scheduler wins. Default "constant" => flags inert, behavior unchanged.
+        self._cosine_lr = str(getattr(self.cfg, "lr_schedule", "constant")).lower() == "cosine"
+        self._lr_built = False
+
         # set up target networks
         if self.target_critic_1 is not None and self.target_critic_2 is not None:
             self.target_critic_1.freeze_parameters(True)
@@ -263,7 +270,7 @@ class SAC(BlockAgent):
         # self.ema_actions / the base env's self.actions) splice in-place across
         # steps, growing an unbounded graph that OOMs the GPU after a few thousand steps.
         with torch.no_grad(), torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
-            actions, outputs = self.policy.act(inputs, role="policy")
+            actions, outputs = self._sample_rollout_action(inputs, timestep=timestep)
         return actions, outputs
 
     def record_transition(
@@ -294,6 +301,11 @@ class SAC(BlockAgent):
             rewards=rewards, terminated=terminated, truncated=truncated, infos=infos,
             observations=observations, actions=actions, states=states,
         )
+
+        # Rollout hook for running reward/return statistics (base: no-op). FlashSAC's
+        # adaptive reward scaling accumulates the per-env discounted return here from RAW
+        # rewards, mirroring the ordering of the reward-shaper applied below.
+        self._update_return_stats(rewards=rewards, terminated=terminated, truncated=truncated)
 
         if self.training:
             if self.cfg.rewards_shaper is not None:
@@ -408,6 +420,14 @@ class SAC(BlockAgent):
             self.critic_scheduler = self.cfg.learning_rate_scheduler[1](
                 self.critic_optimizer, **self.cfg.learning_rate_scheduler_kwargs[1]
             )
+        # Cosine LR (built lazily): drop the stale schedulers bound to the old optimizers so
+        # they rebuild against the fresh ones on the next update.
+        if self._cosine_lr:
+            if self.cfg.learning_rate_scheduler[0] is None:
+                self.policy_scheduler = None
+            if self.cfg.learning_rate_scheduler[1] is None:
+                self.critic_scheduler = None
+            self._lr_built = False
 
         # reset entropy coefficient + its optimizer (part of "the entire network and optimizer").
         self._entropy_coefficient = torch.full(
@@ -422,6 +442,116 @@ class SAC(BlockAgent):
             )
 
     # --------------------------------------------------------------
+    # Overridable update/rollout hooks
+    #
+    # These isolate the steps FlashSAC needs to change from the shared SAC loop.
+    # Every base implementation reproduces today's SAC behavior verbatim, so the
+    # SimBa path is numerically unchanged; ``FlashSAC(SAC)`` overrides only these.
+    # --------------------------------------------------------------
+    def _sample_rollout_action(self, inputs: dict, *, timestep: int):
+        """Rollout action sampling. Base: stochastic squashed-Gaussian policy sample.
+
+        Called inside ``act()``'s ``no_grad``+autocast context. FlashSAC overrides this
+        with temporally-correlated noise repetition.
+        """
+        return self.policy.act(inputs, role="policy")
+
+    def _should_update_actor(self, gradient_step: int) -> bool:
+        """Actor/entropy update gate. Base: update every gradient step. FlashSAC delays
+        the actor (``actor_update_period``)."""
+        return True
+
+    def _post_optimizer_step(self) -> None:
+        """Hook run after both optimizer steps and the target-network update, once per
+        gradient step. Base: no-op. FlashSAC projects weights onto the unit sphere."""
+        pass
+
+    def _update_return_stats(self, *, rewards, terminated, truncated) -> None:
+        """Rollout hook (from ``record_transition``) to update running reward/return
+        statistics. Base: no-op. FlashSAC accumulates the discounted-return variance
+        used by adaptive reward scaling."""
+        pass
+
+    def _compute_critic_loss(
+        self, *, sampled, inputs, next_inputs, critic_inputs, critic_next_inputs, B
+    ):
+        """Critic loss. Base: min-twin bootstrapped target + MSE over both critics.
+
+        Runs inside the caller's autocast context. Returns
+        ``(critic_loss, critic_1_values, critic_2_values, target_values)``.
+        """
+        sampled_actions = sampled["actions"]
+        sampled_rewards = sampled["rewards"]
+        sampled_terminated = sampled["terminated"]
+
+        with torch.no_grad():
+            next_actions, outputs = self.policy.act(next_inputs, role="policy")
+            next_log_prob = outputs["log_prob"]
+
+            target_q1_values, _ = self.target_critic_1.act(
+                {**critic_next_inputs, "taken_actions": next_actions}, role="target_critic_1"
+            )
+            target_q2_values, _ = self.target_critic_2.act(
+                {**critic_next_inputs, "taken_actions": next_actions}, role="target_critic_2"
+            )
+            ent_flat = self._expand_per_agent(self._entropy_coefficient, B)  # (N*B, 1)
+            target_q_values = torch.min(target_q1_values, target_q2_values) - ent_flat * next_log_prob
+            target_values = (
+                sampled_rewards
+                + self.cfg.discount_factor * sampled_terminated.logical_not() * target_q_values
+            )
+
+        critic_1_values, _ = self.critic_1.act({**critic_inputs, "taken_actions": sampled_actions}, role="critic_1")
+        critic_2_values, _ = self.critic_2.act({**critic_inputs, "taken_actions": sampled_actions}, role="critic_2")
+
+        critic_loss = (
+            F.mse_loss(critic_1_values, target_values) + F.mse_loss(critic_2_values, target_values)
+        ) / 2
+        return critic_loss, critic_1_values, critic_2_values, target_values
+
+    def _compute_actor_loss(self, *, sampled, inputs, critic_inputs, B):
+        """Actor loss. Base: ``alpha*log_pi - min(Q1_pi, Q2_pi)``.
+
+        Runs inside the caller's autocast context. Returns
+        ``(policy_loss, actions, log_prob, critic_1_pi, critic_2_pi, outputs, ent_flat)``.
+        """
+        actions, outputs = self.policy.act(inputs, role="policy")
+        log_prob = outputs["log_prob"]
+        # Critic Q for the policy gradient: actor uses obs, critic uses state.
+        critic_1_pi, _ = self.critic_1.act({**critic_inputs, "taken_actions": actions}, role="critic_1")
+        critic_2_pi, _ = self.critic_2.act({**critic_inputs, "taken_actions": actions}, role="critic_2")
+
+        ent_flat = self._expand_per_agent(self._entropy_coefficient, B)  # detached, no grad
+        policy_loss = (ent_flat * log_prob - torch.min(critic_1_pi, critic_2_pi)).mean()
+        return policy_loss, actions, log_prob, critic_1_pi, critic_2_pi, outputs, ent_flat
+
+    def _build_cosine_lr(self, timesteps: int) -> None:
+        """Build CosineAnnealingLR for the actor+critic, decaying their LR to ``cfg.lr_end``.
+
+        ``scheduler.step()`` runs once per gradient step, only after ``learning_starts``, so
+        ``T_max`` = ``(timesteps - learning_starts) * gradient_steps``. Only fills scheduler
+        slots left None by ``cfg.learning_rate_scheduler`` (explicit schedulers win). The
+        entropy LR is intentionally left constant."""
+        from torch.optim.lr_scheduler import CosineAnnealingLR
+
+        update_steps = max(1, int(timesteps) - int(self.cfg.learning_starts))
+        T_max = max(1, update_steps * int(self.cfg.gradient_steps))
+        if self.policy_scheduler is None:
+            self.policy_scheduler = CosineAnnealingLR(
+                self.policy_optimizer, T_max=T_max, eta_min=self.cfg.lr_end
+            )
+        if self.critic_scheduler is None:
+            self.critic_scheduler = CosineAnnealingLR(
+                self.critic_optimizer, T_max=T_max, eta_min=self.cfg.lr_end
+            )
+        print(
+            f"[sac] cosine LR: T_max={T_max} (timesteps={timesteps}, "
+            f"gradient_steps={self.cfg.gradient_steps}, learning_starts={self.cfg.learning_starts}); "
+            f"actor {self.cfg.actor_lr}->{self.cfg.lr_end}, critic {self.cfg.critic_lr}->{self.cfg.lr_end}",
+            flush=True,
+        )
+
+    # --------------------------------------------------------------
     # Update
     # --------------------------------------------------------------
     def update(self, *, timestep: int, timesteps: int) -> None:
@@ -430,6 +560,11 @@ class SAC(BlockAgent):
         # batch_size argument as per-agent and internally returns N * batch_size
         # rows partitioned [agent0 | agent1 | ...].
         B = self.cfg.batch_size
+
+        # Lazily build the cosine LR schedulers now that the total run length is known.
+        if self._cosine_lr and not self._lr_built:
+            self._build_cosine_lr(timesteps)
+            self._lr_built = True
 
         for gradient_step in range(self.cfg.gradient_steps):
             sampled_list = self.memory.sample(
@@ -463,29 +598,17 @@ class SAC(BlockAgent):
                     critic_inputs = inputs
                     critic_next_inputs = next_inputs
 
-                with torch.no_grad():
-                    next_actions, outputs = self.policy.act(next_inputs, role="policy")
-                    next_log_prob = outputs["log_prob"]
-
-                    target_q1_values, _ = self.target_critic_1.act(
-                        {**critic_next_inputs, "taken_actions": next_actions}, role="target_critic_1"
-                    )
-                    target_q2_values, _ = self.target_critic_2.act(
-                        {**critic_next_inputs, "taken_actions": next_actions}, role="target_critic_2"
-                    )
-                    ent_flat = self._expand_per_agent(self._entropy_coefficient, B)  # (N*B, 1)
-                    target_q_values = torch.min(target_q1_values, target_q2_values) - ent_flat * next_log_prob
-                    target_values = (
-                        sampled_rewards
-                        + self.cfg.discount_factor * sampled_terminated.logical_not() * target_q_values
-                    )
-
-                critic_1_values, _ = self.critic_1.act({**critic_inputs, "taken_actions": sampled_actions}, role="critic_1")
-                critic_2_values, _ = self.critic_2.act({**critic_inputs, "taken_actions": sampled_actions}, role="critic_2")
-
-                critic_loss = (
-                    F.mse_loss(critic_1_values, target_values) + F.mse_loss(critic_2_values, target_values)
-                ) / 2
+                # Critic loss hook (base: min-twin bootstrapped target + MSE over both
+                # critics). FlashSAC overrides this with the cross-batch categorical
+                # (distributional) critic loss. Runs inside this autocast context.
+                critic_loss, critic_1_values, critic_2_values, target_values = self._compute_critic_loss(
+                    sampled=sampled,
+                    inputs=inputs,
+                    next_inputs=next_inputs,
+                    critic_inputs=critic_inputs,
+                    critic_next_inputs=critic_next_inputs,
+                    B=B,
+                )
 
                 # ---- additional (auxiliary) critic-target losses ----
                 # Optional extra losses configured via loss_cfg and built into the
@@ -529,76 +652,84 @@ class SAC(BlockAgent):
                 )
             self.scaler.step(self.critic_optimizer)
 
-            with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
-                actions, outputs = self.policy.act(inputs, role="policy")
-                log_prob = outputs["log_prob"]
-                # Critic Q for the policy gradient: actor uses obs, critic uses state.
-                critic_1_pi, _ = self.critic_1.act({**critic_inputs, "taken_actions": actions}, role="critic_1")
-                critic_2_pi, _ = self.critic_2.act({**critic_inputs, "taken_actions": actions}, role="critic_2")
-
-                ent_flat = self._expand_per_agent(self._entropy_coefficient, B)  # detached, no grad
-                policy_loss = (ent_flat * log_prob - torch.min(critic_1_pi, critic_2_pi)).mean()
-
-                # ---- additional (auxiliary) policy-target losses ----
-                # Mirror of the critic-side hook above, on the policy side: fold
-                # any policy-target aux losses into policy_loss inside the autocast
-                # block, before the policy backward/step below, so their gradients
-                # reach the actor on the same step. The freshly re-sampled `actions`
-                # / `log_prob` (grad-carrying) are passed in the context — e.g. the
-                # built-in ActionL2Loss differentiates through `actions`.
-                # `aux_policy_raw` is {} unless a loss targets the policy.
-                aux_policy_raw: dict[str, torch.Tensor] = {}
-                if self._aux_losses is not None and self._aux_losses.has_target("policy"):
-                    aux_total, aux_policy_raw = self._aux_losses.compute(
-                        LossContext(
-                            agent=self,
-                            target="policy",
-                            sampled=sampled,
-                            actions=actions,
-                            log_prob=log_prob,
-                            policy_outputs=outputs,
-                            inputs=inputs,
-                        ),
-                        "policy",
-                    )
-                    policy_loss = policy_loss + aux_total
-
-            self.policy_optimizer.zero_grad()
-            self.scaler.scale(policy_loss).backward()
-            if config.torch.is_distributed:
-                self.policy.reduce_parameters()
-            # Unscale unconditionally so the per-agent grad-norm slices we
-            # capture below reflect true (un-amped) magnitudes. If mixed
-            # precision is off the scaler is a no-op; if on, scaler.step()
-            # detects the prior unscale and skips a redundant pass.
-            self.scaler.unscale_(self.policy_optimizer)
-            if self.write_interval > 0:
-                self._last_action_head_grad_norm = self._compute_actor_head_grad_norm()
-            if self.cfg.grad_norm_clip > 0:
-                nn.utils.clip_grad_norm_(self.policy.parameters(), self.cfg.grad_norm_clip)
-            self.scaler.step(self.policy_optimizer)
-
-            # per-agent entropy step
-            if self.cfg.learn_entropy:
+            # Actor + entropy update, gated by the actor-update hook (base: every step;
+            # FlashSAC delays it — actor_update_period). When skipped, the actor
+            # locals stay None and the actor-dependent logging below is skipped.
+            actor_ran = self._should_update_actor(gradient_step)
+            actions = log_prob = critic_1_pi = critic_2_pi = outputs = ent_flat = None
+            entropy_loss_per_agent = None
+            aux_policy_raw: dict[str, torch.Tensor] = {}
+            if actor_ran:
                 with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
-                    log_prob_per_agent = log_prob.view(N, B, 1).mean(dim=1)  # (N, 1)
-                    entropy_loss_per_agent = -(
-                        self.log_entropy_coefficient
-                        * (log_prob_per_agent + self._target_entropy).detach()
-                    )  # (N, 1)
-                    entropy_loss = entropy_loss_per_agent.sum()
+                    # Actor loss hook (base: alpha*logpi - min(Q1_pi, Q2_pi)). FlashSAC
+                    # overrides with the cross-batch actor forward + expected-value Q.
+                    (policy_loss, actions, log_prob, critic_1_pi, critic_2_pi,
+                     outputs, ent_flat) = self._compute_actor_loss(
+                        sampled=sampled, inputs=inputs, critic_inputs=critic_inputs, B=B,
+                    )
 
-                self.entropy_optimizer.zero_grad()
-                self.scaler.scale(entropy_loss).backward()
-                self.scaler.step(self.entropy_optimizer)
+                    # ---- additional (auxiliary) policy-target losses ----
+                    # Fold any policy-target aux losses into policy_loss inside the
+                    # autocast block, before the policy backward/step below, so their
+                    # gradients reach the actor on the same step. The freshly re-sampled
+                    # `actions` / `log_prob` (grad-carrying) are passed in the context —
+                    # e.g. the built-in ActionL2Loss differentiates through `actions`.
+                    # `aux_policy_raw` stays {} unless a loss targets the policy.
+                    if self._aux_losses is not None and self._aux_losses.has_target("policy"):
+                        aux_total, aux_policy_raw = self._aux_losses.compute(
+                            LossContext(
+                                agent=self,
+                                target="policy",
+                                sampled=sampled,
+                                actions=actions,
+                                log_prob=log_prob,
+                                policy_outputs=outputs,
+                                inputs=inputs,
+                            ),
+                            "policy",
+                        )
+                        policy_loss = policy_loss + aux_total
 
-                self._entropy_coefficient = torch.exp(self.log_entropy_coefficient.detach())  # (N, 1)
+                self.policy_optimizer.zero_grad()
+                self.scaler.scale(policy_loss).backward()
+                if config.torch.is_distributed:
+                    self.policy.reduce_parameters()
+                # Unscale unconditionally so the per-agent grad-norm slices we
+                # capture below reflect true (un-amped) magnitudes. If mixed
+                # precision is off the scaler is a no-op; if on, scaler.step()
+                # detects the prior unscale and skips a redundant pass.
+                self.scaler.unscale_(self.policy_optimizer)
+                if self.write_interval > 0:
+                    self._last_action_head_grad_norm = self._compute_actor_head_grad_norm()
+                if self.cfg.grad_norm_clip > 0:
+                    nn.utils.clip_grad_norm_(self.policy.parameters(), self.cfg.grad_norm_clip)
+                self.scaler.step(self.policy_optimizer)
+
+                # per-agent entropy step
+                if self.cfg.learn_entropy:
+                    with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
+                        log_prob_per_agent = log_prob.view(N, B, 1).mean(dim=1)  # (N, 1)
+                        entropy_loss_per_agent = -(
+                            self.log_entropy_coefficient
+                            * (log_prob_per_agent + self._target_entropy).detach()
+                        )  # (N, 1)
+                        entropy_loss = entropy_loss_per_agent.sum()
+
+                    self.entropy_optimizer.zero_grad()
+                    self.scaler.scale(entropy_loss).backward()
+                    self.scaler.step(self.entropy_optimizer)
+
+                    self._entropy_coefficient = torch.exp(self.log_entropy_coefficient.detach())  # (N, 1)
 
             self.scaler.update()
 
             # target networks
             self.target_critic_1.update_parameters(self.critic_1, polyak=self.cfg.polyak)
             self.target_critic_2.update_parameters(self.critic_2, polyak=self.cfg.polyak)
+
+            # Post-optimizer-step hook (base: no-op). FlashSAC projects each weight
+            # vector onto the unit-norm sphere and each norm param vector to sqrt(d).
+            self._post_optimizer_step()
 
             if self.policy_scheduler:
                 self.policy_scheduler.step()
@@ -610,9 +741,10 @@ class SAC(BlockAgent):
                 def split(t):  # (N*B, *) -> (N, B, -1)
                     return t.view(N, B, -1)
 
-                policy_terms = (ent_flat * log_prob - torch.min(critic_1_pi, critic_2_pi))
-                self.track_per_agent("Loss / Policy loss",
-                                     split(policy_terms).mean(dim=(1, 2)))
+                if actor_ran:
+                    policy_terms = (ent_flat * log_prob - torch.min(critic_1_pi, critic_2_pi))
+                    self.track_per_agent("Loss / Policy loss",
+                                         split(policy_terms).mean(dim=(1, 2)))
                 critic_loss_per_agent = 0.5 * (
                     F.mse_loss(split(critic_1_values), split(target_values), reduction="none").mean(dim=(1, 2))
                     + F.mse_loss(split(critic_2_values), split(target_values), reduction="none").mean(dim=(1, 2))
@@ -645,62 +777,65 @@ class SAC(BlockAgent):
                 self.track_per_agent("Target / Target (mean)", split(target_values).mean(dim=(1, 2)))
 
                 # Action diagnostics — surface tanh saturation and log_prob collapse.
-                with torch.no_grad():
-                    abs_a = actions.abs()
-                    saturation = (abs_a > 0.99).float()
-                self.track_per_agent("Action / |a| max",       split(abs_a).amax(dim=(1, 2)))
-                self.track_per_agent("Action / |a| mean",      split(abs_a).mean(dim=(1, 2)))
-                self.track_per_agent("Action / saturation rate", split(saturation).mean(dim=(1, 2)))
-                self.track_per_agent("Action / log_prob (mean)", split(log_prob).mean(dim=(1, 2)))
-
-                # Pose-action magnitude — the leading action dims are the raw, pre-scaled pose
-                # command (x, y, z, rx, ry, rz) the policy emits before the env rescales to
-                # physical units. Tracks the average magnitude and its spread per axis so we can
-                # see how hard the policy drives each pose channel independent of gain/gripper dims.
-                # The keypoint-servo wrapper can take over the leading pose dims (position, or
-                # position+orientation); the runner then sets ``_pose_axis_labels`` to just the pose
-                # axes the policy STILL emits (empty when all are servo-provided). Default to all 6,
-                # and clamp to the action width so this never indexes past a shrunk action vector.
-                pose_axes = getattr(self, "_pose_axis_labels", ("x", "y", "z", "rx", "ry", "rz"))
-                n_pose = min(len(pose_axes), abs_a.shape[-1])
-                if n_pose > 0:
+                # Guarded by actor_ran: on a delayed-actor step (FlashSAC) the actor
+                # locals (actions/log_prob/…) are None, so these are skipped.
+                if actor_ran:
                     with torch.no_grad():
-                        pose_abs_pa = split(abs_a[..., :n_pose])        # (N, B, n_pose)
-                    for i, axis in enumerate(pose_axes[:n_pose]):
-                        self.track_per_agent(f"Action / pose |{axis}| mean", pose_abs_pa[..., i].mean(dim=1))
-                        self.track_per_agent(f"Action / pose |{axis}| std",  pose_abs_pa[..., i].std(dim=1))
+                        abs_a = actions.abs()
+                        saturation = (abs_a > 0.99).float()
+                    self.track_per_agent("Action / |a| max",       split(abs_a).amax(dim=(1, 2)))
+                    self.track_per_agent("Action / |a| mean",      split(abs_a).mean(dim=(1, 2)))
+                    self.track_per_agent("Action / saturation rate", split(saturation).mean(dim=(1, 2)))
+                    self.track_per_agent("Action / log_prob (mean)", split(log_prob).mean(dim=(1, 2)))
 
-                # Continuous-action L2 norm — surfaces "do nothing" collapse.
-                # If the policy parks all continuous dims near 0 (e.g. when the
-                # entropy term dominates and the critic gradient is tiny), L2
-                # norm trends toward 0. Excluding Bernoulli dims keeps {-1,+1}
-                # gripper outputs from inflating the norm artificially.
-                cont_idx = getattr(self.policy, "_cont_action_idx", None)
-                if cont_idx is not None and cont_idx.numel() > 0:
-                    with torch.no_grad():
-                        cont_actions = actions.index_select(-1, cont_idx)   # (N*B, num_cont)
-                        cont_l2 = cont_actions.norm(dim=-1)                 # (N*B,)
-                        cont_l2_per_agent = cont_l2.view(N, -1)             # (N, B)
-                    self.track_per_agent("Action / continuous L2 (max)",  cont_l2_per_agent.amax(dim=1))
-                    self.track_per_agent("Action / continuous L2 (min)",  cont_l2_per_agent.amin(dim=1))
-                    self.track_per_agent("Action / continuous L2 (mean)", cont_l2_per_agent.mean(dim=1))
-                    self.track_per_agent("Action / continuous L2 (std)",  cont_l2_per_agent.std(dim=1))
+                    # Pose-action magnitude — the leading action dims are the raw, pre-scaled pose
+                    # command (x, y, z, rx, ry, rz) the policy emits before the env rescales to
+                    # physical units. Tracks the average magnitude and its spread per axis so we can
+                    # see how hard the policy drives each pose channel independent of gain/gripper dims.
+                    # The keypoint-servo wrapper can take over the leading pose dims (position, or
+                    # position+orientation); the runner then sets ``_pose_axis_labels`` to just the pose
+                    # axes the policy STILL emits (empty when all are servo-provided). Default to all 6,
+                    # and clamp to the action width so this never indexes past a shrunk action vector.
+                    pose_axes = getattr(self, "_pose_axis_labels", ("x", "y", "z", "rx", "ry", "rz"))
+                    n_pose = min(len(pose_axes), abs_a.shape[-1])
+                    if n_pose > 0:
+                        with torch.no_grad():
+                            pose_abs_pa = split(abs_a[..., :n_pose])        # (N, B, n_pose)
+                        for i, axis in enumerate(pose_axes[:n_pose]):
+                            self.track_per_agent(f"Action / pose |{axis}| mean", pose_abs_pa[..., i].mean(dim=1))
+                            self.track_per_agent(f"Action / pose |{axis}| std",  pose_abs_pa[..., i].std(dim=1))
 
-                # Gripper diagnostic — open rate is the headline metric. If it's
-                # stuck near 0 or 1 the gripper is locked and the agent can't grasp.
-                gidx = self.cfg.gripper_action_idx
-                if gidx is not None:
-                    with torch.no_grad():
-                        g = actions[..., gidx].unsqueeze(-1)         # (N*B, 1)
-                        g_open = (g >= 0).float()
-                    self.track_per_agent("Gripper / open rate",   split(g_open).mean(dim=(1, 2)))
-                    self.track_per_agent("Gripper / action mean", split(g).mean(dim=(1, 2)))
-                    self.track_per_agent("Gripper / action std",  split(g).flatten(1).std(dim=1))
+                    # Continuous-action L2 norm — surfaces "do nothing" collapse.
+                    # If the policy parks all continuous dims near 0 (e.g. when the
+                    # entropy term dominates and the critic gradient is tiny), L2
+                    # norm trends toward 0. Excluding Bernoulli dims keeps {-1,+1}
+                    # gripper outputs from inflating the norm artificially.
+                    cont_idx = getattr(self.policy, "_cont_action_idx", None)
+                    if cont_idx is not None and cont_idx.numel() > 0:
+                        with torch.no_grad():
+                            cont_actions = actions.index_select(-1, cont_idx)   # (N*B, num_cont)
+                            cont_l2 = cont_actions.norm(dim=-1)                 # (N*B,)
+                            cont_l2_per_agent = cont_l2.view(N, -1)             # (N, B)
+                        self.track_per_agent("Action / continuous L2 (max)",  cont_l2_per_agent.amax(dim=1))
+                        self.track_per_agent("Action / continuous L2 (min)",  cont_l2_per_agent.amin(dim=1))
+                        self.track_per_agent("Action / continuous L2 (mean)", cont_l2_per_agent.mean(dim=1))
+                        self.track_per_agent("Action / continuous L2 (std)",  cont_l2_per_agent.std(dim=1))
 
-                if self.cfg.learn_entropy:
-                    self.track_per_agent("Loss / Entropy loss", entropy_loss_per_agent.squeeze(-1))
-                    self.track_per_agent("Coefficient / Entropy coefficient",
-                                         self._entropy_coefficient.squeeze(-1))
+                    # Gripper diagnostic — open rate is the headline metric. If it's
+                    # stuck near 0 or 1 the gripper is locked and the agent can't grasp.
+                    gidx = self.cfg.gripper_action_idx
+                    if gidx is not None:
+                        with torch.no_grad():
+                            g = actions[..., gidx].unsqueeze(-1)         # (N*B, 1)
+                            g_open = (g >= 0).float()
+                        self.track_per_agent("Gripper / open rate",   split(g_open).mean(dim=(1, 2)))
+                        self.track_per_agent("Gripper / action mean", split(g).mean(dim=(1, 2)))
+                        self.track_per_agent("Gripper / action std",  split(g).flatten(1).std(dim=1))
+
+                    if self.cfg.learn_entropy:
+                        self.track_per_agent("Loss / Entropy loss", entropy_loss_per_agent.squeeze(-1))
+                        self.track_per_agent("Coefficient / Entropy coefficient",
+                                             self._entropy_coefficient.squeeze(-1))
 
                 # Action-head grad norm: an actor health metric under the
                 # actor diagnostics tab (Action / *). Tracked whenever the

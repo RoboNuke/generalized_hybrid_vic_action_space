@@ -97,8 +97,23 @@ class CriticCfg:
     critic_latent: int = 512
     clip_actions: bool = False
 
+    # --- FlashSAC distributional (categorical / C51) critic (architecture=flashsac only) ---
+    n_atoms: int = 101
+    """Number of atoms in the categorical value distribution (FlashSAC only)."""
+    v_min: float = -5.0
+    """Lower bound of the categorical support (FlashSAC only). Must equal the reward
+    scaler's ``reward_scaling_g_max`` (validated in the runner)."""
+    v_max: float = 5.0
+    """Upper bound of the categorical support (FlashSAC only)."""
+
 
 @dataclasses.dataclass(kw_only=True)
 class ModelCfg:
+    architecture: str = "simba"
+    """Which model family to build. ``"simba"`` (default) = today's ``BlockSimBa*``
+    networks + the vanilla ``SAC`` agent. ``"flashsac"`` = the ``Flash*`` networks
+    (BatchNorm/RMSNorm inverted-residual backbone, state-dependent std, categorical
+    critic) + the ``FlashSAC`` agent. Selected by the runner; anything else is an error."""
+
     actor: ActorCfg = dataclasses.field(default_factory=ActorCfg)
     critic: CriticCfg = dataclasses.field(default_factory=CriticCfg)

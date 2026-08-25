@@ -1,0 +1,67 @@
+# _record.yaml — per-agent recorder OVERLAY for fixed_angle_peg_FORGE.
+#
+# NOT a standalone config. It is deep-merged over a trained agent's snapshotted
+# config (<agent_dir>/config.yaml) by the per-agent recorder. The recorder forces
+# num_agents=1 and loads ONLY that agent's weights, so the rollout, the twin
+# critics behind the V-Est overlay, and the output GIF are all agent-specific.
+#
+# Typical use (one agent):
+#   python learning/record.py \
+#     --agent_dir runs/log_dir/1_fixed/0 \
+#     --record_config configs/exp_cfgs/fixed_angle_peg_FORGE/_record.yaml --headless
+#
+# Bulk: launchers/record_experiment.bash (all agents of one run) and
+#       launchers/record_group.bash (all runs under a log dir).
+
+# Coordinate-frame axis markers drawn into the recorded video. Each is independent;
+# flip any of the visualize_* flags to false to hide it, and tune its *_axis_scale
+# (meters) separately. The rotated stiffness frame only appears when the agent's
+# gain_mapping is "rotated" (otherwise it is silently skipped); the peg-tip and EEF
+# frames appear in any mode. The peg-tip position comes from the env's own held-asset
+# base frame (task/FORGE offsets included) — no offset to configure here.
+controller_cfg:
+  visualize_rotation_frame: true        # rotation R, at the peg tip (rotated mode only)
+  rotation_frame_axis_scale: 0.02
+  visualize_peg_tip_frame: false         # peg's own orientation, at the peg tip
+  peg_tip_frame_axis_scale: 0.02
+  visualize_eef_frame: false             # actual fingertip (EEF) orientation, at the robot EEF
+  eef_frame_axis_scale: 0.02
+
+  visualize_stiffness_ellipsoid: false   # translational stiffness ellipsoid (eigendecomp of K_pos)
+  stiffness_ellipsoid_min_scale: 0.001  # 0.2 cm semi-axis at the min gain
+  stiffness_ellipsoid_max_scale: 0.01   # 2 cm   semi-axis at the max gain
+  stiffness_ellipsoid_compliance: false # false=stiffness (stiff=long), true=compliance (stiff=short)
+  stiffness_ellipsoid_opacity: 0.95     # surface opacity [0..1]; lower = more see-through
+
+runner_cfg:
+  # num_agents is forced to 1 by record mode regardless of this value; pinned here
+  # for clarity (one agent's slice is loaded into a single-agent run).
+  num_agents: 1
+  # Parallel rollout width = number of camera tiles rendered per step (total scene
+  # envs, since num_agents=1). 12 keeps the per-step GPU/camera load modest while
+  # still filling the 3x4 grid from a single episode. Raise for more parallelism
+  # (fewer episodes) at the cost of more simultaneous camera tiles.
+  num_envs: 24
+  # Eval never samples the replay buffer, so keep it tiny.
+  memory_size: 50_000
+
+sac_cfg:
+  recorder:
+    enabled: true                   # triggers TiledCamera injection in build_env
+    video_format: mp4               # H.264 mp4 (compact, smooth). Use "gif" only if needed.
+    # Collect at least this many COMPLETE trajectories, then pick best-4 / median-4
+    # / worst-4 by return for the grid. The recorder runs ceil(num_trajectories /
+    # num_envs) full episodes (here 24/24 = 1) and selects 12 from the 24 collected.
+    # All collected frame buffers are held in host RAM, so this scales memory linearly;
+    # 24 keeps it safe at the larger tiles. Raise only with memory headroom.
+    num_trajectories: 48
+    width: 560                      # per-tile RGB width  (2.5x of 240, 4:3 preserved)
+    height: 720                     # per-tile RGB height (2.5x of 180, 4:3 preserved)
+    camera_pos: [1.0, 0.0, 0.35]
+    camera_quat: [-0.3535534, 0.6123724, 0.6123724, -0.3535534]
+    focal_length: 24.0
+    focus_distance: 0.05
+    horizontal_aperture: 20.955
+    clipping_range: [0.1, 20.0]
+    fps: 30
+    output_subdir: videos           # GIF -> <agent_dir>/videos/recording.gif
