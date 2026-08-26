@@ -220,15 +220,20 @@ class FlashSimBaActor(GaussianMixin, Model):
         self.mean_w = BlockUnitLinear(num_agents, actor_latent, self.num_actions, bias=True).to(device)
         self.logstd_w = BlockUnitLinear(num_agents, actor_latent, self.num_actions, bias=True).to(device)
 
-        # Initial exploration: bias the (state-dependent) log-std head so the policy STARTS at
-        # sigma ~= act_init_std (clamped to [min_log_std, max_log_std]), matching SimBa's initial
-        # sigma. Without this the tanh-map starts at its midpoint (sigma ~= 0.003), i.e. nearly
-        # deterministic. We set only the head BIAS (kept out of weight normalization), so state
-        # dependence is retained but centered on the target sigma. target_log_std -> raw bias via
-        # the inverse tanh map: L = min + (max-min)*0.5*(1+tanh(b)).
+        # Initial exploration: bias the (state-dependent) log-std head so the policy STARTS with a
+        # meaningful sigma (target ~= act_init_std, clamped to [min_log_std, max_log_std]) instead
+        # of the tanh-map midpoint (sigma ~= 0.003, near-deterministic). We set only the head BIAS
+        # (kept out of weight normalization), so state dependence is retained.
+        #
+        # CRUCIAL: the head passes through a tanh map (L = min + (max-min)*0.5*(1+tanh(b))). If the
+        # target sits AT the ceiling (e.g. act_init_std hitting max_log_std), the required bias lands
+        # deep in tanh's saturated tail where the gradient ~ 0, so sigma FREEZES at the ceiling and
+        # can never adapt (this caused constant max-sigma "chaotic" actions). So we clamp the init
+        # into the RESPONSIVE band of the tanh (|tanh| <= 0.9, grad >= ~0.18); under a -1.5 cap this
+        # tops out at sigma ~= 0.15 (== the entropy target) rather than the 0.22 ceiling.
         _L = min(max(math.log(max(float(act_init_std), 1e-8)), min_log_std), max_log_std)
         _span = max(max_log_std - min_log_std, 1e-8)
-        _t = max(min(2.0 * (_L - min_log_std) / _span - 1.0, 0.999), -0.999)
+        _t = max(min(2.0 * (_L - min_log_std) / _span - 1.0, 0.9), -0.9)
         _bias0 = math.atanh(_t)
         with torch.no_grad():
             if self.logstd_w.bias is not None:
