@@ -230,6 +230,9 @@ class FlashSAC(SAC):
         actions_all, out_all = self.policy.act({"observations": obs_all, "training": True}, role="policy")
         actions, _ = block_cross_split(actions_all, N)
         log_prob, _ = block_cross_split(out_all["log_prob"], N)
+        # Current-half deterministic action + log_std for the saturation/sigma diagnostics.
+        mean_actions_cur, _ = block_cross_split(out_all["mean_actions"], N)
+        log_std_cur, _ = block_cross_split(out_all["log_std"], N)
 
         # Q for the policy gradient: critic on current (state, actions), running stats
         # (training=False, no BN update). Gradient flows through `actions` into the policy.
@@ -240,7 +243,7 @@ class FlashSAC(SAC):
         ent_flat = self._expand_per_agent(self._entropy_coefficient, B)
         policy_loss = (ent_flat * log_prob - q).mean()
 
-        outputs = {"log_prob": log_prob, "mean_actions": None, "log_std": out_all.get("log_std")}
+        outputs = {"log_prob": log_prob, "mean_actions": mean_actions_cur, "log_std": log_std_cur}
         return policy_loss, actions, log_prob, q1, q2, outputs, ent_flat
 
     # ------------------------------------------------------------------

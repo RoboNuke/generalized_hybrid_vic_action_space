@@ -202,6 +202,8 @@ class FlashSimBaActor(GaussianMixin, Model):
         actor_latent: int = 128,
         min_log_std: float = -10.0,
         max_log_std: float = 2.0,
+        last_layer_scale: float = 1.0,
+        scale_down_action_dims: list[int] | None = None,
         **_ignored,
     ):
         Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
@@ -217,13 +219,29 @@ class FlashSimBaActor(GaussianMixin, Model):
         self.mean_w = BlockUnitLinear(num_agents, actor_latent, self.num_actions, bias=True).to(device)
         self.logstd_w = BlockUnitLinear(num_agents, actor_latent, self.num_actions, bias=True).to(device)
 
+        # Mean-head output scaling (SimBa's ``last_layer_scale``): shrink the action-mean
+        # output by this factor so typical/initial actions start small (reduces tanh
+        # saturation). Applied as a PERSISTENT forward-time multiply — NOT an init weight
+        # scaling — because weight normalization would otherwise re-normalize it away each
+        # step. ``scale_down_action_dims`` scales only those env-action indices (else all).
+        # A per-dim (num_actions,) constant vector; plain attribute (not a buffer) so it is
+        # not sliced/saved by the per-agent checkpoint helpers.
+        scale_vec = torch.ones(self.num_actions, device=device)
+        if last_layer_scale != 1.0:
+            if scale_down_action_dims:
+                idx = [d for d in scale_down_action_dims if 0 <= d < self.num_actions]
+                scale_vec[idx] = last_layer_scale
+            else:
+                scale_vec[:] = last_layer_scale
+        self._mean_scale = scale_vec  # (num_actions,), broadcasts over (N, ne, act)
+
         # For the SAC agent's continuous-L2 diagnostic (all dims are continuous here).
         self._cont_action_idx = torch.arange(self.num_actions, dtype=torch.long, device=device)
 
     def get_mean_and_std(self, obs: torch.Tensor, training: bool):
         num_envs = obs.size(0) // self.num_agents
         feat = self.backbone(obs, num_envs, training)          # (N, ne, hidden)
-        mean = self.mean_w(feat).reshape(-1, self.num_actions)  # (N*ne, act)
+        mean = (self.mean_w(feat) * self._mean_scale).reshape(-1, self.num_actions)  # (N*ne, act)
         raw_log_std = self.logstd_w(feat).reshape(-1, self.num_actions)
         # Bounded log_std via tanh map into [min, max] (FlashSAC NormalTanhPolicy).
         log_std = self.min_log_std + (self.max_log_std - self.min_log_std) * 0.5 * (1.0 + torch.tanh(raw_log_std))

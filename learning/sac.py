@@ -805,6 +805,25 @@ class SAC(BlockAgent):
                     self.track_per_agent("Action / saturation rate", split(saturation).mean(dim=(1, 2)))
                     self.track_per_agent("Action / log_prob (mean)", split(log_prob).mean(dim=(1, 2)))
 
+                    # Policy sigma + mean-action saturation — disentangle whether tanh
+                    # saturation is driven by a wide sampling sigma or a rail-pinned MEAN.
+                    # (`saturation rate` above is on the sampled action = mean + sigma noise;
+                    # `mean-action saturation` is on the deterministic tanh(mean).)
+                    _lstd = outputs.get("log_std") if isinstance(outputs, dict) else None
+                    if _lstd is not None:
+                        with torch.no_grad():
+                            _sig = _lstd.exp()
+                        self.track_per_agent("Action / sigma (mean)", split(_sig).mean(dim=(1, 2)))
+                        self.track_per_agent("Action / sigma (max)",  split(_sig).amax(dim=(1, 2)))
+                        self.track_per_agent("Action / log_std (mean)", split(_lstd).mean(dim=(1, 2)))
+                    _ma = outputs.get("mean_actions") if isinstance(outputs, dict) else None
+                    if _ma is not None:
+                        with torch.no_grad():
+                            _ma_abs = _ma.abs()
+                            _ma_sat = (_ma_abs > 0.99).float()
+                        self.track_per_agent("Action / mean-action saturation", split(_ma_sat).mean(dim=(1, 2)))
+                        self.track_per_agent("Action / mean |a| mean", split(_ma_abs).mean(dim=(1, 2)))
+
                     # Pose-action magnitude — the leading action dims are the raw, pre-scaled pose
                     # command (x, y, z, rx, ry, rz) the policy emits before the env rescales to
                     # physical units. Tracks the average magnitude and its spread per axis so we can
