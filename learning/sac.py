@@ -183,6 +183,14 @@ class SAC(BlockAgent):
         self._cosine_lr = str(getattr(self.cfg, "lr_schedule", "constant")).lower() == "cosine"
         self._lr_built = False
 
+        # Temperature (alpha) loss formulation (see cfg.entropy_loss_form). "log_alpha"
+        # (default) reproduces today's skrl form; "alpha" is FlashSAC's gentler form.
+        self._entropy_loss_form = str(getattr(self.cfg, "entropy_loss_form", "log_alpha")).lower()
+        if self._entropy_loss_form not in ("log_alpha", "alpha"):
+            raise ValueError(
+                f"entropy_loss_form must be 'log_alpha' or 'alpha', got {self.cfg.entropy_loss_form!r}"
+            )
+
         # set up target networks
         if self.target_critic_1 is not None and self.target_critic_2 is not None:
             self.target_critic_1.freeze_parameters(True)
@@ -709,10 +717,19 @@ class SAC(BlockAgent):
                 if self.cfg.learn_entropy:
                     with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
                         log_prob_per_agent = log_prob.view(N, B, 1).mean(dim=1)  # (N, 1)
-                        entropy_loss_per_agent = -(
-                            self.log_entropy_coefficient
-                            * (log_prob_per_agent + self._target_entropy).detach()
-                        )  # (N, 1)
+                        if self._entropy_loss_form == "alpha":
+                            # Form B (FlashSAC): loss = alpha * (H_hat - H_target), multiplier is
+                            # alpha = exp(log_alpha) (gradient flows through it). Gentle adaptation
+                            # (rate ~ alpha), so temperature stays near its init while small.
+                            entropy_loss_per_agent = torch.exp(self.log_entropy_coefficient) * (
+                                -log_prob_per_agent - self._target_entropy
+                            ).detach()  # (N, 1)
+                        else:
+                            # Form A (default, skrl): loss = -log_alpha * (log_pi + H_target).
+                            entropy_loss_per_agent = -(
+                                self.log_entropy_coefficient
+                                * (log_prob_per_agent + self._target_entropy).detach()
+                            )  # (N, 1)
                         entropy_loss = entropy_loss_per_agent.sum()
 
                     self.entropy_optimizer.zero_grad()

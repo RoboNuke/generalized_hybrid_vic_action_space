@@ -413,6 +413,15 @@ def main(argv: list[str] | None = None) -> None:
     actor_kwargs = dataclasses.asdict(model_cfg.actor)
     critic_kwargs = dataclasses.asdict(model_cfg.critic)
 
+    # n_atoms / v_min / v_max configure the FlashSAC categorical (C51) critic ONLY. The simba
+    # BlockSimBaQCritic (SAC) and BlockSimBaValueCritic (PPO) take no such kwargs, so strip them
+    # unless we're building the flashsac critic — otherwise a config that carries these fields
+    # (e.g. an agent_type=sac run whose saved CriticCfg still serialized the distributional
+    # defaults) raises "unexpected keyword argument 'n_atoms'" at model construction.
+    if model_cfg.architecture != "flashsac":
+        for _flash_only in ("n_atoms", "v_min", "v_max"):
+            critic_kwargs.pop(_flash_only, None)
+
     # disable_success_pred force-zeros the Forge success-prediction action (dim 6) so the actor
     # allocates no parameters to the inert head. build_env() has already validated the flag is
     # Forge-only (7-dim base action, index 6 = success prediction; survives the control-wrapper

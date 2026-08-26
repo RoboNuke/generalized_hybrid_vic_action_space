@@ -322,6 +322,18 @@ class SAC_CFG(AgentCfg):
     """Update the actor (and entropy coefficient) once every N gradient steps
     (FlashSAC delays it, e.g. 2). 1 = every step (vanilla SAC)."""
 
+    entropy_loss_form: str = "log_alpha"
+    """Temperature (alpha) loss formulation for automatic entropy tuning.
+
+    * ``"log_alpha"`` (default): ``loss = -log_alpha * (log_pi + H_target)`` — the standard
+      skrl/SAC form. The logalpha update rate is ``~(H_target - H_hat)``, independent of
+      alpha, so alpha adapts aggressively (today's behavior).
+    * ``"alpha"`` (FlashSAC): ``loss = alpha * (H_hat - H_target)`` with the multiplier being
+      ``alpha = exp(log_alpha)``. The logalpha update rate is ``~alpha*(H_target - H_hat)``,
+      so temperature adapts gently (near-frozen while alpha is small). Same fixed point.
+
+    Both reach ``H_hat = H_target`` at equilibrium; they differ only in adaptation dynamics."""
+
     target_entropy_mode: str = "neg_action_dim"
     """How the automatic-entropy target is set (when ``learn_entropy`` and
     ``target_entropy`` is null). ``"neg_action_dim"`` (default) = ``-|A|`` (today's

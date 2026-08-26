@@ -134,6 +134,7 @@ sac_cfg:
   grad_norm_clip: 1.0
   mixed_precision: false
   # ---- FlashSAC (Kim et al., 2026) ----
+  entropy_loss_form: alpha              # FlashSAC temperature form: loss = alpha*(H_hat - H_target)
   target_entropy_mode: unified          # H = 0.5*|A|*log(2*pi*e*sigma^2)
   entropy_sigma_target: 0.15
   reward_scaling_enabled: true          # adaptive reward scaling (Eq. 6); replaces rewards_shaper_scale
