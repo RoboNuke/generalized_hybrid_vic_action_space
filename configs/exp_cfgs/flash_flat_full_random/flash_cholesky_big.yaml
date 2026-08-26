@@ -1,7 +1,14 @@
-# FlashSAC variant of flat_full_random/VICES.yaml — same task + control identity
-# (gain_mapping=variable_diagonal), FlashSAC algorithm/model hyperparameters. Auto-derived; see docs/flashsac_plan.md.
-# Surface Path-Following experiment: simp_low-F_high-P (VICES / variable_diagonal).
-# Copied from glued_surface/2_VICES.yaml. Adds the knobs this sweep tunes, exposed at their
+# FlashSAC variant of flat_full_random/cholesky.yaml — same task + control identity
+# (gain_mapping=cholesky), FlashSAC algorithm/model hyperparameters. Auto-derived; see docs/flashsac_plan.md.
+# cholesky: identical to simp_low-F_high-P/VICES EXCEPT the stiffness formulation:
+# gain_mapping=cholesky — a variable SPD stiffness K with within-block axis COUPLING. With
+# full_gain_matrix=false the policy sets the POSITION 3x3 block (3 Cholesky-diagonal + 3
+# off-diagonal dims = 6 dims, same policy action width as VICES); the rotation block is held at
+# the constants. Cross term chol_offdiag_rho=1.0 (full correlation range; the other configs use 0.9).
+# All other settings (gains bounds, keypoint-servo, force/EMA, reward weights, 5 agents, 12_500 steps)
+# match the other methods.
+# Surface Path-Following experiment: simp_low-F_high-P (cholesky / SPD-coupled).
+# Copied from VICES.yaml. Adds the knobs this sweep tunes, exposed at their
 # DEFAULT values (flip/edit as needed): directional fragile peg (+ require-contact + reset-in-
 # contact), the keypoint-servo action override (target offsets + fixed EEF orientation), and
 # every surface reward-term weight. The cylinder's fixed grasp PITCH relative to the gripper
@@ -127,7 +134,7 @@ sac_cfg:
   random_timesteps: 0
   learning_starts: 300
   learn_entropy: true
-  initial_entropy_value: 0.01
+  initial_entropy_value: 0.05
   target_entropy: null
   grad_norm_clip: 1.0
   mixed_precision: false
@@ -151,7 +158,7 @@ sac_cfg:
     enabled: false
   experiment:
     directory: flat_scribing_fullgain_upright
-    experiment_name: "VICES"
+    experiment_name: "cholesky_big"
     write_interval: 75
     checkpoint_interval: auto
     wandb: true
@@ -164,11 +171,11 @@ model_cfg:
     act_init_std: 1.0
     selection_distribution: product
     actor_n: 2
-    actor_latent: 128
-    last_layer_scale: 0.1
+    actor_latent: 512
+    last_layer_scale: 1.0
     clip_log_std: true
     min_log_std: -10.0
-    max_log_std: 2.0
+    max_log_std: -1.5
     reduction: sum
     use_state_dependent_std: true
     bernoulli_action_dims: null
@@ -176,8 +183,8 @@ model_cfg:
     scale_down_action_dims: null   # apply last_layer_scale to ONLY the 6 pose deltas (3 pos + 3 orient); gain/selection dims stay unshrunk so they explore
   critic:
     critic_output_init_mean: 0.0
-    critic_n: 2
-    critic_latent: 256
+    critic_n: 4
+    critic_latent: 1024
     clip_actions: false
     # ---- FlashSAC distributional (categorical / C51) critic ----
     n_atoms: 101
@@ -201,7 +208,7 @@ controller_cfg:
   #                       (per block: 3 L-diagonal + 3 L-off-diagonal). D = zeros for now.
   # "rotated"           : diagonal K (6) + 6-D rotation vector (6) = 12 dims; R applied as
   #                       blkdiag(R,R) to the full 6x6.
-  gain_mapping: variable_diagonal #"constant" #
+  gain_mapping: cholesky
   #fixed_rotation_rpy: [0.0, 30.0, 0.0]   # stiffness-frame R; aligned to the 30deg grasp tilt (used only when gain_mapping=rotated)
 
   # Toggle force control. When false: NO selection/force-target dims, K_f = zeros, and
@@ -228,14 +235,14 @@ controller_cfg:
   # Cholesky-only: off-diagonal L entry = chol_offdiag_rho * sqrt(lo*hi) * clamp(a,-1,1).
   # 0.0 => diagonal-only (equivalent to variable_diagonal but with 12 dims). Increase to
   # allow within-block (translation- or rotation-) axis coupling.
-  chol_offdiag_rho: 0.9
+  chol_offdiag_rho: 1.0    # cross term = 1.0 (full correlation range; other configs use 0.9)
 
   # cholesky/rotated only: learn the full 6-DOF gain matrix (position + orientation)
   # instead of the translational 3x3 block alone. Changes action dim => re-tune
   # target_entropy if enabled.
   full_gain_matrix: true
-  # Declared for consistency across the flat_6d family; NO-OP for gain_mapping=variable_diagonal
-  # (VICES stiffness is already an axis-aligned diagonal in the control frame — no rotation R).
+  # Declared for consistency across the flat_6d family; NO-OP for gain_mapping=cholesky (the full
+  # SPD matrix has no shared rotation frame R to withhold from the orientation block).
   rotate_orientation_block: true
 
   # Full 3-DOF orientation control: command roll/pitch/yaw as a delta-axis-angle rotation

@@ -134,7 +134,7 @@ sac_cfg:
   random_timesteps: 0
   learning_starts: 300
   learn_entropy: true
-  initial_entropy_value: 0.01
+  initial_entropy_value: 0.05
   target_entropy: null
   grad_norm_clip: 1.0
   mixed_precision: false
@@ -172,10 +172,10 @@ model_cfg:
     selection_distribution: product
     actor_n: 2
     actor_latent: 128
-    last_layer_scale: 0.1
+    last_layer_scale: 1.0
     clip_log_std: true
     min_log_std: -10.0
-    max_log_std: 2.0
+    max_log_std: -1.5
     reduction: sum
     use_state_dependent_std: true
     bernoulli_action_dims: null

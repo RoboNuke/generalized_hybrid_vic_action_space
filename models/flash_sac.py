@@ -204,6 +204,7 @@ class FlashSimBaActor(GaussianMixin, Model):
         max_log_std: float = 2.0,
         last_layer_scale: float = 1.0,
         scale_down_action_dims: list[int] | None = None,
+        act_init_std: float = 1.0,
         **_ignored,
     ):
         Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
@@ -218,6 +219,20 @@ class FlashSimBaActor(GaussianMixin, Model):
         self.backbone = FlashBackbone(num_agents, self.num_observations, actor_latent, actor_n).to(device)
         self.mean_w = BlockUnitLinear(num_agents, actor_latent, self.num_actions, bias=True).to(device)
         self.logstd_w = BlockUnitLinear(num_agents, actor_latent, self.num_actions, bias=True).to(device)
+
+        # Initial exploration: bias the (state-dependent) log-std head so the policy STARTS at
+        # sigma ~= act_init_std (clamped to [min_log_std, max_log_std]), matching SimBa's initial
+        # sigma. Without this the tanh-map starts at its midpoint (sigma ~= 0.003), i.e. nearly
+        # deterministic. We set only the head BIAS (kept out of weight normalization), so state
+        # dependence is retained but centered on the target sigma. target_log_std -> raw bias via
+        # the inverse tanh map: L = min + (max-min)*0.5*(1+tanh(b)).
+        _L = min(max(math.log(max(float(act_init_std), 1e-8)), min_log_std), max_log_std)
+        _span = max(max_log_std - min_log_std, 1e-8)
+        _t = max(min(2.0 * (_L - min_log_std) / _span - 1.0, 0.999), -0.999)
+        _bias0 = math.atanh(_t)
+        with torch.no_grad():
+            if self.logstd_w.bias is not None:
+                self.logstd_w.bias.fill_(_bias0)
 
         # Mean-head output scaling (SimBa's ``last_layer_scale``): shrink the action-mean
         # output by this factor so typical/initial actions start small (reduces tanh

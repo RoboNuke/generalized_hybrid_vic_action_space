@@ -1,8 +1,8 @@
-# FlashSAC variant of flat_full_random/fixed_dyn.yaml — same task + control identity
+# FlashSAC variant of flat_full_random/GAS.yaml — same task + control identity
 # (gain_mapping=rotated), FlashSAC algorithm/model hyperparameters. Auto-derived; see docs/flashsac_plan.md.
-# fixed_dyn: identical to simp_low-F_high-P/VICES (force 10N, EMA 0.08, keypoint-servo
+# GAS: identical to simp_low-F_high-P/VICES (force 10N, EMA 0.08, keypoint-servo
 # + fix_orientation + normal_offset -0.01, gains, all reward/env settings; baked at grasp pitch 45)
-# EXCEPT the stiffness-frame method: gain_mapping=rotated, frame FIXED to the dynamic interaction frame (contact-reaction dir).
+# EXCEPT the stiffness-frame method: gain_mapping=rotated (policy-emitted stiffness-frame rotation).
 # Surface Path-Following experiment: simp_low-F_high-P (VICES / variable_diagonal).
 # Copied from glued_surface/2_VICES.yaml. Adds the knobs this sweep tunes, exposed at their
 # DEFAULT values (flip/edit as needed): directional fragile peg (+ require-contact + reset-in-
@@ -40,6 +40,7 @@ runner_cfg:
     task.desired_speed_cm_s: 5.0
     task.force_desired_min: 10.0
     task.force_desired_max: 10.0
+    task.force_obs_frame: eef   # ft_force/ft_torque OBS frame (policy+critic): "eef" (body-fixed, tool frame) | "world"
     ft_smoothing_factor: 0.08                    # force EMA (Forge default 0.25); heavier smoothing for the noisier drag-contact signal (~0.10s time constant at 120Hz), pairs with the 10N target
     task.orientation_desired_angle_deg: 0.0
     task.success_orn_tol_deg: 180.0   # angle success check DISABLED (drag angle must not gate success in the tilted-grasp experiment)
@@ -49,7 +50,6 @@ runner_cfg:
     #     holds ONE constant tilt and cannot be re-randomized). min==max on an axis => constant. ---
     task.grasp_tilt_min_deg: [0.0, 0.0, 0.0]
     task.grasp_tilt_max_deg: [0.0, 45.0, 0.0]
-    task.interaction_frame_mode: dynamic   # source frame for fixed_rotation_from_interaction
     # Held-cylinder spawn: TIP 1 mm above the starting keypoint (along the surface normal), peg straight
     # up/down (no rotation), no jitter. Each DOF has a mean + std; std == 0 => mean used exactly (no
     # sampling). pos = surface-local (x=along-path, y=cross-track, z=normal, m); orn = WORLD-frame
@@ -152,7 +152,7 @@ sac_cfg:
     enabled: false
   experiment:
     directory: flat_scribing_fullgain_upright
-    experiment_name: "fixed_dyn"
+    experiment_name: "GAS"
     write_interval: 75
     checkpoint_interval: auto
     wandb: true
@@ -203,7 +203,6 @@ controller_cfg:
   # "rotated"           : diagonal K (6) + 6-D rotation vector (6) = 12 dims; R applied as
   #                       blkdiag(R,R) to the full 6x6.
   gain_mapping: rotated #"constant" #
-  fixed_rotation_from_interaction: true   # stiffness-frame R fixed from the interaction frame (not policy-emitted)
   #fixed_rotation_rpy: [0.0, 30.0, 0.0]   # stiffness-frame R; aligned to the 30deg grasp tilt (used only when gain_mapping=rotated)
 
   # Toggle force control. When false: NO selection/force-target dims, K_f = zeros, and
@@ -236,9 +235,10 @@ controller_cfg:
   # instead of the translational 3x3 block alone. Changes action dim => re-tune
   # target_entropy if enabled.
   full_gain_matrix: true
-  # ABLATION (6d): rotate ONLY the position ellipsoid; keep the orientation gains axis-aligned
-  # instead of dragging them around with the shared R. Set consistently across the rotated methods
-  # (GAS/GAS_geo/fixed_geo). Does not change the action dim, so target_entropy is unchanged.
+  # ABLATION (6d): rotate ONLY the position ellipsoid; keep the policy-set orientation gains
+  # axis-aligned instead of dragging them around with the shared learned R. Does not change the
+  # action dim (rot6d still emitted, still orients the position block) so target_entropy is unchanged.
+  # Set true (or delete) to restore the historical "rotate both blocks" behavior.
   rotate_orientation_block: true
 
   # Full 3-DOF orientation control: command roll/pitch/yaw as a delta-axis-angle rotation
