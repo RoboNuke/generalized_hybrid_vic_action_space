@@ -44,6 +44,13 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             for order in (cfg.obs_order, cfg.state_order):
                 if "ft_torque_eef" not in order:
                     order.append("ft_torque_eef")
+        # Live grasp angle [sin θ, cos θ] — same BEFORE-super() pattern so the obs/state spaces are
+        # sized to include it. Added to BOTH policy obs and critic state (the critic always gets
+        # everything the policy sees). Value is computed live from actual geometry each step.
+        if getattr(cfg.task, "observe_grasp_angle", False):
+            for order in (cfg.obs_order, cfg.state_order):
+                if "grasp_angle" not in order:
+                    order.append("grasp_angle")
         # Configurable PhysX position-solver iterations. Set BEFORE super().__init__() builds the
         # sim: the scene cap clamps every body, and the robot articulation's own count governs the
         # glued cylinder (a link on it) — the plate is kinematic, so these two set the realized
@@ -159,9 +166,14 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.keypoint_spacing = 1e-6
         self.keypoints_total = torch.ones((self.num_envs,), dtype=torch.long, device=self.device)
         # Drag-performance accumulators over IN-CONTACT steps (running count/sum/sumsq -> per-rollout
-        # mean+std for force / along-speed / perp-speed / theta(deg)). Published as drag_performance/*.
+        # mean+std). Each metric is the SIGNED ERROR against its per-env target (measured - target, so
+        # + = over/too-fast/too-tilted), NOT the raw magnitude, so the metric stays meaningful as the
+        # targets are varied per env: force_err vs desired_force (N), speed_d_err vs the desired pace
+        # (m/s), speed_perp_err vs a straight drag (target 0 m/s), theta_err vs orientation_desired_angle
+        # (deg). Targets are per-episode constants, so subtracting them shifts only the mean — the
+        # within-rollout std is identical to the raw-value std. Published as drag_performance/*.
         self.drag_count = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
-        self._drag_metrics = ("force", "speed_d", "speed_perp", "theta")
+        self._drag_metrics = ("force_err", "speed_d_err", "speed_perp_err", "theta_err")
         for _n in self._drag_metrics:
             setattr(self, f"drag_sum_{_n}", torch.zeros((self.num_envs,), device=self.device))
             setattr(self, f"drag_sumsq_{_n}", torch.zeros((self.num_envs,), device=self.device))
@@ -550,6 +562,21 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # plate normal) — sign-robust, independent of which way the grasp leaves held-frame +z.
         self.cyl_axis = self._rotate_vec(self.held_quat, torch.tensor([0.0, 0.0, 1.0], device=self.device))
         self.cyl_axis = self.cyl_axis / torch.linalg.norm(self.cyl_axis, dim=-1, keepdim=True).clamp_min(1e-8)
+
+        # --- Live grasp angle (theta): signed PITCH of the peg's long axis relative to the gripper,
+        # computed from the ACTUAL held + EEF orientation THIS step (slip-robust — deliberately NOT
+        # the reset-time grasp tilt, which drifts as the peg slips in the friction hold). Express the
+        # world cylinder axis in the EEF frame: at zero grasp tilt it points along -EEF_z, and a grasp
+        # pitch tilts it within the EEF x-z plane (spawn_align_eef_x_to_path puts that plane along the
+        # path). theta = atan2(x, -z); emitted as [sin θ, cos θ] so the obs is wrap-free. cyl_axis
+        # already tracks any in-hand slip via held_quat, so this is the true current grasp pitch.
+        cyl_axis_eef = self._rotate_vec(
+            torch_utils.quat_conjugate(self.fingertip_midpoint_quat), self.cyl_axis
+        )
+        self.grasp_angle_rad = torch.atan2(cyl_axis_eef[:, 0], -cyl_axis_eef[:, 2])          # (E,) signed rad
+        self.grasp_angle_obs = torch.stack(
+            (torch.sin(self.grasp_angle_rad), torch.cos(self.grasp_angle_rad)), dim=-1
+        )                                                                                     # (E, 2)
         half = 0.5 * self.cfg_task.held_asset_cfg.height
         end_plus = self.held_pos + half * self.cyl_axis
         end_minus = self.held_pos - half * self.cyl_axis
@@ -825,6 +852,7 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "ft_force": F_ft + force_noise,
             "ft_torque_eef": T_ft + force_noise,
             "target_normal_force": tnf,
+            "grasp_angle": self.grasp_angle_obs,   # live [sin θ, cos θ]; inert unless in obs_order (observe_grasp_angle)
             "prev_actions": prev_actions,
         }
         # CRITIC — clean + privileged geometry. The contact-frame geometry (surface_normal, path_dir)
@@ -855,6 +883,7 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "orn_error": self.orn_error[:, None],
             "normal_force": self.measured_normal_force[:, None],
             "target_normal_force": tnf,
+            "grasp_angle": self.grasp_angle_obs,   # critic gets the same live grasp angle as the policy
             "prev_actions": prev_actions,
         }
 
@@ -893,6 +922,9 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             "keypoints_achieved": self.keypoints_achieved.detach().float(),
             "keypoints_passed": self.keypoints_passed.detach().float(),
             "keypoints_total": self.keypoints_total.detach().float(),
+            # Live grasp pitch (rad, signed) — the actual peg-vs-gripper angle this step, so eval
+            # traces can correlate performance with the real (slipped) grasp angle.
+            "grasp_angle_rad": self.grasp_angle_rad.detach(),
         }
         # Curved-surface subclasses carry a fixed per-env curvature scalar (env.alpha in [0, 1],
         # 0 = flat). Publish it so an eval trace can break metrics down by curvature difficulty.
@@ -1200,8 +1232,18 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # so the recorder can't recompute the finite difference itself).
         self.viz_along_track_speed = v_along_prog
         self.drag_count += c.long()
-        for _n, _v in (("force", self.measured_normal_force), ("speed_d", v_along_prog),
-                       ("speed_perp", v_perp_prog), ("theta", theta_deg)):
+        # Log SIGNED ERRORS vs the per-env targets (measured - target), not raw magnitudes, so the
+        # metric family remains interpretable as the targets are varied per env. force_err uses the
+        # per-episode sampled desired_force; speed_d_err uses the desired pace (v_des, m/s); straightness
+        # (speed_perp_err) targets a perfectly straight drag (0 lateral speed); theta_err uses the
+        # commanded orientation angle. See the accumulator-init comment for units/signs.
+        v_des = float(self.cfg_task.desired_speed_cm_s) / 100.0                 # cm/s -> m/s (pace target)
+        force_err = self.measured_normal_force - self.desired_force            # (E,) N,   + = pressing too hard
+        speed_d_err = v_along_prog - v_des                                     # (E,) m/s, + = dragging too fast
+        speed_perp_err = v_perp_prog                                          # (E,) m/s, straightness target 0
+        theta_err = theta_deg - float(self.cfg_task.orientation_desired_angle_deg)  # (E,) deg, + = over-tilted
+        for _n, _v in (("force_err", force_err), ("speed_d_err", speed_d_err),
+                       ("speed_perp_err", speed_perp_err), ("theta_err", theta_err)):
             getattr(self, f"drag_sum_{_n}").add_(_v * cf)
             getattr(self, f"drag_sumsq_{_n}").add_(_v * _v * cf)
         # (keypoint achievement/passed were computed earlier, before the success bonus, so it could be
@@ -1233,8 +1275,9 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.extras["per_env_contact_quality_mask"] = self.reset_buf.clone()
 
         # --- Drag-performance per-episode publish ---
-        # Two-level stats: per rollout compute the mean AND std of each metric over its IN-CONTACT
-        # steps; block_agent then reduces over rollouts, emitting {metric}_mean (avg-of-rollout-means)
+        # Two-level stats: per rollout compute the mean AND std of each metric's SIGNED TARGET ERROR
+        # (measured - target; 0 = perfect tracking) over its IN-CONTACT steps; block_agent then reduces
+        # over rollouts, emitting {metric}_mean (avg-of-rollout-means)
         # and {metric}_std (spread-of-rollout-means), plus {metric}_intra_std_mean (avg within-rollout
         # std). NaN where a rollout never contacted, so the stat reducer skips it. keypoints_achieved /
         # keypoints_passed are plain per-rollout counts (0 valid); block_agent also emits each as a
@@ -1255,9 +1298,11 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         }
         for _n in self._drag_metrics:
             _m = getattr(self, f"drag_sum_{_n}") / dcnt
-            _var = (getattr(self, f"drag_sumsq_{_n}") / dcnt - _m * _m).clamp_min(0.0)
             drag[_n] = torch.where(dhas, _m, nan)                        # per-rollout mean (in contact)
-            drag[f"{_n}_intra_std"] = torch.where(dhas, _var.sqrt(), nan)  # per-rollout within-run std
+            # Within-rollout std of the error is no longer published (unused). The sum-of-squares
+            # accumulators (drag_sumsq_*) are still maintained, so re-enabling is just these two lines:
+            # _var = (getattr(self, f"drag_sumsq_{_n}") / dcnt - _m * _m).clamp_min(0.0)
+            # drag[f"{_n}_intra_std"] = torch.where(dhas, _var.sqrt(), nan)  # per-rollout within-run std
         self.extras["per_env_drag"] = drag
         self.extras["per_env_drag_mask"] = self.reset_buf.clone()
 

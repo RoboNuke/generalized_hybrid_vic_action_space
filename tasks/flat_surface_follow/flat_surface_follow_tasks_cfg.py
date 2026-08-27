@@ -181,6 +181,9 @@ class FlatSurfaceFollowTask(ForgeTask):
 
     # --- Observation toggles ---
     observe_eef_torque: bool = False              # add the 3-D EEF-frame torque to the obs (policy + critic)
+    observe_grasp_angle: bool = False             # add the live 2-D grasp angle [sin θ, cos θ] (peg pitch
+                                                  # relative to the gripper, computed from actual geometry —
+                                                  # slip-robust, NOT the reset init) to the obs (policy + critic)
 
     # --- Success tolerances ---
     success_pos_tol: float = 0.01                 # cylinder tip within this of the far-edge center

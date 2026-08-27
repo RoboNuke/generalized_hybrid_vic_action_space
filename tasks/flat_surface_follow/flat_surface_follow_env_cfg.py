@@ -31,6 +31,10 @@ OBS_DIM_CFG.update(
         "setpoint_pos_rel": 3,  # R_eefᵀ (setpoint_pos - eef_pos): setpoint position in the EEF frame
         "ft_torque_eef": 3,     # EEF-frame torque (appended to obs_order only when observe_eef_torque)
         "target_normal_force": 1,
+        # Live grasp angle [sin θ, cos θ]: peg PITCH relative to the gripper, computed each step from
+        # the actual held/EEF orientation (slip-robust). Appended to obs_order only when
+        # observe_grasp_angle. See flat_surface_follow_env._compute_intermediate_values.
+        "grasp_angle": 2,
     }
 )
 STATE_DIM_CFG.update(
@@ -38,6 +42,7 @@ STATE_DIM_CFG.update(
         "setpoint_pos_rel": 3,
         "ft_torque_eef": 3,
         "target_normal_force": 1,
+        "grasp_angle": 2,       # critic sees everything the policy sees (appended when observe_grasp_angle)
         # Privileged surface geometry (critic only — the policy must infer it).
         "surface_normal": 3,
         "path_dir": 3,
