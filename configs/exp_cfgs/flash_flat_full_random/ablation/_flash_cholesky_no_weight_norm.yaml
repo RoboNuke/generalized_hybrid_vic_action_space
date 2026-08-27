@@ -144,7 +144,7 @@ sac_cfg:
   entropy_sigma_target: 0.15
   reward_scaling_enabled: true          # adaptive reward scaling (Eq. 6); replaces rewards_shaper_scale
   reward_scaling_g_max: 5.0             # must equal model_cfg.critic.v_max
-  weight_norm_enabled: true             # unit-sphere weight / sqrt(d) norm-param projection
+  weight_norm_enabled: false         # ABLATION: disable FlashSAC weight normalization
   noise_repeat_enabled: true            # temporally-correlated exploration
   noise_repeat_zeta_mu: 2.0
   noise_repeat_max: 16
@@ -158,7 +158,7 @@ sac_cfg:
     enabled: false
   experiment:
     directory: flat_scribing_fullgain_upright
-    experiment_name: "cholesky"
+    experiment_name: "cholesky_abl_no_weight_norm"
     write_interval: 75
     checkpoint_interval: auto
     wandb: true

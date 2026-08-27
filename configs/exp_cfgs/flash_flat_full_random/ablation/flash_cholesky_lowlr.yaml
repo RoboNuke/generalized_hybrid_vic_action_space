@@ -125,10 +125,10 @@ sac_cfg:
   batch_size: 2048
   discount_factor: 0.99
   polyak: 0.01
-  actor_lr: 3.0e-4
-  critic_lr: 3.0e-4
+  actor_lr: 1.0e-4                   # ABLATION: SimBa LR
+  critic_lr: 1.0e-4                  # ABLATION: SimBa LR
   lr_schedule: cosine          # decay actor+critic LR 3e-4 -> lr_end (FlashSAC)
-  lr_end: 1.5e-4
+  lr_end: 0.5e-4                     # ABLATION: keep 2:1 cosine decay
   entropy_lr: 3.0e-4
   weight_decay: 0.0
   random_timesteps: 0
@@ -158,7 +158,7 @@ sac_cfg:
     enabled: false
   experiment:
     directory: flat_scribing_fullgain_upright
-    experiment_name: "cholesky"
+    experiment_name: "cholesky_abl_lowlr"
     write_interval: 75
     checkpoint_interval: auto
     wandb: true

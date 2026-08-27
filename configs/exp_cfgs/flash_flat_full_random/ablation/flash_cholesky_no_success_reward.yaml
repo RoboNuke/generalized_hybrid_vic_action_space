@@ -91,7 +91,7 @@ runner_cfg:
     task.pace_weight: 1.0
     task.straightness_air_weight: 0.0
     task.pace_air_weight: 0.0
-    task.success_time_weight: 300.0
+    task.success_time_weight: 0.0   # ABLATION: drop sparse success bonus -> dense per-step rewards only
     # --- Setpoint keypoint placement: false = completion/robot-driven (target waits for the arm to
     #     catch up); true = PACE-DRIVEN (target advances on the time-based pace clock at
     #     desired_speed_cm_s, never waiting). ---
@@ -158,7 +158,7 @@ sac_cfg:
     enabled: false
   experiment:
     directory: flat_scribing_fullgain_upright
-    experiment_name: "cholesky"
+    experiment_name: "cholesky_abl_no_success_reward"
     write_interval: 75
     checkpoint_interval: auto
     wandb: true

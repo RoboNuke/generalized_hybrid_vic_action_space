@@ -142,7 +142,7 @@ sac_cfg:
   entropy_loss_form: alpha              # FlashSAC temperature form: loss = alpha*(H_hat - H_target)
   target_entropy_mode: unified          # H = 0.5*|A|*log(2*pi*e*sigma^2)
   entropy_sigma_target: 0.15
-  reward_scaling_enabled: true          # adaptive reward scaling (Eq. 6); replaces rewards_shaper_scale
+  reward_scaling_enabled: false      # ABLATION: static reward instead of adaptive Eq.6
   reward_scaling_g_max: 5.0             # must equal model_cfg.critic.v_max
   weight_norm_enabled: true             # unit-sphere weight / sqrt(d) norm-param projection
   noise_repeat_enabled: true            # temporally-correlated exploration
@@ -151,14 +151,14 @@ sac_cfg:
   actor_update_period: 2                # delay the actor/entropy update
   observation_preprocessor: null
   observation_preprocessor_kwargs: {}
-  rewards_shaper_scale: null
+  rewards_shaper_scale: 0.1          # ABLATION: SimBa static scale
   gripper_action_idx: null
   phase_split_families: []        # peg-only (needs per_env_curr_engaged); OFF for surface
   recorder:
     enabled: false
   experiment:
     directory: flat_scribing_fullgain_upright
-    experiment_name: "cholesky"
+    experiment_name: "cholesky_abl_static_reward"
     write_interval: 75
     checkpoint_interval: auto
     wandb: true
@@ -188,8 +188,8 @@ model_cfg:
     clip_actions: false
     # ---- FlashSAC distributional (categorical / C51) critic ----
     n_atoms: 101
-    v_min: -5.0
-    v_max: 5.0
+    v_min: -50.0   # ABLATION: widened so static-scaled returns fit the C51 support
+    v_max: 50.0    # ABLATION: widened (companion to static reward)
 
 controller_cfg:
   # ---- control type selector (the single switch) ----

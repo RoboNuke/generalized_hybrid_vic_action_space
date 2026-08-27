@@ -169,7 +169,7 @@ model_cfg:
     last_layer_scale: 1.0
     clip_log_std: true
     min_log_std: -10.0
-    max_log_std: -1.5
+    max_log_std: 2.0
     reduction: sum
     use_state_dependent_std: true
     bernoulli_action_dims: null
