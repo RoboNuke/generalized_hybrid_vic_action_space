@@ -361,8 +361,11 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         down-path at all times, while still correcting lateral drift (the goal sits on the path
         centerline, so its offset from the drifted tip pulls x back toward the line). When the tip sits
         within 0.1 mm of that keypoint — where the direction is ill-defined — it steps one keypoint
-        further so x stays meaningful and stable. (Previously x used the constant along-track
-        ``path_dir``.) FRAME-ONLY: nothing here mutates the real goal the policy sees.
+        further so x stays meaningful and stable. FRAME-ONLY: nothing here mutates the real goal the
+        policy sees. Set ``interaction_frame_constant_x = True`` to instead take x from the plate travel
+        direction (``path_dir``) directly: constant per episode on a flat/straight path, so the frame
+        does not jitter about the normal as the (bouncing) tip wobbles — at the cost of the goal-
+        direction's lateral-drift correction (the position servo already handles lateral tracking).
 
         ``interaction_frame_mode`` (task cfg):
           * "geometric" (default): z = surface normal — the pure surface frame; x = the goal-keypoint
@@ -382,20 +385,29 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         which case the projected-surface frame is used even off-contact (removing the on/off switch);
         the dynamic line is always gated. Contact is the env's single source of truth,
         ``self.in_contact_any`` (contact sensor / normal-force fallback)."""
-        # x points from the contact point to the first keypoint AHEAD OF THE TIP. We intentionally do
-        # NOT use self.setpoint_pos here: that observation/pace setpoint is time-driven and can lag the
-        # tip (the tip outruns the pace clock), which would make to_goal — and thus x — point BACKWARD
-        # and flip the whole interaction frame. Instead pick the keypoint just past the tip's own
-        # along-track progress so x always points down-path. FRAME-ONLY: this touches neither
-        # self.setpoint_pos nor self.setpoint_kp_idx (the real goal the policy sees is unchanged).
-        spacing = self.keypoint_spacing
-        kp_ahead = torch.floor(self.progress / spacing) + 1.0                          # next keypoint past the tip
-        residual = kp_ahead * spacing - self.progress                                  # along-track gap, in (0, spacing]
-        kp_ahead = kp_ahead + (residual < 1e-4).float()                                # on the keypoint -> step one further
-        kp_ahead = kp_ahead.clamp_min(1.0).minimum(self.keypoints_total.float())       # stay within [1, last keypoint]
-        goal_arclen = (kp_ahead * spacing).minimum(self.path_length)                   # (E,) arc length along the path
-        goal_pos = self._point_on_path(self.start_world, self.path_dir, goal_arclen)   # (E,3) on the path centerline
-        to_goal = goal_pos - self.contact_point                                        # (E,3) toward the goal keypoint
+        # Along-track (x) axis SOURCE, projected clear of z below.
+        if bool(getattr(self.cfg_task, "interaction_frame_constant_x", False)):
+            # CONSTANT frame: x = the plate's along-track travel direction (path_dir), which is constant
+            # per episode on a flat/straight path — so the frame does NOT jitter about the normal as the
+            # (bouncing) tip wobbles. This drops the lateral-drift correction that the goal direction gave
+            # (the position servo already handles lateral tracking). On a curved surface path_dir is the
+            # local tangent, still pure geometry. Pairs with interaction_frame_mode=geometric (z=normal).
+            to_goal = self.path_dir                                                        # (E,3) constant along-track dir
+        else:
+            # x points from the contact point to the first keypoint AHEAD OF THE TIP. We intentionally do
+            # NOT use self.setpoint_pos here: that observation/pace setpoint is time-driven and can lag the
+            # tip (the tip outruns the pace clock), which would make to_goal — and thus x — point BACKWARD
+            # and flip the whole interaction frame. Instead pick the keypoint just past the tip's own
+            # along-track progress so x always points down-path. FRAME-ONLY: this touches neither
+            # self.setpoint_pos nor self.setpoint_kp_idx (the real goal the policy sees is unchanged).
+            spacing = self.keypoint_spacing
+            kp_ahead = torch.floor(self.progress / spacing) + 1.0                          # next keypoint past the tip
+            residual = kp_ahead * spacing - self.progress                                  # along-track gap, in (0, spacing]
+            kp_ahead = kp_ahead + (residual < 1e-4).float()                                # on the keypoint -> step one further
+            kp_ahead = kp_ahead.clamp_min(1.0).minimum(self.keypoints_total.float())       # stay within [1, last keypoint]
+            goal_arclen = (kp_ahead * spacing).minimum(self.path_length)                   # (E,) arc length along the path
+            goal_pos = self._point_on_path(self.start_world, self.path_dir, goal_arclen)   # (E,3) on the path centerline
+            to_goal = goal_pos - self.contact_point                                        # (E,3) toward the goal keypoint
         mode = getattr(self.cfg_task, "interaction_frame_mode", "geometric")
         if mode == "dynamic":
             # Reaction vector follows the reward's force_source: "oracle" = the true peg<->plate contact

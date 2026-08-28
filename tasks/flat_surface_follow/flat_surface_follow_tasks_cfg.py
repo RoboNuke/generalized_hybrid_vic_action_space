@@ -241,6 +241,11 @@ class FlatSurfaceFollowTask(ForgeTask):
     # GEOMETRIC frame is defined regardless of contact), removing the on/off frame switch. Only relaxes
     # the "geometric" line — "dynamic" is always gated (its z-axis reaction is undefined off-contact).
     interaction_frame_contact_gated: bool = True
+    # x-axis (along-track) source for the interaction frame. False (default): direction from the contact
+    # point to the next keypoint ahead of the tip (corrects lateral drift, but rides the noisy/bouncing
+    # tip -> jitters about the normal). True: the plate travel direction (path_dir), CONSTANT per episode
+    # on a flat/straight path -> a stable, non-jittering geometric frame (z=surface normal, x=path_dir).
+    interaction_frame_constant_x: bool = False
 
     # --- Termination (per-env). Both default OFF. When EITHER is on, env_setup auto-attaches the
     # efficient-reset wrapper so partial resets teleport (no sim steps) instead of running Factory's
