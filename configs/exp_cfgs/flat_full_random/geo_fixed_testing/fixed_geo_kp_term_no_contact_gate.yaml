@@ -49,7 +49,7 @@ runner_cfg:
     task.grasp_tilt_min_deg: [0.0, 0.0, 0.0]
     task.grasp_tilt_max_deg: [0.0, 45.0, 0.0]
     task.interaction_frame_mode: geometric   # source frame for fixed_rotation_from_interaction
-    task.interaction_frame_contact_gated: true   # true (default): off-contact -> EEF-frame stiffness (R=I); false: keep the projected-surface frame off-contact too (geometric only), removing the on/off switch
+    task.interaction_frame_contact_gated: false   # true (default): off-contact -> EEF-frame stiffness (R=I); false: keep the projected-surface frame off-contact too (geometric only), removing the on/off switch
     # Held-cylinder spawn: TIP 1 mm above the starting keypoint (along the surface normal), peg straight
     # up/down (no rotation), no jitter. Each DOF has a mean + std; std == 0 => mean used exactly (no
     # sampling). pos = surface-local (x=along-path, y=cross-track, z=normal, m); orn = WORLD-frame
@@ -63,7 +63,8 @@ runner_cfg:
     task.spawn_align_eef_x_to_path: true   # spin the grasp at spawn so the EEF x-axis points along path_dir; the keypoint-servo fix_orientation then holds this
     task.observe_eef_torque: false
     task.terminate_on_lag: false
-    task.terminate_on_success: true
+    task.terminate_on_success: false
+    task.terminate_on_all_keypoints_passed: true   # terminate (no bootstrap) once the frontier has passed every keypoint
     task.pace_lag_frac: 0.5
     task.keypoint_reward_weight: 4.0
     task.vel_based_pace_enabled: true   # velocity-based pace (reward matching v_des along d); false = legacy position pace

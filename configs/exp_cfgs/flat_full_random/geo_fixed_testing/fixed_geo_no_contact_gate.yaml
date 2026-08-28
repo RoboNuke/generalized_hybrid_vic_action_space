@@ -49,7 +49,7 @@ runner_cfg:
     task.grasp_tilt_min_deg: [0.0, 0.0, 0.0]
     task.grasp_tilt_max_deg: [0.0, 45.0, 0.0]
     task.interaction_frame_mode: geometric   # source frame for fixed_rotation_from_interaction
-    task.interaction_frame_contact_gated: true   # true (default): off-contact -> EEF-frame stiffness (R=I); false: keep the projected-surface frame off-contact too (geometric only), removing the on/off switch
+    task.interaction_frame_contact_gated: false   # true (default): off-contact -> EEF-frame stiffness (R=I); false: keep the projected-surface frame off-contact too (geometric only), removing the on/off switch
     # Held-cylinder spawn: TIP 1 mm above the starting keypoint (along the surface normal), peg straight
     # up/down (no rotation), no jitter. Each DOF has a mean + std; std == 0 => mean used exactly (no
     # sampling). pos = surface-local (x=along-path, y=cross-track, z=normal, m); orn = WORLD-frame

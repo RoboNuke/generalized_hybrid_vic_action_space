@@ -352,12 +352,17 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         Consumed by the controller's ``fixed_rotation_from_interaction`` stiffness variant (R =
         R_eefᵀ @ this = the true interaction->EEF rotation), the impedance metrics, and the viz marker.
 
-        In BOTH modes the x-axis points from the contact point toward the CURRENT goal keypoint
-        (``self.setpoint_pos``), projected clear of that mode's z-axis so x ⊥ z. (Previously x was the
-        constant along-track ``path_dir``; the goal-keypoint direction also corrects lateral drift, and
-        it is what the supervised-rotation loss target now supervises.) When the tip sits within 0.1 mm
-        of the current keypoint — where that direction is ill-defined and x would be random — it falls
-        back to the NEXT keypoint (``self.next_setpoint_pos``) so x stays meaningful and stable.
+        In BOTH modes the x-axis points from the contact point toward the first keypoint AHEAD OF THE
+        TIP — the keypoint at ``floor(progress / keypoint_spacing) + 1`` — projected clear of that
+        mode's z-axis so x ⊥ z. This goal is derived HERE, for the frame only; it deliberately does NOT
+        use the observation/pace setpoint (``self.setpoint_pos``), which is time-driven and can fall
+        BEHIND the tip when the tip outruns the pace clock — targeting it would make x point backward
+        and flip the whole frame. Anchoring to the tip's own along-track progress keeps x pointing
+        down-path at all times, while still correcting lateral drift (the goal sits on the path
+        centerline, so its offset from the drifted tip pulls x back toward the line). When the tip sits
+        within 0.1 mm of that keypoint — where the direction is ill-defined — it steps one keypoint
+        further so x stays meaningful and stable. (Previously x used the constant along-track
+        ``path_dir``.) FRAME-ONLY: nothing here mutates the real goal the policy sees.
 
         ``interaction_frame_mode`` (task cfg):
           * "geometric" (default): z = surface normal — the pure surface frame; x = the goal-keypoint
@@ -370,17 +375,29 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             (force_sensor_world_smooth). x = the goal-keypoint direction with its component parallel to
             the reaction (z) subtracted, y = z × x (cross-track).
 
-        OFF-CONTACT, BOTH modes return R_eef (world<-eef), so the controller's R = R_eefᵀ·this =
-        IDENTITY — with no surface to interact with, the stiffness is applied in the control (EEF)
-        frame, not a surface/reaction frame. Contact is the env's single source of truth,
+        OFF-CONTACT, the frame returns R_eef (world<-eef) by default, so the controller's R =
+        R_eefᵀ·this = IDENTITY — with no surface to interact with, the stiffness is applied in the
+        control (EEF) frame, not a surface/reaction frame. This contact-gating is on by default and can
+        be DISABLED for the geometric line via task cfg ``interaction_frame_contact_gated = False``, in
+        which case the projected-surface frame is used even off-contact (removing the on/off switch);
+        the dynamic line is always gated. Contact is the env's single source of truth,
         ``self.in_contact_any`` (contact sensor / normal-force fallback)."""
-        # x points from the contact point to the current goal keypoint. When the tip sits essentially
-        # ON that keypoint (<0.1 mm), the direction is ill-defined (x goes random), so fall back to the
-        # NEXT keypoint to keep x meaningful and stable.
-        at_goal = (torch.linalg.norm(self.setpoint_pos - self.contact_point, dim=-1) < 1e-4)  # (E,) 0.1 mm
-        goal_pos = torch.where(at_goal[:, None], self.next_setpoint_pos, self.setpoint_pos)  # (E,3)
-        to_goal = goal_pos - self.contact_point                                      # (E,3) toward goal keypoint
-        if getattr(self.cfg_task, "interaction_frame_mode", "geometric") == "dynamic":
+        # x points from the contact point to the first keypoint AHEAD OF THE TIP. We intentionally do
+        # NOT use self.setpoint_pos here: that observation/pace setpoint is time-driven and can lag the
+        # tip (the tip outruns the pace clock), which would make to_goal — and thus x — point BACKWARD
+        # and flip the whole interaction frame. Instead pick the keypoint just past the tip's own
+        # along-track progress so x always points down-path. FRAME-ONLY: this touches neither
+        # self.setpoint_pos nor self.setpoint_kp_idx (the real goal the policy sees is unchanged).
+        spacing = self.keypoint_spacing
+        kp_ahead = torch.floor(self.progress / spacing) + 1.0                          # next keypoint past the tip
+        residual = kp_ahead * spacing - self.progress                                  # along-track gap, in (0, spacing]
+        kp_ahead = kp_ahead + (residual < 1e-4).float()                                # on the keypoint -> step one further
+        kp_ahead = kp_ahead.clamp_min(1.0).minimum(self.keypoints_total.float())       # stay within [1, last keypoint]
+        goal_arclen = (kp_ahead * spacing).minimum(self.path_length)                   # (E,) arc length along the path
+        goal_pos = self._point_on_path(self.start_world, self.path_dir, goal_arclen)   # (E,3) on the path centerline
+        to_goal = goal_pos - self.contact_point                                        # (E,3) toward the goal keypoint
+        mode = getattr(self.cfg_task, "interaction_frame_mode", "geometric")
+        if mode == "dynamic":
             # Reaction vector follows the reward's force_source: "oracle" = the true peg<->plate contact
             # force (contact_force_world_ema, no wrist inertia/motion contamination); "wrist_ft" = the FR3
             # wrist F/T reaction (force_sensor_world_smooth). The oracle path HARD-REQUIRES the
@@ -402,9 +419,17 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         x = to_goal - (to_goal * z).sum(-1, keepdim=True) * z                         # goal dir ⊥ z
         x = x / torch.linalg.norm(x, dim=-1, keepdim=True).clamp_min(1e-6)
         frame = torch.stack([x, torch.cross(z, x, dim=-1), z], dim=-1)                # (E,3,3)
-        # Off-contact -> R_eef so the stiffness rotation collapses to identity (stiffness in the EEF frame).
-        R_eef = matrix_from_quat(self.fingertip_midpoint_quat)                        # (E,3,3) world<-eef
-        return torch.where(self.in_contact_any[:, None, None], frame, R_eef)
+        # Contact-gating (task cfg ``interaction_frame_contact_gated``, default True = historical):
+        # OFF-CONTACT collapse to R_eef so the stiffness rotation R = R_eefᵀ·this is IDENTITY (impedance
+        # in the control/EEF frame — there is no surface to interact with). Setting it False keeps the
+        # projected-surface ``frame`` even off-contact (contact_point is always the tip projected onto
+        # the surface, so the GEOMETRIC frame is defined regardless of contact), removing the on/off
+        # switch. Dynamic mode is ALWAYS gated: its z-axis reaction is undefined off-contact.
+        contact_gated = bool(getattr(self.cfg_task, "interaction_frame_contact_gated", True))
+        if contact_gated or mode == "dynamic":
+            R_eef = matrix_from_quat(self.fingertip_midpoint_quat)                    # (E,3,3) world<-eef
+            return torch.where(self.in_contact_any[:, None, None], frame, R_eef)
+        return frame
 
     # ------------------------------------------------------------------
     # Scene: procedural plate (fixed) + cylinder (held)
@@ -1348,7 +1373,13 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             setpoint is frozen so lag can't grow, which lets brief bounces recover.
           * terminate_on_success: success reached while in contact — end immediately (the one-shot
             success_time bonus has already been paid this step).
-        When EITHER toggle is on the run MUST carry the efficient-reset wrapper (env_setup attaches
+          * terminate_on_all_keypoints_passed: the progress frontier has PASSED every keypoint
+            (``keypoints_passed >= keypoints_total``), regardless of achieved/on-track state — a
+            reward-complete full-traversal terminal. When on, this "passed all" condition TERMINATES
+            (no value bootstrap: the collected keypoint reward IS the return) instead of its default
+            TRUNCATION. When off, passed_all keeps truncating (SAC bootstraps the near-zero tail).
+        The plain time-out always TRUNCATES (bootstrapped) — only the toggles above terminate.
+        When ANY toggle is on the run MUST carry the efficient-reset wrapper (env_setup attaches
         it automatically for this task) so the resulting partial resets teleport to a cached donor
         state instead of running Factory's all-envs settling reset. Overrides FactoryEnv._get_dones
         (which returns all-synced time-outs); still refreshes intermediate values first, as it does.
@@ -1363,10 +1394,16 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         passed_all = self.keypoints_passed >= self.keypoints_total
         self._passed_all = passed_all                 # stashed for the per-episode outcome metrics + recorder pill
         self._time_out = time_out
-        truncated = time_out | passed_all
         terminated = torch.zeros_like(time_out)
         self._term_lag = torch.zeros_like(time_out)   # this step's lag-termination flag (for the metric)
         succ_term = torch.zeros_like(time_out)
+        # Optional reward-complete early stop: TERMINATE (no value bootstrap) once the frontier has
+        # PASSED every keypoint, regardless of achieved/on-track state. When on, "passed all"
+        # terminates instead of truncating (so it is not double-counted in `truncated` below); when
+        # off, passed_all keeps its historical truncation behavior (SAC bootstraps the near-zero tail).
+        kp_term = passed_all if bool(cfg.terminate_on_all_keypoints_passed) else torch.zeros_like(time_out)
+        terminated = terminated | kp_term
+        truncated = time_out | (passed_all & ~kp_term)
         if bool(cfg.terminate_on_lag):
             lag = self.s_ref - self.progress                          # (E,) m, positive = behind
             lag_max = float(cfg.pace_lag_frac) * self.path_length     # (E,) m

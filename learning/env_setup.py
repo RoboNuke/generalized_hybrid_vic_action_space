@@ -663,6 +663,7 @@ def build_env(
     _surface_termination = runner_cfg.task.startswith("Isaac-FlatSurfaceFollow-") and (
         bool(getattr(getattr(env_cfg, "task", None), "terminate_on_lag", False))
         or bool(getattr(getattr(env_cfg, "task", None), "terminate_on_success", False))
+        or bool(getattr(getattr(env_cfg, "task", None), "terminate_on_all_keypoints_passed", False))
     )
     if runner_cfg.efficient_reset_enabled or _surface_termination:
         from wrappers.sensors.efficient_reset_wrapper import EfficientResetWrapper

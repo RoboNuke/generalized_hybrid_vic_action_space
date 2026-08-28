@@ -233,13 +233,26 @@ class FlatSurfaceFollowTask(ForgeTask):
     #              reaction (force_sensor_world_smooth).
     # OFF-CONTACT (env.in_contact_any False — the single contact source of truth) BOTH modes collapse
     # to the control/EEF frame (identity stiffness rotation): no surface, so stiffness is control-frame.
+    # This contact-gating is toggled by interaction_frame_contact_gated below.
     interaction_frame_mode: str = "geometric"
+    # Contact-gate the interaction frame. True (default, historical): off-contact the frame collapses to
+    # R_eef so the stiffness rotation is identity (control/EEF-frame impedance). False: keep the
+    # projected-surface frame even off-contact (the tip is always projected onto the surface, so the
+    # GEOMETRIC frame is defined regardless of contact), removing the on/off frame switch. Only relaxes
+    # the "geometric" line — "dynamic" is always gated (its z-axis reaction is undefined off-contact).
+    interaction_frame_contact_gated: bool = True
 
     # --- Termination (per-env). Both default OFF. When EITHER is on, env_setup auto-attaches the
     # efficient-reset wrapper so partial resets teleport (no sim steps) instead of running Factory's
     # all-envs settling reset. terminated (failure/success) is NOT value-bootstrapped; time-out is. ---
     terminate_on_lag: bool = False                # end if the tool falls too far behind the setpoint
     terminate_on_success: bool = False            # end the moment success is reached (in contact)
+    terminate_on_all_keypoints_passed: bool = False  # end (TERMINATED, no value bootstrap) once the progress
+                                                  # frontier has PASSED every keypoint, regardless of achieved/
+                                                  # on-track state — a reward-complete full-traversal terminal.
+                                                  # When on, "passed all" TERMINATES instead of truncating, so a
+                                                  # finished run collects every keypoint's reward then ends early
+                                                  # (a cleaner early-stop than terminate_on_success).
     pace_lag_frac: float = 0.5                    # max along-track lag before termination, as a
                                                   # FRACTION of path length L (0.5 => half the path)
 
