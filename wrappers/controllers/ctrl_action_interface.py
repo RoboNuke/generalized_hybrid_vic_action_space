@@ -671,7 +671,9 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         env = self.unwrapped
         R_eef = matrix_from_quat(env.fingertip_midpoint_quat)     # (E,3,3) world<-eef
         R_int = env.interaction_frame_world()                     # (E,3,3) world<-interaction
-        return R_eef.transpose(1, 2) @ R_int                      # (E,3,3) eef<-interaction
+        R = R_eef.transpose(1, 2) @ R_int                         # (E,3,3) eef<-interaction
+        R = R.transpose(1, 2)                                     # EXPERIMENT (revert to remove): invert the frame direction
+        return R
 
     @staticmethod
     def _rotate_blockdiag(R, kdiag, rotate_orient: bool = True):
