@@ -66,6 +66,8 @@ class BlockAgent(Agent):
         num_agents: int = 1,
         contact_axes: list[int] | None = None,
         rot6d_slice: tuple[int, int] | None = None,
+        p_slice: tuple[int, int] | None = None,
+        lever_arm_max: float = 0.3,
         run_config: dict | None = None,
     ) -> None:
         super().__init__(
@@ -105,6 +107,12 @@ class BlockAgent(Agent):
         # target env.extras["gt_interaction_rot"] is buffered (one-step aligned, like contact).
         self._rot6d_slice = tuple(rot6d_slice) if rot6d_slice is not None else None
         self._pending_rot_target: torch.Tensor | None = None
+        # Optional ground-truth lever-arm buffering for the lever-arm supervised-p loss (learned p /
+        # GAS). ``p_slice`` = (lo, hi) into the action = the policy's predicted-p dims; None disables
+        # both the memory target and the p term. Mirrors the rotation-target machinery below.
+        self._p_slice = tuple(p_slice) if p_slice is not None else None
+        self._lever_arm_max = float(lever_arm_max)
+        self._pending_p_target: torch.Tensor | None = None
 
         # per-agent tracking buffers (writers created in init() once experiment_dir is set)
         # Per-agent scalar sink: a raw skrl SummaryWriter, or (when experiment.wandb
@@ -1231,6 +1239,9 @@ class BlockAgent(Agent):
         if self._rot6d_slice is not None and self.memory is not None:
             self.memory.create_tensor(name="gt_interaction_rot", size=9, dtype=torch.float32)
             self._tensors_names.append("gt_interaction_rot")
+        if self._p_slice is not None and self.memory is not None:
+            self.memory.create_tensor(name="gt_interaction_p", size=3, dtype=torch.float32)
+            self._tensors_names.append("gt_interaction_p")
 
     def _buffer_rot_target_for_write(
         self, *, terminated: torch.Tensor, truncated: torch.Tensor, infos: Any, add_kwargs: dict
@@ -1251,6 +1262,18 @@ class BlockAgent(Agent):
         nxt = raw.to(self.device).float().clone() if raw is not None else eye9.unsqueeze(0).repeat(n_envs, 1)
         nxt[(terminated + truncated).bool().view(-1)] = eye9
         self._pending_rot_target = nxt
+
+        # Ground-truth lever arm p (same one-step alignment; reset finished envs to zero). No-op when
+        # p_slice is None (non-learned-p configs never buffer it).
+        if self._p_slice is not None:
+            zero3 = torch.zeros(3, device=self.device)
+            if self._pending_p_target is None:
+                self._pending_p_target = zero3.unsqueeze(0).repeat(n_envs, 1)
+            add_kwargs["gt_interaction_p"] = self._pending_p_target
+            rawp = infos.get("gt_interaction_p") if isinstance(infos, dict) else None
+            nxtp = rawp.to(self.device).float().clone() if rawp is not None else zero3.unsqueeze(0).repeat(n_envs, 1)
+            nxtp[(terminated + truncated).bool().view(-1)] = zero3
+            self._pending_p_target = nxtp
 
     # --------------------------------------------------------------
     # Per-agent checkpoint save/load (generic; specialized via hooks)

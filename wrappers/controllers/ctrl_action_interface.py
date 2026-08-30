@@ -72,7 +72,7 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
     _ALLOW_ZERO_N = True                  # force_axes all-zero => no force control
 
     @staticmethod
-    def _pose_pdim(mode, full, fixed_rot=False):
+    def _pose_pdim(mode, full, fixed_rot=False, learn_p=False):
         """Pose-K action dims consumed by ``mode`` (K_f mirrors this when hybrid is on).
 
         ``constant`` => 0, ``variable_diagonal`` => 6 (per-axis diagonal, always full 6-DOF).
@@ -92,7 +92,9 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
             return 6
         n = 6 if full else 3
         if mode == "rotated":
-            return n if fixed_rot else n + 6
+            if fixed_rot:
+                return n                          # R fixed: no rot6d; p (if lever-arm) read from env
+            return n + 6 + (3 if learn_p else 0)  # learned R (rot6d) + optional learned p (3)
         return n + n * (n - 1) // 2  # cholesky
 
     def __init__(self, env, controller_cfg, num_agents: int = 1):
@@ -115,7 +117,19 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
             cfg.fixed_rotation_rpy if (self._mode == "rotated" and not self._fixed_from_interaction) else None
         )
         self._fixed_rot = (self._fixed_rpy is not None) or self._fixed_from_interaction
-        self._pdim = self._pose_pdim(self._mode, self._full, self._fixed_rot)
+        # Lever-arm (spatial-adjoint) stiffness: transfer the interaction-point diagonal K to the EEF
+        # with G = [[R,0],[R[p]x,R]] (accounts for the peg moment arm). Only for gain_mapping='rotated'
+        # (VICES untouched). Learned-rotation methods (GAS: rotated, NOT fixed_rot) also PREDICT p
+        # (+3 action dims); fixed-rotation methods read the true p from the env.
+        self._lever_arm = bool(getattr(cfg, "lever_arm_stiffness", False)) and self._mode == "rotated"
+        self._lever_arm_max = float(getattr(cfg, "lever_arm_max_m", 0.3))
+        self._learn_p = self._lever_arm and not self._fixed_rot
+        if self._lever_arm and not self._rotate_orient:
+            raise ValueError(
+                "lever_arm_stiffness requires rotate_orientation_block=True (the adjoint rotates both "
+                "the translation and orientation blocks)."
+            )
+        self._pdim = self._pose_pdim(self._mode, self._full, self._fixed_rot, self._learn_p)
 
         # EVAL-ONLY rotation ablation: overwrite R at runtime without touching the action space
         # (the policy still emits rot6d; it's ignored). Validated here; the runner enforces that it
@@ -202,12 +216,22 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         # rot6d action slice (lo, hi) = the trailing 6 of the pose-gain block, present ONLY when the
         # rotation is LEARNED (rotated mode, R from the policy — not fixed_rot). Exposed on the
         # unwrapped env so the runner can hand it to the supervised-rotation loss; None otherwise.
+        # Pose-block layout for LEARNED rotation: [gains | rot6d(6) | p(3, only if lever-arm)].
+        # _hi = end of the pose gain block in the FULL action; slices are absolute (runner remaps them
+        # for the keypoint-servo). _p_action_slice = the predicted lever arm (GAS + lever-arm only).
         if self._mode == "rotated" and not self._fixed_rot:
             _hi = self._base_n + 2 * self.N + self._pdim
-            self._rot6d_action_slice = (_hi - 6, _hi)
+            if self._learn_p:
+                self._p_action_slice = (_hi - 3, _hi)
+                self._rot6d_action_slice = (_hi - 9, _hi - 3)
+            else:
+                self._p_action_slice = None
+                self._rot6d_action_slice = (_hi - 6, _hi)
         else:
             self._rot6d_action_slice = None
+            self._p_action_slice = None
         self.unwrapped._rot6d_action_slice = self._rot6d_action_slice
+        self.unwrapped._p_action_slice = self._p_action_slice
 
         # Translational stiffness ellipsoid. Eigenvalues of the position 3x3 block of K are linearly
         # mapped from the scalar position-gain range [lo, hi] to a semi-axis length in [min, max] m.
@@ -274,7 +298,22 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
         self._log_rotation_frame_angle()
         self._log_stiffness_frame_metrics()
         self._log_commanded_orientation()
+        self._log_lever_arm()
         self._update_frame_viz()
+
+    def _log_lever_arm(self):
+        """Log the true lever-arm magnitude ‖p‖ and, for learned-p (GAS), the prediction error
+        ‖p̂ − p‖ (both m). p_gt/p_pred are cached by _build_pose_KD during super()._compute_control_targets."""
+        if not self._lever_arm or not hasattr(self.unwrapped, "extras"):
+            return
+        p_gt = getattr(self, "_p_gt", None)
+        if p_gt is None:
+            return
+        to_log = self.unwrapped.extras["to_log"]
+        to_log["RotationFrame/p_magnitude (dist)"] = torch.linalg.norm(p_gt, dim=-1)
+        p_pred = getattr(self, "_p_pred", None)
+        if p_pred is not None:
+            to_log["RotationFrame/p_error (dist)"] = torch.linalg.norm(p_pred - p_gt, dim=-1)
 
     def _log_commanded_orientation(self):
         """Log the policy's commanded orientation (deg) about roll/pitch/yaw, BOTH pre-EMA (raw
@@ -581,6 +620,16 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
                 kdiag = torch.cat((kpos, krot), dim=1)                                # (E,6)
             # Native principal gains are the interaction-frame diagonal (pre-rotation R).
             self._k_native = kdiag[:, 0:3]
+            if self._lever_arm:
+                # Spatial-adjoint transfer: K authored (diagonal) at the interaction point ->
+                # equivalent K at the EEF, G = [[R,0],[R[p]x,R]] (the wrench spatial adjoint).
+                # K_eef stays symmetric PSD but is no longer block-diagonal, so damp with the
+                # general matrix critical damping. p from the policy (GAS) or the env (fixed).
+                p = self._lever_arm_p(a)                                           # (E,3) interaction frame
+                G = self._lever_arm_adjoint(R, p)                                  # (E,6,6)
+                K = G @ torch.diag_embed(kdiag) @ G.transpose(1, 2)
+                D = self._crit_damp_matrix(K)
+                return K, D
             K = self._rotate_blockdiag(R, kdiag, self._rotate_orient)
             D = self._rotate_blockdiag(R, self._crit_damp(kdiag), self._rotate_orient)
             return K, D
@@ -621,6 +670,10 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
                 kpos = geom_scale(a[:, 0:3], self._kf_lo[:, 0:3], self._kf_hi[:, 0:3])
                 ktor = self._kf_const[3:6].unsqueeze(0).expand(E, 3)
                 kdiag = torch.cat((kpos, ktor), dim=1)
+            if self._lever_arm:
+                # Same lever arm as the pose K (cached by _build_pose_KD, which runs first).
+                G = self._lever_arm_adjoint(R, self._p_cur)
+                return G @ torch.diag_embed(kdiag) @ G.transpose(1, 2)
             return self._rotate_blockdiag(R, kdiag)
         # cholesky
         if self._full:
@@ -634,6 +687,45 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
     def _crit_damp(kdiag):
         """Critical damping for a diagonal stiffness vector: D = 2*sqrt(K)."""
         return 2.0 * torch.sqrt(kdiag.clamp_min(0.0))
+
+    # ------------------------------------------------- lever-arm (spatial adjoint)
+    def _lever_arm_p(self, a):
+        """(E,3) lever arm p (EEF->interaction point, in the interaction frame) for the adjoint.
+        Learned-rotation methods (GAS) PREDICT it from the trailing 3 pose-block dims (scaled to m);
+        fixed-rotation methods read the TRUE geometric p from the env. Caches p_gt (+ p_pred) for the
+        supervised-p logging. Stays on-device (torch), no host transfers."""
+        p_gt = self.unwrapped.interaction_lever_arm()                      # (E,3) true geometric lever arm
+        self._p_gt = p_gt
+        if self._learn_p:
+            p = a[:, -3:] * self._lever_arm_max                            # policy-predicted, scaled to m
+            self._p_pred = p
+            self._p_cur = p
+            return p
+        self._p_pred = None
+        self._p_cur = p_gt
+        return p_gt
+
+    @staticmethod
+    def _skew(p):
+        """Batched skew-symmetric [p]x for p (E,3) -> (E,3,3)."""
+        E = p.shape[0]
+        S = torch.zeros(E, 3, 3, device=p.device, dtype=p.dtype)
+        S[:, 0, 1] = -p[:, 2]; S[:, 0, 2] = p[:, 1]
+        S[:, 1, 0] = p[:, 2];  S[:, 1, 2] = -p[:, 0]
+        S[:, 2, 0] = -p[:, 1]; S[:, 2, 1] = p[:, 0]
+        return S
+
+    def _lever_arm_adjoint(self, R, p):
+        """(E,6,6) spatial (wrench) adjoint G = [[R, 0], [R·[p]x, R]] transferring an interaction-point
+        diagonal stiffness to the EEF control point: K_eef = G·diag(k)·Gᵀ (symmetric PSD; p=0 reduces
+        to blkdiag(R,R)). This is the wrench spatial adjoint (Adᵀ) transferring an interaction-point
+        stiffness to the EEF; K_eef = G·diag(k)·Gᵀ = Adᵀ·K_int·Ad."""
+        E = R.shape[0]
+        bl = R @ self._skew(p)                                             # bottom-left = R·[p]x
+        Z = torch.zeros(E, 3, 3, device=R.device, dtype=R.dtype)
+        top = torch.cat((R, Z), dim=2)                                     # [ R    | 0 ]
+        bot = torch.cat((bl, R), dim=2)                                    # [ R[p]x| R ]
+        return torch.cat((top, bot), dim=1)                               # (E,6,6)
 
     def _rotation_frame(self, a):
         """(E,3,3) stiffness rotation ``R = R_(eef←interaction)`` for ``rotated`` mode.
@@ -661,6 +753,10 @@ class CtrlActionInterfaceWrapper(HybridVICWrapper):
             return self._geometric_rotation_frame()
         if self._fixed_rot:
             return self._R_fixed.expand(a.shape[0], 3, 3)
+        # Learned R: rot6d is the last 6 of the pose block, UNLESS a learned lever arm p (3 dims) is
+        # appended after it — then rot6d is a[:, -9:-3] and p is a[:, -3:].
+        if self._learn_p:
+            return rotation_6d_to_matrix(a[:, -9:-3])
         return rotation_6d_to_matrix(a[:, -6:])
 
     def _geometric_rotation_frame(self):

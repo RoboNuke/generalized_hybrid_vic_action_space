@@ -73,6 +73,9 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # Contact point under the tip (recomputed each _compute); init so interaction_frame_world()'s
         # goal-keypoint x-axis (setpoint_pos - contact_point) is safe before the first _compute.
         self.contact_point = torch.zeros((self.num_envs, 3), device=self.device)
+        # Interaction (contact) point under the tip (recomputed each _compute); init so
+        # interaction_lever_arm() is safe if the controller queries it before the first _compute.
+        self.interaction_pos = torch.zeros((self.num_envs, 3), device=self.device)
         # Contact flag (set each _compute); init here so interaction_frame_world() is safe if the
         # controller queries the stiffness frame before the first _compute.
         self.in_contact_any = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
@@ -441,6 +444,16 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         if contact_gated or mode == "dynamic":
             R_eef = matrix_from_quat(self.fingertip_midpoint_quat)                    # (E,3,3) world<-eef
             return torch.where(self.in_contact_any[:, None, None], frame, R_eef)
+
+    def interaction_lever_arm(self):
+        """(E,3) lever arm from the EEF (control origin) to the interaction point, expressed in the
+        INTERACTION frame: ``p = R_intᵀ · (interaction_pos − fingertip_midpoint_pos)`` with
+        ``R_int = interaction_frame_world()`` (world<-interaction). Consumed by the controller's
+        ``lever_arm_stiffness`` adjoint (fixed methods read it directly; learned-rotation/GAS predicts
+        p and this is the supervised target) and published as ``gt_interaction_p`` for the loss/logging."""
+        R_int = self.interaction_frame_world()                                       # (E,3,3) world<-interaction
+        p_world = (self.interaction_pos - self.fingertip_midpoint_pos)                # (E,3) EEF->interaction (world)
+        return torch.bmm(R_int.transpose(1, 2), p_world.unsqueeze(-1)).squeeze(-1)    # (E,3) interaction frame
         return frame
 
     # ------------------------------------------------------------------
@@ -796,6 +809,10 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         # buffer to pick up (flattened (E,9)); harmless when the loss is off.
         R_eef = matrix_from_quat(self.fingertip_midpoint_quat)                        # (E,3,3) world<-eef
         self.extras["gt_interaction_rot"] = (R_eef.transpose(1, 2) @ R_int).reshape(self.num_envs, 9)
+        # Ground-truth lever arm p (EEF->interaction, interaction frame) for the lever-arm supervised-p
+        # loss (learned-rotation/GAS) and the per-step trace. Cached for reuse below. Harmless when off.
+        self._interaction_p = self.interaction_lever_arm()                            # (E,3)
+        self.extras["gt_interaction_p"] = self._interaction_p
 
         # Measured normal force, CONTACT-CONDITIONAL: NaN off-contact and tagged "(stat)" so
         # block_agent's _accum_dist_stat (which drops non-finite values) means ONLY over in-contact
@@ -962,6 +979,9 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             # Live grasp pitch (rad, signed) — the actual peg-vs-gripper angle this step, so eval
             # traces can correlate performance with the real (slipped) grasp angle.
             "grasp_angle_rad": self.grasp_angle_rad.detach(),
+            # Lever arm p (EEF->interaction, interaction frame) — the true geometric p the lever-arm
+            # stiffness uses / the learned-p GAS policy is supervised toward.
+            "interaction_p": self._interaction_p.detach(),
         }
         # Curved-surface subclasses carry a fixed per-env curvature scalar (env.alpha in [0, 1],
         # 0 = flat). Publish it so an eval trace can break metrics down by curvature difficulty.

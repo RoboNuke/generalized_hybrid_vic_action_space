@@ -751,6 +751,19 @@ def main(argv: list[str] | None = None) -> None:
         print(f"[runner] supervised rotation loss: rot6d_slice={rot6d_slice} "
               "(GAS rotation dims supervised toward the ground-truth interaction frame)")
 
+    # Lever-arm learned-p supervision (part of the supervised-rotation loss): supervise the GAS
+    # policy's PREDICTED lever arm p toward the true geometric p. p_slice is exposed by the control
+    # wrapper only for learned-p (rotated + lever_arm_stiffness, NOT fixed-rot); remapped for the
+    # keypoint-servo like rot6d_slice. lever_arm_max scales the [-1,1] p action to meters (loss + build).
+    p_slice = None
+    lever_arm_max = float(getattr(controller_cfg, "lever_arm_max_m", 0.3))
+    if loss_cfg.supervised_rotation_enabled:
+        p_slice = getattr(env.unwrapped, "_p_action_slice", None)
+        if p_slice is not None and _ks_removed:
+            p_slice = (p_slice[0] - _ks_removed, p_slice[1] - _ks_removed)
+        if p_slice is not None:
+            print(f"[runner] supervised rotation loss: also supervising predicted lever arm p_slice={p_slice}")
+
     # ---- agent ----
     # Serialize the full loaded config ONCE, here — after every CLI override has
     # been applied to the loaded instances (experiment name/dir, wandb tags, record
@@ -778,6 +791,8 @@ def main(argv: list[str] | None = None) -> None:
         aux_losses=AuxLossManager.from_cfg(loss_cfg),
         contact_axes=contact_axes,
         rot6d_slice=rot6d_slice,
+        p_slice=p_slice,
+        lever_arm_max=lever_arm_max,
         # Full serialized runtime config -> structured wandb.config (see make_wandb_run).
         run_config=run_config,
     )

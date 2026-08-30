@@ -113,6 +113,20 @@ class ControlCfg(ForgeCtrlCfg):
     # gain_mapping='rotated' and mutually exclusive with fixed_rotation_rpy.
     fixed_rotation_from_interaction: bool = False
 
+    # rotated only: account for the peg's moment arm in the stiffness. The diagonal K is authored at
+    # the INTERACTION point (contact/tip); the impedance is applied at the EEF (control origin). This
+    # transfers it with the full 6x6 spatial adjoint congruence K_eef = G·diag(k)·Gᵀ,
+    #   G = [[R, 0], [R·[p]x, R]],   p = EEF->interaction lever arm in the interaction frame,
+    # coupling tip translation to EEF moment (and augmenting the rotational block through the arm).
+    # p=0 reduces to the current blkdiag(R,R). Requires rotate_orientation_block=True (the adjoint
+    # rotates both blocks) — hard-checked below. For LEARNED-rotation methods (GAS: rotated WITHOUT
+    # fixed_rotation_*) this also makes the policy predict p (+3 action dims, supervised toward the
+    # true geometric p by the supervised-rotation loss); fixed-rotation methods read the true p from
+    # the env. VICES (variable_diagonal) is unaffected. Only valid with gain_mapping='rotated'.
+    lever_arm_stiffness: bool = False
+    # Scale (m) mapping the policy's [-1,1] predicted-p action to a lever arm (learned-p / GAS only).
+    lever_arm_max_m: float = 0.3
+
     # ---- EVAL-ONLY rotation ablation (ctrl-action-interface, gain_mapping='rotated') ----
     # Overwrites the stiffness rotation R at RUNTIME to isolate the effect of the learned rotation,
     # WITHOUT changing the action space (unlike fixed_rotation_*, the policy still emits rot6d; it is
@@ -242,6 +256,18 @@ class ControlCfg(ForgeCtrlCfg):
                 raise ValueError(
                     "ControlCfg.fixed_rotation_from_interaction and fixed_rotation_rpy are mutually "
                     "exclusive (both fix R — pick one)."
+                )
+        if self.lever_arm_stiffness:
+            if self.gain_mapping != "rotated":
+                raise ValueError(
+                    "ControlCfg.lever_arm_stiffness is only valid with gain_mapping='rotated' "
+                    f"(VICES/variable_diagonal is intentionally unaffected); got {self.gain_mapping!r}."
+                )
+            if not self.rotate_orientation_block:
+                raise ValueError(
+                    "ControlCfg.lever_arm_stiffness requires rotate_orientation_block=True: the spatial "
+                    "adjoint congruence rotates BOTH the translation and orientation blocks; it is "
+                    "incompatible with an axis-aligned (unrotated) orientation block."
                 )
 
         # control_type-specific force_axes consistency (each wrapper also re-checks).

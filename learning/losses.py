@@ -197,8 +197,23 @@ class SupervisedRotationLoss(AuxLoss):
 
         R_pi = rotation_6d_to_matrix(ctx.actions[:, sl[0]:sl[1]])       # (N*B, 3, 3) grad-carrying
         R_tgt = ctx.sampled["gt_interaction_rot"].view(-1, 3, 3)        # (N*B, 3, 3) noise-free target
-        chordal = ((R_pi - R_tgt) ** 2).sum(dim=(-2, -1))              # (N*B,) = 6 - 2·tr(R_piᵀ R_tgt)
-        return chordal.view(ctx.agent.num_agents, -1).mean(dim=1)      # (N,) per-agent
+        loss = ((R_pi - R_tgt) ** 2).sum(dim=(-2, -1))                 # (N*B,) chordal = 6 - 2·tr(R_piᵀ R_tgt)
+
+        # Lever-arm supervised-p term (learned-p / GAS only): pull the policy's predicted lever arm
+        # toward the true geometric p. Supervised in the NORMALIZED action space (raw action in [-1,1]
+        # vs gt/lever_arm_max) so it's O(1), comparable to the chordal term. No-op when p_slice is None.
+        p_sl = getattr(ctx.agent, "_p_slice", None)
+        if p_sl is not None:
+            if "gt_interaction_p" not in ctx.sampled:
+                raise KeyError(
+                    "supervised_rotation loss: agent._p_slice is set but ctx.sampled['gt_interaction_p'] "
+                    "is missing — the agent was not set up to buffer the lever-arm target."
+                )
+            lam = float(getattr(ctx.agent, "_lever_arm_max", 0.3))
+            p_raw = ctx.actions[:, p_sl[0]:p_sl[1]]                     # (N*B,3) predicted p in [-1,1] (grad)
+            p_tgt = (ctx.sampled["gt_interaction_p"] / lam).clamp(-1.0, 1.0)  # normalized noise-free target
+            loss = loss + ((p_raw - p_tgt) ** 2).sum(dim=-1)          # (N*B,)
+        return loss.view(ctx.agent.num_agents, -1).mean(dim=1)         # (N,) per-agent
 
 
 @dataclasses.dataclass

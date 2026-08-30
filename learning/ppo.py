@@ -100,6 +100,8 @@ class PPO(BlockAgent):
         aux_losses: "AuxLossManager | None" = None,
         contact_axes: list[int] | None = None,
         rot6d_slice: tuple[int, int] | None = None,
+        p_slice: tuple[int, int] | None = None,
+        lever_arm_max: float = 0.3,
         run_config: dict | None = None,
     ) -> None:
         """Proximal Policy Optimization (PPO) with per-agent block-parallel independence.
@@ -125,6 +127,8 @@ class PPO(BlockAgent):
             num_agents=num_agents,
             contact_axes=contact_axes,
             rot6d_slice=rot6d_slice,
+            p_slice=p_slice,
+            lever_arm_max=lever_arm_max,
             run_config=run_config,
         )
 

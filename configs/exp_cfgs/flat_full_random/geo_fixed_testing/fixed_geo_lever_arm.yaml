@@ -1,18 +1,12 @@
-# cholesky: identical to simp_low-F_high-P/VICES EXCEPT the stiffness formulation:
-# gain_mapping=cholesky — a variable SPD stiffness K with within-block axis COUPLING. With
-# full_gain_matrix=false the policy sets the POSITION 3x3 block (3 Cholesky-diagonal + 3
-# off-diagonal dims = 6 dims, same policy action width as VICES); the rotation block is held at
-# the constants. Cross term chol_offdiag_rho=1.0 (full correlation range; the other configs use 0.9).
-# All other settings (gains bounds, keypoint-servo, force/EMA, reward weights, 5 agents, 12_500 steps)
-# match the other methods.
-# Surface Path-Following experiment: simp_low-F_high-P (cholesky / SPD-coupled).
-# Copied from VICES.yaml. Adds the knobs this sweep tunes, exposed at their
+# fixed_geo: identical to simp_low-F_high-P/VICES (force 10N, EMA 0.08, keypoint-servo
+# + fix_orientation + normal_offset -0.01, gains, all reward/env settings; baked at grasp pitch 45)
+# EXCEPT the stiffness-frame method: gain_mapping=rotated, frame FIXED to the geometric interaction frame (surface normal).
+# Surface Path-Following experiment: simp_low-F_high-P (VICES / variable_diagonal).
+# Copied from glued_surface/2_VICES.yaml. Adds the knobs this sweep tunes, exposed at their
 # DEFAULT values (flip/edit as needed): directional fragile peg (+ require-contact + reset-in-
 # contact), the keypoint-servo action override (target offsets + fixed EEF orientation), and
-# every surface reward-term weight. The cylinder's fixed grasp PITCH relative to the gripper
-# (rel_grasp_rot_init_deg) defaults to 0 (aligned); sweep it across jobs with
-# launchers/hpc/sweep_launcher.bash (--sweep_param runner_cfg.rel_grasp_rot_init_deg) rather
-# than maintaining one config per angle.
+# every surface reward-term weight. The one per-file difference is the cylinder's fixed grasp
+# PITCH relative to the gripper (rel_grasp_rot_init_deg), set to the angle in the file name.
 runner_cfg:
   task: Isaac-FlatSurfaceFollow-Direct-v0
   agent_type: sac
@@ -34,7 +28,7 @@ runner_cfg:
   fragile_peg_enabled: true
   efficient_reset_enabled: true
   direction_break_force: true
-  break_force: [1000, 20]                      # scalar N (magnitude) when direction_break_force=false;
+  break_force: [1000, 20]                       # scalar N (magnitude) when direction_break_force=false;
                                          # set to [shear_N, normal_N] when direction_break_force=true
   require_contact_enabled: true
   require_contact_grace_steps: 7   # no loss-of-contact break for the first N steps; earliest failure at step N+1 (peg spawns 1mm above, descends into contact)
@@ -54,6 +48,9 @@ runner_cfg:
     #     holds ONE constant tilt and cannot be re-randomized). min==max on an axis => constant. ---
     task.grasp_tilt_min_deg: [0.0, 0.0, 0.0]
     task.grasp_tilt_max_deg: [0.0, 45.0, 0.0]
+    task.interaction_frame_mode: geometric   # source frame for fixed_rotation_from_interaction
+    task.interaction_frame_contact_gated: true   # true (default): off-contact -> EEF-frame stiffness (R=I); false: keep the projected-surface frame off-contact too (geometric only), removing the on/off switch
+    task.interaction_frame_constant_x: false   # false (default): x = dir to next keypoint ahead of tip; true: x = path_dir (constant frame per episode on flat, no jitter about the normal)
     # Held-cylinder spawn: TIP 1 mm above the starting keypoint (along the surface normal), peg straight
     # up/down (no rotation), no jitter. Each DOF has a mean + std; std == 0 => mean used exactly (no
     # sampling). pos = surface-local (x=along-path, y=cross-track, z=normal, m); orn = WORLD-frame
@@ -131,7 +128,7 @@ sac_cfg:
   learning_starts: 300
   learn_entropy: true
   initial_entropy_value: 0.05
-  target_entropy: -10.5    # -action_dim/2 (dim=21; full_gain_matrix cholesky: 6 diag + 15 off-diag, servo removes the 6 pose dims)
+  target_entropy: -3.0    # -action_dim/2 (dim=6; full_gain_matrix rotated+fixed_rot: 6 diag, servo removes the 6 pose dims)
   grad_norm_clip: 1.0
   mixed_precision: false
   observation_preprocessor: RunningStandardScaler
@@ -143,7 +140,7 @@ sac_cfg:
     enabled: false
   experiment:
     directory: flat_scribing_fullgain_upright
-    experiment_name: "cholesky"
+    experiment_name: "fixed_geo_lever_arm"
     write_interval: 75
     checkpoint_interval: auto
     wandb: true
@@ -188,8 +185,13 @@ controller_cfg:
   #                       (per block: 3 L-diagonal + 3 L-off-diagonal). D = zeros for now.
   # "rotated"           : diagonal K (6) + 6-D rotation vector (6) = 12 dims; R applied as
   #                       blkdiag(R,R) to the full 6x6.
-  gain_mapping: cholesky
+  gain_mapping: rotated #"constant" #
+  fixed_rotation_from_interaction: true   # stiffness-frame R fixed from the interaction frame (not policy-emitted)
   #fixed_rotation_rpy: [0.0, 30.0, 0.0]   # stiffness-frame R; aligned to the 30deg grasp tilt (used only when gain_mapping=rotated)
+  # LEVER-ARM (spatial-adjoint) stiffness: transfer the interaction-point diagonal K to the EEF with
+  # the peg moment arm accounted for (K_eef = G·diag(k)·Gᵀ, G=[[R,0],[R[p]x,R]]). Fixed-rot method, so
+  # p is read from the env geometry (no extra action dims). Requires rotate_orientation_block=true.
+  lever_arm_stiffness: true
 
   # Toggle force control. When false: NO selection/force-target dims, K_f = zeros, and
   # force_axes MUST be all-zero. When true: force_axes selects eligible axes (adds 2*N dims)
@@ -201,7 +203,7 @@ controller_cfg:
   # A lower bound < ~1e-6 disables that channel (k=0) instead of producing NaN, so use > 0 for
   # meaningful variable impedance. Translation and rotation differ ~10x, hence the split values.
   gain_min: [300, 300, 100, 20, 20, 20] # pose stiffness K (position x3, rotation x3)
-  gain_max: [4000, 4000, 2000, 150, 150, 150] 
+  gain_max: [4000, 4000, 2000, 150, 150, 150]  
 
   # Policy commands the pose stiffness directly, so disable the base Forge env's per-reset
   # multiplicative gain randomization (default [0.41]x6) to avoid randomizing on top of the
@@ -215,18 +217,16 @@ controller_cfg:
   # Cholesky-only: off-diagonal L entry = chol_offdiag_rho * sqrt(lo*hi) * clamp(a,-1,1).
   # 0.0 => diagonal-only (equivalent to variable_diagonal but with 12 dims). Increase to
   # allow within-block (translation- or rotation-) axis coupling.
-  chol_offdiag_rho: 1.0    # cross term = 1.0 (full correlation range; other configs use 0.9)
+  chol_offdiag_rho: 0.9
 
   # cholesky/rotated only: learn the full 6-DOF gain matrix (position + orientation)
   # instead of the translational 3x3 block alone. Changes action dim => re-tune
   # target_entropy if enabled.
   full_gain_matrix: true
-  # cholesky: full_gain_matrix is NOT a no-op. false = the policy sets only the POSITION 3x3 SPD
-  #   block (3 diagonal + 3 off-diagonal = 6 dims); the orientation block is held at a CONSTANT
-  #   diagonal (no position<->orientation coupling). true = the policy sets the WHOLE 6x6 SPD matrix
-  #   (6 diagonal + 15 off-diagonal = 21 dims), coupling position and orientation. This changes the
-  #   action dim (6 vs 21) -> re-tune target_entropy accordingly.
-  rotate_orientation_block: true   # NO-OP for cholesky (no shared rotation frame R to withhold); affects gain_mapping=rotated only.
+  # ABLATION (6d): rotate ONLY the position ellipsoid; keep the orientation gains axis-aligned
+  # instead of dragging them around with the shared R. Set consistently across the rotated methods
+  # (GAS/GAS_geo/fixed_geo). Does not change the action dim, so target_entropy is unchanged.
+  rotate_orientation_block: true
 
   # Full 3-DOF orientation control: command roll/pitch/yaw as a delta-axis-angle rotation
   # scaled by rot_action_bounds, instead of the default yaw-only map (roll/pitch forced to 0).
