@@ -49,3 +49,20 @@ class KeypointServoCfg:
     peg on the surface, plus the x-axis heading from ``task.spawn_align_eef_x_to_path``); a constant
     world orientation would instead level the wrist and lift the peg off the plate. When False, the
     policy keeps the orientation dims."""
+
+    decouple_orientation_lever_arm: bool = False
+    """When True (requires :attr:`fix_orientation`), subtract the EXACT tip motion induced by the
+    orientation command from the position command, so the servoed point (``env.held_end_pos``) still
+    lands on the setpoint even while the EEF is being rotated.
+
+    The tip is rigidly offset from the control point (fingertip midpoint) by ``r = held_end_pos -
+    fingertip_midpoint_pos``; rotating the EEF by the applied delta ``Δq`` moves the tip by
+    ``Δq·r - r`` (computed with ``quat_apply`` — exact for any angle, NOT a small-angle ``ω x r``
+    approximation, so it stays correct if ``rot_threshold`` is raised). That displacement is removed
+    from the desired tip displacement before it becomes the EEF position command. ``Δq`` is
+    reconstructed to match ``compute_ctrl_targets`` exactly (same per-component clamp + quat rebuild),
+    so it decouples against the rotation that actually gets applied. The arm ``r`` uses the
+    LOOP-CLOSURE point (``held_end_pos``, the tip center where keypoints/success are defined), which
+    differs from the stiffness lever-arm's contact point (``interaction_pos``) by the tip sphere
+    radius — the decoupling arm must match the point being servoed. No-op when :attr:`fix_orientation`
+    is False (no commanded rotation to decouple)."""

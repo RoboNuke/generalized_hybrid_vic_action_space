@@ -39,6 +39,17 @@ tilt that keeps the peg on the surface — rather than a constant world rpy (whi
 wrist and lift the peg off the plate). No offset is ever added to orientation. When
 ``fix_orientation`` is off the policy keeps the rotation dims.
 
+Orientation->tip lever-arm decoupling (optional ``decouple_orientation_lever_arm``, needs
+``fix_orientation``) — the position servo above drives the EEF, but the point we actually want on the
+setpoint is the tip, offset from the EEF by ``r = held_end_pos - fingertip_midpoint_pos``. When the
+orientation channel is simultaneously rotating the EEF by the applied delta ``Δq``, the tip is swept
+by ``Δq·r - r`` (computed with ``quat_apply`` — EXACT for any angle, not a small-angle ``ω x r``, so
+it holds if ``rot_threshold`` is raised). Enabling this subtracts that induced motion from the
+position command so the tip still lands on the setpoint. ``r`` uses the loop-closure point
+(``held_end_pos``, the tip center) — distinct from the stiffness adjoint's contact point
+(``interaction_pos``), which differs by the tip sphere radius. Off by default (original
+translation-only behavior).
+
 Action-space surgery: the taken-over dims are a contiguous FRONT block — ``pos`` (0:3) always,
 plus ``rot`` (3:6) when ``fix_orientation`` — so the wrapper is agnostic to whatever
 force/gain dims the control wrapper appends after them. It shrinks the exposed action space by
@@ -52,7 +63,7 @@ from __future__ import annotations
 import gymnasium as gym
 import numpy as np
 import torch
-from isaaclab.utils.math import axis_angle_from_quat
+from isaaclab.utils.math import axis_angle_from_quat, quat_apply
 
 from .factory_control_utils import rotate_vec_to_eef
 
@@ -88,6 +99,9 @@ class KeypointServoActionWrapper(gym.ActionWrapper):
         self._any_offset = any(abs(v) > 0.0 for v in (self._along, self._off, self._normal))
 
         self._fix_orientation = bool(cfg.fix_orientation)
+        # Exact orientation->tip lever-arm decoupling (only meaningful when fixing orientation, since
+        # otherwise there is no wrapper-commanded rotation to decouple against).
+        self._decouple_lever = bool(getattr(cfg, "decouple_orientation_lever_arm", False)) and self._fix_orientation
         # Number of contiguous FRONT dims this wrapper takes over: pos (3), + rot (3) if fixing it.
         self._n_override = 6 if self._fix_orientation else 3
 
@@ -155,9 +169,17 @@ class KeypointServoActionWrapper(gym.ActionWrapper):
         self._validated = True
 
     # ------------------------------------------------------------------ servo
-    def _pos_action(self) -> torch.Tensor:
-        """EEF-frame, threshold-normalized position action (E,3) servoing the tip to the setpoint."""
+    def _pos_action(self, applied_aa: torch.Tensor | None = None) -> torch.Tensor:
+        """EEF-frame, threshold-normalized position action (E,3) servoing the tip to the setpoint.
+
+        When ``applied_aa`` (the clamped EEF-frame orientation delta this step is commanding) is
+        supplied, the EXACT tip motion that rotation induces is removed from the command, so the
+        servoed point (``held_end_pos``) still lands on the setpoint while the EEF is rotating (the
+        ``decouple_orientation_lever_arm`` path). ``applied_aa=None`` reproduces the original
+        translation-only servo.
+        """
         env = self.unwrapped
+        eef_quat = env.fingertip_midpoint_quat
         disp_world = env.setpoint_pos - env.held_end_pos                      # (E,3) tip -> keypoint
         if self._any_offset:
             disp_world = (
@@ -166,7 +188,24 @@ class KeypointServoActionWrapper(gym.ActionWrapper):
                 + self._off * env.d_lat
                 + self._normal * env.surface_normal
             )
-        total_eef = rotate_vec_to_eef(disp_world, env.fingertip_midpoint_quat)  # (E,3) into EEF frame
+        total_eef = rotate_vec_to_eef(disp_world, eef_quat)                   # (E,3) into EEF frame
+        if applied_aa is not None:
+            # EXACT tip displacement from the applied rotation Δq: (Δq·r − r), in the EEF frame. r is
+            # the arm to the LOOP-CLOSURE point (tip center ``held_end_pos``, where keypoints/success
+            # live) — NOT the stiffness adjoint's contact point (``interaction_pos``), which differs by
+            # the tip sphere radius; the decoupling arm must match the point being driven to the
+            # setpoint. ``quat_apply`` is exact for ANY angle (no small-angle ω×r), so raising
+            # ``rot_threshold`` stays correct. Δq is rebuilt from ``applied_aa`` exactly as
+            # ``compute_ctrl_targets`` does, so it cancels the rotation that is actually applied.
+            angle = applied_aa.norm(dim=1)                                   # (E,)
+            axis = applied_aa / angle.clamp_min(1e-6).unsqueeze(-1)          # (E,3)
+            dq_applied = torch_utils.quat_from_angle_axis(angle, axis)       # (E,4)
+            identity = torch.zeros_like(dq_applied)
+            identity[:, 0] = 1.0
+            dq_applied = torch.where(angle.unsqueeze(-1) > 1e-6, dq_applied, identity)
+            r_eef = rotate_vec_to_eef(env.held_end_pos - env.fingertip_midpoint_pos, eef_quat)
+            tip_disp_rot_eef = quat_apply(dq_applied, r_eef) - r_eef          # (E,3) EEF frame, exact
+            total_eef = total_eef - tip_disp_rot_eef
         return torch.clamp(total_eef / env.pos_threshold, -1.0, 1.0)
 
     def _capture_reset_orientation(self) -> None:
@@ -182,8 +221,12 @@ class KeypointServoActionWrapper(gym.ActionWrapper):
         if fresh.any():
             self._q_target[fresh] = env.fingertip_midpoint_quat[fresh].detach().clone()
 
-    def _rot_action(self) -> torch.Tensor:
-        """EEF-frame, threshold-normalized rotation action (E,3) driving the EEF to the held quat."""
+    def _applied_rot_axis_angle(self) -> torch.Tensor:
+        """(E,3) EEF-frame axis-angle of the orientation delta the controller will ACTUALLY apply this
+        step: the shortest rotation from the current EEF orientation to the held (spawn) target,
+        clamped per-component to ``env.rot_threshold`` — the exact quantity ``compute_ctrl_targets``
+        turns into the applied delta quaternion. Shared by the rotation action and the position
+        lever-arm decoupling so both reference the identical rotation."""
         env = self.unwrapped
         eef_quat = env.fingertip_midpoint_quat                               # (E,4)
         q_target = self._q_target                                            # (E,4) per-env spawn orient.
@@ -192,15 +235,22 @@ class KeypointServoActionWrapper(gym.ActionWrapper):
         # Canonicalize to the positive-w hemisphere so axis_angle gives the SHORTEST rotation.
         dq = torch.where(dq[:, 0:1] < 0.0, -dq, dq)
         aa = axis_angle_from_quat(dq)                                        # (E,3) EEF-frame axis-angle
-        return torch.clamp(aa / env.rot_threshold, -1.0, 1.0)
+        return torch.clamp(aa, -env.rot_threshold, env.rot_threshold)       # applied per-axis delta
+
+    def _rot_action(self, applied_aa: torch.Tensor) -> torch.Tensor:
+        """EEF-frame, threshold-normalized rotation action (E,3) driving the EEF to the held quat.
+        ``applied_aa`` is already clamped to ``rot_threshold``, so this is just the normalization."""
+        return torch.clamp(applied_aa / self.unwrapped.rot_threshold, -1.0, 1.0)
 
     def action(self, action: torch.Tensor) -> torch.Tensor:
         """Prepend the computed pose block onto the policy's (reduced) action -> full-width vector."""
         if not self._validated:
             self._validate()
+        applied_aa = None
         if self._fix_orientation:
             self._capture_reset_orientation()                               # latch spawn orient. on reset
-        head = self._pos_action()
+            applied_aa = self._applied_rot_axis_angle()                     # the rotation actually applied
+        head = self._pos_action(applied_aa if self._decouple_lever else None)
         if self._fix_orientation:
-            head = torch.cat((head, self._rot_action()), dim=1)             # (E,6)
+            head = torch.cat((head, self._rot_action(applied_aa)), dim=1)   # (E,6)
         return torch.cat((head, action), dim=1)                             # (E, full_dim)
