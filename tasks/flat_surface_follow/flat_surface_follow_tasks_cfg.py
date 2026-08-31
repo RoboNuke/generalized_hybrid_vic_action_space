@@ -231,6 +231,10 @@ class FlatSurfaceFollowTask(ForgeTask):
     #              subtracted. The reaction vector follows force_source: "oracle" (default) = the true
     #              peg<->plate contact force (contact_force_world_ema); "wrist_ft" = the FR3 wrist F/T
     #              reaction (force_sensor_world_smooth).
+    # "peg":       z = the PEG's long axis (world) — the frame is attached to the PEG, not the table. The
+    #              constraints live in the peg (axial = break force, radial = friction), so k_normal acts
+    #              along the peg and k_along/k_cross radially, tracking the peg as it tilts. x = goal-
+    #              keypoint dir projected ⊥ the peg axis.
     # OFF-CONTACT (env.in_contact_any False — the single contact source of truth) BOTH modes collapse
     # to the control/EEF frame (identity stiffness rotation): no surface, so stiffness is control-frame.
     # This contact-gating is toggled by interaction_frame_contact_gated below.

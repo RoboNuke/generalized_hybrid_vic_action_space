@@ -70,6 +70,9 @@ class FlatSurfaceFollowEnv(ForgeEnv):
         self.path_dir = torch.tensor([1.0, 0.0, 0.0], device=self.device).expand(self.num_envs, 3).clone()
         self.d_lat = torch.tensor([0.0, 1.0, 0.0], device=self.device).expand(self.num_envs, 3).clone()
         self.surface_normal = torch.tensor([0.0, 0.0, 1.0], device=self.device).expand(self.num_envs, 3).clone()
+        # Peg long axis (world, unit; recomputed each _compute). Init so interaction_frame_mode="peg"
+        # is safe if the controller queries the stiffness frame before the first _compute.
+        self.cyl_axis = torch.tensor([0.0, 0.0, 1.0], device=self.device).expand(self.num_envs, 3).clone()
         # Contact point under the tip (recomputed each _compute); init so interaction_frame_world()'s
         # goal-keypoint x-axis (setpoint_pos - contact_point) is safe before the first _compute.
         self.contact_point = torch.zeros((self.num_envs, 3), device=self.device)
@@ -380,6 +383,10 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             wrench, no wrist inertia/motion contamination); "wrist_ft" uses the FR3 wrist F/T reaction
             (force_sensor_world_smooth). x = the goal-keypoint direction with its component parallel to
             the reaction (z) subtracted, y = z × x (cross-track).
+          * "peg": z = the PEG's long axis (self.cyl_axis, world) — the frame is attached to the PEG,
+            not the table. The peg is where the constraints live (axial = break force, radial = friction),
+            so k_normal acts along the peg and k_along/k_cross radially as the peg tilts. x = the goal-
+            keypoint direction projected ⊥ the peg axis, y = z × x.
 
         OFF-CONTACT, the frame returns R_eef (world<-eef) by default, so the controller's R =
         R_eefᵀ·this = IDENTITY — with no surface to interact with, the stiffness is applied in the
@@ -429,6 +436,11 @@ class FlatSurfaceFollowEnv(ForgeEnv):
             else:
                 f = self.force_sensor_world_smooth[:, 0:3]                            # (E,3) world wrist reaction
             z = f / torch.linalg.norm(f, dim=-1, keepdim=True).clamp_min(1e-6)        # z along the reaction
+        elif mode == "peg":
+            # z along the PEG's long axis (world, unit). The constraints live in the peg: axial = break
+            # force, radial = friction. Aligning the stiffness frame to the peg (not the table) means
+            # k_normal acts along the peg and k_along/k_cross radially, regardless of how the peg tilts.
+            z = self.cyl_axis                                                        # (E,3) peg long axis
         else:
             z = self.surface_normal                                                  # z along the surface normal
         x = to_goal - (to_goal * z).sum(-1, keepdim=True) * z                         # goal dir ⊥ z
